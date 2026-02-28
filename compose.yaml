@@ -1,0 +1,23 @@
+services:
+  whisper:
+    build: .
+    environment:
+      - DEBUG_MODE=1  # Set to 0 for clean production logs
+      - HF_TOKEN=${HF_TOKEN}  # HuggingFace token for pyannote diarization
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./uploads:/data
+      - ./app.py:/app/app.py:ro
+      - model-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  model-cache:
