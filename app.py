@@ -486,6 +486,15 @@ CSS = """
     margin-top: 4px;
 }
 footer { display: none !important; }
+#copy-transcript-btn {
+    max-width: 140px;
+    margin-left: auto;
+    margin-top: -0.5rem;
+}
+#copy-transcript-btn button {
+    font-size: 0.8rem;
+    padding: 4px 12px;
+}
 """
 
 # -- Gradio UI -----------------------------------------------------------------
@@ -499,32 +508,6 @@ with gr.Blocks(title="Whisper Transcription") as demo:
             <div class="sub">faster-whisper (CTranslate2)</div>
             <div class="gpu">{GPU_INFO_STR}</div>
         </div>
-        <script>
-            // Request notification permission on load
-            if ("Notification" in window && Notification.permission === "default") {{
-                Notification.requestPermission();
-            }}
-            window._whisperNotify = function(title, body) {{
-                if ("Notification" in window && Notification.permission === "granted") {{
-                    if (document.hidden) {{
-                        new Notification(title, {{ body: body, icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>" }});
-                    }}
-                }}
-            }};
-            // Watch the status field for changes
-            const observer = new MutationObserver(function() {{
-                const statusEl = document.querySelector('input[aria-label="Status"], textarea[aria-label="Status"]');
-                if (!statusEl) return;
-                const val = statusEl.value || "";
-                if (val.startsWith("Done --")) {{
-                    window._whisperNotify("Transcription Complete", val);
-                }}
-            }});
-            setTimeout(function() {{
-                const target = document.querySelector('.gradio-container');
-                if (target) observer.observe(target, {{ childList: true, subtree: true, characterData: true, attributes: true }});
-            }}, 2000);
-        </script>
     """)
 
     # -- Top row: file upload + settings + button --
@@ -571,13 +554,29 @@ with gr.Blocks(title="Whisper Transcription") as demo:
     output_text = gr.Textbox(
         label="Transcript",
         lines=14,
-        max_lines=50,
+        max_lines=14,
         placeholder="Transcript will appear here...",
+        elem_id="transcript-box",
     )
-    output_file = gr.File(label="Subtitles", height=50)
-
-    # Hidden HTML for triggering notifications from Python
-    notify_html = gr.HTML(visible=False)
+    copy_btn = gr.Button(
+        "Copy Transcript",
+        size="sm",
+        variant="secondary",
+        elem_id="copy-transcript-btn",
+    )
+    copy_btn.click(
+        fn=None,
+        inputs=[output_text],
+        outputs=[],
+        js="""(text) => {
+            if (!text) return;
+            navigator.clipboard.writeText(text).then(() => {
+                const btn = document.querySelector('#copy-transcript-btn button');
+                if (btn) { const o = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = o, 1500); }
+            });
+        }""",
+    )
+    output_file = gr.File(label="Subtitles", height=50, interactive=False)
 
     # Enable/disable button based on file upload state
     def on_file_change(f):
@@ -586,25 +585,61 @@ with gr.Blocks(title="Whisper Transcription") as demo:
                 size_mb = os.path.getsize(f) / (1024 * 1024)
                 fname = os.path.basename(f)
                 log.info(f"File uploaded: {fname} ({size_mb:.1f} MB)")
-                notify_js = f'<script>window._whisperNotify && window._whisperNotify("Upload Complete", "{fname} ({size_mb:.0f} MB)");</script>'
             except Exception:
                 log.info(f"File uploaded: {f}")
-                notify_js = '<script>window._whisperNotify && window._whisperNotify("Upload Complete", "File ready");</script>'
         else:
             log.info("File cleared")
-            notify_js = ""
-        return gr.update(interactive=f is not None), notify_js
+        return gr.update(interactive=f is not None)
 
     file_input.change(
         fn=on_file_change,
         inputs=[file_input],
-        outputs=[transcribe_btn, notify_html],
+        outputs=[transcribe_btn],
     )
 
+    # Auto-transcribe when a file is uploaded; also request notification permission
+    file_input.upload(
+        fn=None,
+        js="""() => {
+            if ("Notification" in window && Notification.permission === "default") {
+                Notification.requestPermission();
+            }
+        }""",
+    ).then(
+        fn=transcribe,
+        inputs=[file_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox],
+        outputs=[status_text, output_text, output_file],
+    ).then(
+        fn=None,
+        inputs=[status_text],
+        js="""(status) => {
+            if (!status || !status.startsWith("Done --")) return;
+            if ("Notification" in window && Notification.permission === "granted") {
+                new Notification("Transcription Complete", {
+                    body: status,
+                    icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>"
+                });
+            }
+        }""",
+    )
+
+    # Manual transcribe button (still works)
     transcribe_btn.click(
         fn=transcribe,
         inputs=[file_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox],
         outputs=[status_text, output_text, output_file],
+    ).then(
+        fn=None,
+        inputs=[status_text],
+        js="""(status) => {
+            if (!status || !status.startsWith("Done --")) return;
+            if ("Notification" in window && Notification.permission === "granted") {
+                new Notification("Transcription Complete", {
+                    body: status,
+                    icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>"
+                });
+            }
+        }""",
     )
 
 # -- Launch --------------------------------------------------------------------
