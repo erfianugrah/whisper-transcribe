@@ -8,6 +8,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
+# torchcodec is pulled in as a transitive dep but has a C++ ABI mismatch with
+# the installed PyTorch (undefined symbol). Neither whisperX nor our code uses
+# it -- whisperX uses ffmpeg directly, pyannote falls back to torchaudio.
+# Removing it eliminates the noisy startup warning from pyannote.
+RUN pip uninstall -y torchcodec 2>/dev/null || true
+
+# whisperX ships a Lightning v1.5.4 checkpoint that gets auto-upgraded at
+# runtime on every start. Run the upgrade once at build time.
+RUN python3 -m lightning.pytorch.utilities.upgrade_checkpoint \
+    /usr/local/lib/python3.12/dist-packages/whisperx/assets/pytorch_model.bin \
+    2>/dev/null || true
+
 WORKDIR /app
 COPY app.py .
 

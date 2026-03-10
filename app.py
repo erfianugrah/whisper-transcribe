@@ -8,7 +8,6 @@ import glob
 import shutil
 
 # -- Logging setup -------------------------------------------------------------
-# Set DEBUG_MODE=0 in compose.yaml env when you want clean logs
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "1") == "1"
 
 logging.basicConfig(
@@ -20,25 +19,22 @@ logging.basicConfig(
 log = logging.getLogger("whisper-ui")
 log.setLevel(logging.DEBUG)
 
-# Even in debug mode, these are pure noise (chunk-level upload logs, PIL plugins, etc.)
+# Third-party DEBUG-level log spam -- these libraries emit per-chunk, per-frame,
+# or per-request debug logs that drown out our own logs. Only suppress to WARNING.
 for noisy in ("PIL", "python_multipart", "python_multipart.multipart",
               "multipart", "asyncio", "watchfiles",
               "httpcore", "httpcore.http11", "httpcore.connection",
               "httpx", "filelock", "faster_whisper",
               "matplotlib", "matplotlib.font_manager",
-              "pyannote", "pyannote.audio", "torchcodec",
               "fsspec", "fsspec.local", "urllib3"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
-# Suppress torchcodec UserWarning (we load audio manually, pyannote's warning is noise)
-# The message starts with \n so we need a permissive regex
 import warnings
-warnings.filterwarnings("ignore", message=".*torchcodec.*")
+# PyTorch performance hints -- not actionable in this context
 warnings.filterwarnings("ignore", category=UserWarning, message="TensorFloat-32")
 warnings.filterwarnings("ignore", category=UserWarning, message="std\\(\\): degrees of freedom")
 
 if not DEBUG_MODE:
-    # Production: silence everything except our logs + access logs
     for noisy in ("httpcore", "httpx", "urllib3", "gradio", "starlette"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger("uvicorn").setLevel(logging.WARNING)
@@ -47,7 +43,7 @@ else:
     log.info("DEBUG_MODE is ON -- verbose third-party logging enabled")
 
 log.info("=" * 60)
-log.info("Whisper Transcription UI starting")
+log.info("WhisperX Transcription UI starting")
 log.info("=" * 60)
 
 # -- Python / env info ---------------------------------------------------------
@@ -56,46 +52,42 @@ log.info(f"CWD: {os.getcwd()}")
 log.info(f"ENV NVIDIA_VISIBLE_DEVICES={os.environ.get('NVIDIA_VISIBLE_DEVICES', 'unset')}")
 log.info(f"ENV CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}")
 
-# -- GPU detection (lightweight, no torch import) ------------------------------
+# -- GPU detection -------------------------------------------------------------
+import torch
+
 DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
 GPU_INFO_STR = "CPU mode (no GPU detected)"
 
-try:
-    import ctranslate2
-    gpu_count = ctranslate2.get_cuda_device_count()
-    log.info(f"ctranslate2 CUDA device count: {gpu_count}")
-    if gpu_count > 0:
-        DEVICE = "cuda"
-        COMPUTE_TYPE = "float16"
-        # Try to get detailed GPU info via nvidia-smi
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                parts = result.stdout.strip().split(", ")
-                gpu_name = parts[0]
-                vram_mb = int(parts[1])
-                GPU_INFO_STR = f"{gpu_name}  |  {vram_mb // 1024} GB VRAM  |  faster-whisper (CTranslate2)  |  float16"
-                log.info(f"GPU 0: {gpu_name} ({vram_mb} MB VRAM)")
-            else:
-                GPU_INFO_STR = f"CUDA GPU detected ({gpu_count} device(s))  |  faster-whisper (CTranslate2)  |  float16"
-        except Exception:
-            GPU_INFO_STR = f"CUDA GPU detected ({gpu_count} device(s))  |  faster-whisper (CTranslate2)  |  float16"
-except Exception as e:
-    log.warning(f"ctranslate2 CUDA detection failed: {e}")
-    log.info("Falling back to CPU mode")
+if torch.cuda.is_available():
+    DEVICE = "cuda"
+    COMPUTE_TYPE = "float16"
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(", ")
+            gpu_name = parts[0]
+            vram_mb = int(parts[1])
+            GPU_INFO_STR = f"{gpu_name}  |  {vram_mb // 1024} GB VRAM  |  whisperX (faster-whisper + wav2vec2 alignment)  |  float16"
+            log.info(f"GPU 0: {gpu_name} ({vram_mb} MB VRAM)")
+        else:
+            GPU_INFO_STR = f"CUDA GPU detected  |  whisperX  |  float16"
+    except Exception:
+        GPU_INFO_STR = f"CUDA GPU detected  |  whisperX  |  float16"
+else:
+    log.info("No CUDA GPU detected, falling back to CPU mode")
 
 log.info(f"Selected device: {DEVICE}, compute_type: {COMPUTE_TYPE}")
 
-# -- Import faster-whisper -----------------------------------------------------
-log.info("Importing faster-whisper...")
+# -- Import whisperx ----------------------------------------------------------
+log.info("Importing whisperx...")
 t0 = time.time()
-from faster_whisper import WhisperModel
-log.info(f"faster-whisper imported in {time.time()-t0:.2f}s")
+import whisperx
+log.info(f"whisperx imported in {time.time()-t0:.2f}s")
 
 # -- Import gradio -------------------------------------------------------------
 log.info("Importing gradio...")
@@ -103,95 +95,89 @@ t0 = time.time()
 import gradio as gr
 log.info(f"Gradio {gr.__version__} imported in {time.time()-t0:.2f}s")
 
-# -- Import pyannote (optional) ------------------------------------------------
-diarization_pipeline = None
+# -- Diarization availability --------------------------------------------------
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-if HF_TOKEN:
-    log.info("Importing pyannote.audio...")
-    t0 = time.time()
-    try:
-        from pyannote.audio import Pipeline as PyannotePipeline
-        log.info(f"pyannote.audio imported in {time.time()-t0:.2f}s")
-    except ImportError:
-        log.warning("pyannote.audio not installed -- diarization disabled")
-        PyannotePipeline = None
-else:
+DIARIZATION_AVAILABLE = bool(HF_TOKEN)
+if not HF_TOKEN:
     log.info("HF_TOKEN not set -- speaker diarization disabled")
-    PyannotePipeline = None
+else:
+    log.info("HF_TOKEN set -- speaker diarization available")
 
 # -- Model management ---------------------------------------------------------
 whisper_model = None
 current_model_name = None
+diarize_model = None
+align_model_cache = {}  # keyed by language code
 
 
 def load_whisper(model_name):
+    """Load (or reuse) a whisperX transcription model."""
     global whisper_model, current_model_name
-    if model_name != current_model_name:
-        log.info(f"Loading whisper model '{model_name}' on {DEVICE} (compute_type={COMPUTE_TYPE})...")
+    # Map friendly names to actual model IDs
+    actual_name = model_name
+    if model_name == "large":
+        actual_name = "large-v3"
+    elif model_name == "turbo":
+        actual_name = "large-v3-turbo"
 
+    if actual_name != current_model_name:
+        log.info(f"Loading whisperX model '{actual_name}' on {DEVICE} (compute_type={COMPUTE_TYPE})...")
         t0 = time.time()
-        whisper_model = WhisperModel(
-            model_name if model_name != "large" else "large-v3",
+        whisper_model = whisperx.load_model(
+            actual_name,
             device=DEVICE,
             compute_type=COMPUTE_TYPE,
+            language=None,  # auto-detect; set per-transcribe call
         )
         elapsed = time.time() - t0
-
-        log.info(f"  Whisper model loaded in {elapsed:.2f}s")
-        current_model_name = model_name
+        log.info(f"  WhisperX model loaded in {elapsed:.2f}s")
+        current_model_name = actual_name
     else:
-        log.info(f"Whisper model '{model_name}' already loaded, reusing")
+        log.info(f"WhisperX model '{actual_name}' already loaded, reusing")
     return whisper_model
 
 
+def load_align_model(language_code):
+    """Load (or reuse) a wav2vec2 alignment model for a given language."""
+    if language_code in align_model_cache:
+        return align_model_cache[language_code]
+    log.info(f"Loading alignment model for '{language_code}'...")
+    t0 = time.time()
+    model_a, metadata = whisperx.load_align_model(
+        language_code=language_code,
+        device=DEVICE,
+    )
+    align_model_cache[language_code] = (model_a, metadata)
+    log.info(f"  Alignment model loaded in {time.time()-t0:.2f}s")
+    return model_a, metadata
+
+
 def load_diarization():
-    global diarization_pipeline
-    if diarization_pipeline is not None:
+    """Load (or reuse) the whisperX diarization pipeline."""
+    global diarize_model
+    if diarize_model is not None:
         log.info("Diarization pipeline already loaded, reusing")
-        return diarization_pipeline
-    if PyannotePipeline is None:
+        return diarize_model
+    if not HF_TOKEN:
         return None
-    log.info("Loading pyannote diarization pipeline...")
+    log.info("Loading whisperX diarization pipeline...")
     t0 = time.time()
     try:
-        diarization_pipeline = PyannotePipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
+        from whisperx.diarize import DiarizationPipeline
+        diarize_model = DiarizationPipeline(
             token=HF_TOKEN,
+            device=DEVICE,
         )
-        import torch
-        if torch.cuda.is_available():
-            diarization_pipeline.to(torch.device("cuda"))
         log.info(f"  Diarization pipeline loaded in {time.time()-t0:.2f}s")
     except Exception as e:
         log.error(f"  Failed to load diarization pipeline: {e}")
-        diarization_pipeline = None
-    return diarization_pipeline
-
-
-def assign_speakers(segments, diarization_result):
-    """Assign speaker labels to whisper segments using pyannote diarization.
-
-    diarization_result is a DiarizeOutput dataclass; use exclusive_speaker_diarization
-    (no overlapping turns) which maps better to transcription segments.
-    """
-    # DiarizeOutput wraps Annotation objects
-    annotation = getattr(diarization_result, "exclusive_speaker_diarization", None)
-    if annotation is None:
-        annotation = getattr(diarization_result, "speaker_diarization", diarization_result)
-    labeled = []
-    for seg in segments:
-        mid = (seg.start + seg.end) / 2.0
-        speaker = "?"
-        for turn, _, spk in annotation.itertracks(yield_label=True):
-            if turn.start <= mid <= turn.end:
-                speaker = spk
-                break
-        labeled.append((seg, speaker))
-    return labeled
+        traceback.print_exc()
+        diarize_model = None
+    return diarize_model
 
 
 # -- Temp file cleanup ---------------------------------------------------------
-_previous_subtitle = None  # track last subtitle file for cleanup
+_previous_subtitle = None
 
 
 def cleanup_upload(file_path):
@@ -201,7 +187,6 @@ def cleanup_upload(file_path):
     try:
         os.remove(file_path)
         parent = os.path.dirname(file_path)
-        # Remove the per-upload hash directory if empty
         if parent and parent.startswith("/tmp/gradio/") and not os.listdir(parent):
             os.rmdir(parent)
         log.info(f"Cleaned up upload: {file_path}")
@@ -229,12 +214,33 @@ def cleanup_stale_gradio_tmp():
         log.info(f"Cleaned {count} stale gradio temp dirs")
 
 
-# Run cleanup on startup
 cleanup_stale_gradio_tmp()
 
 
+# -- Default batch size based on VRAM -----------------------------------------
+DEFAULT_BATCH_SIZE = 4  # conservative CPU default
+if DEVICE == "cuda":
+    try:
+        vram_bytes = torch.cuda.get_device_properties(0).total_memory
+        vram_gb = vram_bytes / (1024 ** 3)
+        if vram_gb >= 24:
+            DEFAULT_BATCH_SIZE = 32
+        elif vram_gb >= 16:
+            DEFAULT_BATCH_SIZE = 24
+        elif vram_gb >= 10:
+            DEFAULT_BATCH_SIZE = 16
+        elif vram_gb >= 6:
+            DEFAULT_BATCH_SIZE = 8
+        else:
+            DEFAULT_BATCH_SIZE = 4
+        log.info(f"Auto-selected batch_size={DEFAULT_BATCH_SIZE} for {vram_gb:.0f} GB VRAM")
+    except Exception as e:
+        DEFAULT_BATCH_SIZE = 8
+        log.warning(f"VRAM detection failed ({e}), defaulting batch_size={DEFAULT_BATCH_SIZE}")
+
+
 # -- Transcription (generator for live UI updates) ----------------------------
-def transcribe(file, model_name, language, output_format, enable_diarization):
+def transcribe(file, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size):
     """Yields (status, transcript, subtitle_file) tuples for live progress."""
     global _previous_subtitle
     request_id = f"req-{int(time.time()*1000) % 100000}"
@@ -255,107 +261,158 @@ def transcribe(file, model_name, language, output_format, enable_diarization):
     except Exception:
         log.info(f"[{request_id}] Could not determine file size")
 
+    batch_size = int(batch_size)
     log.info(f"[{request_id}] Model: {model_name}")
     log.info(f"[{request_id}] Language: {language}")
     log.info(f"[{request_id}] Output format: {output_format}")
     log.info(f"[{request_id}] Diarization: {enable_diarization}")
+    log.info(f"[{request_id}] Batch size: {batch_size}")
     log.info(f"[{request_id}] Device: {DEVICE}, compute_type: {COMPUTE_TYPE}")
 
-    # -- Phase 1: Load whisper model --
-    yield f"Loading whisper model '{model_name}'...", "", None
-    log.info(f"[{request_id}] Loading whisper model...")
+    # -- Phase 1: Load whisperX model --
+    yield f"Loading whisperX model '{model_name}'...", "", None
+    log.info(f"[{request_id}] Loading whisperX model...")
     t0_model = time.time()
     m = load_whisper(model_name)
     model_time = time.time() - t0_model
-    log.info(f"[{request_id}] Whisper model ready in {model_time:.2f}s")
+    log.info(f"[{request_id}] WhisperX model ready in {model_time:.2f}s")
 
-    # Transcription options
     lang = None if (not language or language == "Auto-detect") else language
 
-    log.info(f"[{request_id}] language: {lang}")
-    log.info(f"[{request_id}] beam_size: 5, condition_on_previous_text: False")
+    # -- Phase 2: Load audio --
+    yield f"Loading audio{file_size_str}...", "", None
 
-    # -- Phase 2: Transcribe --
-    yield f"Transcribing{file_size_str}...", "", None
-    log.info(f"[{request_id}] >> Starting transcription...")
+    # Verify the file still exists (Gradio temp files can vanish between yields)
+    if not os.path.exists(file):
+        log.error(f"[{request_id}] File no longer exists: {file}")
+        yield f"Error: uploaded file no longer exists (may have been cleaned up)", "", None
+        return
+
+    # Create a safe temp path without spaces (ffmpeg subprocess can have issues
+    # with spaces in paths). Use a hard link (instant) instead of copying GBs.
+    ext = os.path.splitext(file)[1] or ".mkv"
+    safe_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    safe_tmp.close()
+    safe_path = safe_tmp.name
+    try:
+        os.remove(safe_path)  # remove empty file so we can link
+        os.link(file, safe_path)  # hard link -- instant, no data copied
+        log.info(f"[{request_id}] Hard-linked to safe temp path: {safe_path}")
+    except OSError:
+        # Cross-device link or unsupported -- fall back to copy
+        try:
+            log.info(f"[{request_id}] Hard link failed, copying to: {safe_path}")
+            shutil.copy2(file, safe_path)
+        except Exception as e:
+            log.error(f"[{request_id}] Failed to copy file: {e}")
+            yield f"Error copying file: {e}", "", None
+            return
+
+    log.info(f"[{request_id}] Loading audio...")
+    t0_audio = time.time()
+    try:
+        audio = whisperx.load_audio(safe_path)
+    except Exception as e:
+        log.error(f"[{request_id}] Failed to load audio: {e}")
+        traceback.print_exc()
+        yield f"Error loading audio: {e}", "", None
+        return
+    finally:
+        # Remove the safe copy now that audio is in memory
+        try:
+            os.remove(safe_path)
+        except Exception:
+            pass
+    audio_duration = len(audio) / 16000  # whisperx loads at 16kHz
+    log.info(f"[{request_id}] Audio loaded in {time.time()-t0_audio:.2f}s ({audio_duration:.0f}s / {audio_duration/60:.1f} min)")
+
+    # -- Phase 3: Transcribe (batched) --
+    yield f"Transcribing{file_size_str} (batch_size={batch_size})...", "", None
+    log.info(f"[{request_id}] >> Starting batched transcription...")
     t0 = time.time()
 
     try:
-        segments_gen, info = m.transcribe(
-            file,
+        result = m.transcribe(
+            audio,
             language=lang,
-            beam_size=5,
-            condition_on_previous_text=False,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=500),
+            batch_size=batch_size,
         )
-
-        # Consume the generator to collect all segments
-        segments = []
-        formatted_lines = []
-        for seg in segments_gen:
-            segments.append(seg)
-            ts = format_timestamp_display(seg.start)
-            formatted_lines.append(f"[{ts}] {seg.text.strip()}")
-            # Stream to UI every 10 segments
-            if len(segments) % 10 == 0:
-                elapsed_so_far = time.time() - t0
-                # Log every 50
-                if len(segments) % 50 == 0:
-                    log.info(f"[{request_id}]   ... {len(segments)} segments processed ({elapsed_so_far:.0f}s)")
-                yield (
-                    f"Transcribing{file_size_str}... {len(segments)} segments ({elapsed_so_far:.0f}s)",
-                    "\n".join(formatted_lines),
-                    None,
-                )
-
     except Exception as e:
         log.error(f"[{request_id}] Transcription FAILED: {e}")
         traceback.print_exc()
         yield f"Error: {e}", "", None
         return
 
-    elapsed = time.time() - t0
-    num_segments = len(segments)
-    detected_lang = info.language
-    lang_prob = info.language_probability
-    duration = info.duration
-
+    transcribe_elapsed = time.time() - t0
+    detected_lang = result.get("language", lang or "unknown")
+    num_segments = len(result.get("segments", []))
     log.info(f"[{request_id}] [OK] Transcription complete")
-    log.info(f"[{request_id}]   Time: {elapsed:.1f}s")
-    log.info(f"[{request_id}]   Audio duration: {duration:.0f}s ({duration/60:.1f} min)")
-    log.info(f"[{request_id}]   Speed: {duration/elapsed:.1f}x realtime")
+    log.info(f"[{request_id}]   Time: {transcribe_elapsed:.1f}s")
+    log.info(f"[{request_id}]   Audio duration: {audio_duration:.0f}s ({audio_duration/60:.1f} min)")
+    log.info(f"[{request_id}]   Speed: {audio_duration/transcribe_elapsed:.1f}x realtime")
     log.info(f"[{request_id}]   Segments: {num_segments}")
-    log.info(f"[{request_id}]   Detected language: {detected_lang} ({lang_prob:.0%})")
+    log.info(f"[{request_id}]   Detected language: {detected_lang}")
 
-    # -- Phase 3: Speaker diarization (optional) --
-    speaker_map = None
-    if enable_diarization and PyannotePipeline is not None:
-        yield f"Loading audio for diarization...", "\n".join(formatted_lines), None
-        log.info(f"[{request_id}] Running diarization...")
+    # Show initial transcript before alignment
+    formatted_lines = []
+    for seg in result.get("segments", []):
+        ts = format_timestamp_display(seg.get("start", 0))
+        formatted_lines.append(f"[{ts}] {seg.get('text', '').strip()}")
+    yield f"Transcribed {num_segments} segments, aligning...", "\n".join(formatted_lines), None
+
+    # -- Phase 4: Word-level alignment (wav2vec2) --
+    log.info(f"[{request_id}] Running word-level alignment for '{detected_lang}'...")
+    t0_align = time.time()
+    try:
+        model_a, metadata = load_align_model(detected_lang)
+        result = whisperx.align(
+            result["segments"],
+            model_a,
+            metadata,
+            audio,
+            DEVICE,
+            return_char_alignments=False,
+        )
+        align_elapsed = time.time() - t0_align
+        log.info(f"[{request_id}]   Alignment complete in {align_elapsed:.1f}s")
+    except Exception as e:
+        log.warning(f"[{request_id}]   Alignment failed (proceeding without): {e}")
+        # result still has segment-level timestamps, just not word-level
+
+    # Rebuild display after alignment (timestamps may have been refined)
+    formatted_lines = []
+    for seg in result.get("segments", []):
+        ts = format_timestamp_display(seg.get("start", 0))
+        formatted_lines.append(f"[{ts}] {seg.get('text', '').strip()}")
+    yield f"Aligned {num_segments} segments", "\n".join(formatted_lines), None
+
+    # -- Phase 5: Speaker diarization (optional) --
+    if enable_diarization and DIARIZATION_AVAILABLE:
+        yield "Loading diarization pipeline...", "\n".join(formatted_lines), None
+        log.info(f"[{request_id}] Running speaker diarization...")
+        min_spk = int(min_speakers) if min_speakers and int(min_speakers) > 0 else None
+        max_spk = int(max_speakers) if max_speakers and int(max_speakers) > 0 else None
+        if min_spk or max_spk:
+            log.info(f"[{request_id}]   Speaker constraints: min={min_spk}, max={max_spk}")
         t0_diar = time.time()
         try:
-            import torchaudio
             dpipe = load_diarization()
             if dpipe is not None:
-                # torchaudio 2.10 uses torchcodec under the hood (needs libpython3.12t64)
-                # Load file directly -- torchcodec handles mkv, mp4, wav, etc.
-                log.info(f"[{request_id}]   Loading audio with torchaudio...")
-                waveform, sample_rate = torchaudio.load(file)
-                audio_input = {"waveform": waveform, "sample_rate": sample_rate}
-                log.info(f"[{request_id}]   Audio loaded: {waveform.shape[1]/sample_rate:.0f}s, {sample_rate}Hz")
+                yield "Running speaker diarization...", "\n".join(formatted_lines), None
+                diarize_segments = dpipe(audio, min_speakers=min_spk, max_speakers=max_spk)
+                result = whisperx.assign_word_speakers(diarize_segments, result)
 
-                yield f"Running speaker diarization...", "\n".join(formatted_lines), None
-                diar_result = dpipe(audio_input)
-                labeled = assign_speakers(segments, diar_result)
                 # Rebuild formatted lines with speaker labels
                 formatted_lines = []
-                for seg, speaker in labeled:
-                    ts = format_timestamp_display(seg.start)
-                    formatted_lines.append(f"[{ts}] [{speaker}] {seg.text.strip()}")
-                speaker_map = [spk for _, spk in labeled]
+                for seg in result.get("segments", []):
+                    ts = format_timestamp_display(seg.get("start", 0))
+                    speaker = seg.get("speaker", "?")
+                    formatted_lines.append(f"[{ts}] [{speaker}] {seg.get('text', '').strip()}")
+
+                num_speakers = len(set(
+                    seg.get("speaker", "?") for seg in result.get("segments", [])
+                ))
                 diar_time = time.time() - t0_diar
-                num_speakers = len(set(spk for _, spk in labeled))
                 log.info(f"[{request_id}]   Diarization complete in {diar_time:.1f}s ({num_speakers} speakers)")
             else:
                 log.warning(f"[{request_id}]   Diarization pipeline not available")
@@ -363,13 +420,16 @@ def transcribe(file, model_name, language, output_format, enable_diarization):
             log.error(f"[{request_id}]   Diarization failed: {e}")
             traceback.print_exc()
     elif enable_diarization:
-        log.warning(f"[{request_id}]   Diarization requested but pyannote not available (check HF_TOKEN)")
+        log.warning(f"[{request_id}]   Diarization requested but HF_TOKEN not set")
 
     transcript = "\n".join(formatted_lines)
+    segments = result.get("segments", [])
     log.info(f"[{request_id}]   Text length: {len(transcript)} chars")
 
-    # -- Phase 4: Generate subtitle file --
+    # -- Phase 6: Generate subtitle file --
     subtitle_file = None
+    has_speakers = enable_diarization and any(seg.get("speaker") for seg in segments)
+
     if output_format == "txt":
         yield "Generating txt file...", transcript, None
         log.info(f"[{request_id}] Generating txt file...")
@@ -377,40 +437,42 @@ def transcribe(file, model_name, language, output_format, enable_diarization):
         tmp.write(transcript)
         tmp.close()
         subtitle_file = tmp.name
-        log.info(f"[{request_id}] Subtitle file: {subtitle_file}")
-    elif output_format in ("srt", "vtt", "all"):
+    elif output_format in ("srt", "vtt"):
         yield f"Generating {output_format} file...", transcript, None
         log.info(f"[{request_id}] Generating {output_format} subtitle file...")
-        ext = "srt" if output_format != "vtt" else "vtt"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}", mode="w")
-        if ext == "srt":
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}", mode="w")
+        if output_format == "srt":
             for i, seg in enumerate(segments, 1):
-                start_ts = format_timestamp_srt(seg.start)
-                end_ts = format_timestamp_srt(seg.end)
+                start_ts = format_timestamp_srt(seg.get("start", 0))
+                end_ts = format_timestamp_srt(seg.get("end", 0))
                 speaker_prefix = ""
-                if speaker_map and i - 1 < len(speaker_map):
-                    speaker_prefix = f"[{speaker_map[i - 1]}] "
-                tmp.write(f"{i}\n{start_ts} --> {end_ts}\n{speaker_prefix}{seg.text.strip()}\n\n")
-        else:
+                if has_speakers:
+                    speaker_prefix = f"[{seg.get('speaker', '?')}] "
+                tmp.write(f"{i}\n{start_ts} --> {end_ts}\n{speaker_prefix}{seg.get('text', '').strip()}\n\n")
+        else:  # vtt
             tmp.write("WEBVTT\n\n")
-            for idx, seg in enumerate(segments):
-                start_ts = format_timestamp_vtt(seg.start)
-                end_ts = format_timestamp_vtt(seg.end)
+            for seg in segments:
+                start_ts = format_timestamp_vtt(seg.get("start", 0))
+                end_ts = format_timestamp_vtt(seg.get("end", 0))
                 speaker_prefix = ""
-                if speaker_map and idx < len(speaker_map):
-                    speaker_prefix = f"[{speaker_map[idx]}] "
-                tmp.write(f"{start_ts} --> {end_ts}\n{speaker_prefix}{seg.text.strip()}\n\n")
+                if has_speakers:
+                    speaker_prefix = f"[{seg.get('speaker', '?')}] "
+                tmp.write(f"{start_ts} --> {end_ts}\n{speaker_prefix}{seg.get('text', '').strip()}\n\n")
         tmp.close()
         subtitle_file = tmp.name
         log.info(f"[{request_id}] Subtitle file: {subtitle_file}")
 
-    total_time = model_time + elapsed
-    speed = duration / elapsed if elapsed > 0 else 0
-    done_msg = f"Done -- {num_segments} segments, {elapsed:.0f}s ({speed:.1f}x realtime), {detected_lang} ({lang_prob:.0%})"
+    total_time = model_time + transcribe_elapsed
+    speed = audio_duration / transcribe_elapsed if transcribe_elapsed > 0 else 0
+    done_parts = [f"{num_segments} segments", f"{transcribe_elapsed:.0f}s ({speed:.1f}x realtime)", detected_lang]
+    if has_speakers:
+        speaker_count = len(set(seg.get("speaker", "?") for seg in segments))
+        done_parts.append(f"{speaker_count} speakers")
+    done_msg = f"Done -- {', '.join(done_parts)}"
     log.info(f"[{request_id}] == Request complete ({total_time:.1f}s total) ==")
 
-    # Cleanup: remove uploaded file and previous subtitle temp file
-    cleanup_upload(file)
+    # Cleanup: only remove previous subtitle file (not the uploaded file --
+    # the user may re-transcribe with different settings)
     if _previous_subtitle and os.path.exists(_previous_subtitle):
         try:
             os.remove(_previous_subtitle)
@@ -500,12 +562,12 @@ footer { display: none !important; }
 # -- Gradio UI -----------------------------------------------------------------
 log.info("Building Gradio UI...")
 
-with gr.Blocks(title="Whisper Transcription") as demo:
+with gr.Blocks(title="WhisperX Transcription") as demo:
 
     gr.HTML(f"""
         <div class="header-wrap">
-            <h2>Whisper Transcription</h2>
-            <div class="sub">faster-whisper (CTranslate2)</div>
+            <h2>WhisperX Transcription</h2>
+            <div class="sub">whisperX (faster-whisper + wav2vec2 alignment + pyannote diarization)</div>
             <div class="gpu">{GPU_INFO_STR}</div>
         </div>
     """)
@@ -518,8 +580,8 @@ with gr.Blocks(title="Whisper Transcription") as demo:
     )
     with gr.Row():
         model_dropdown = gr.Dropdown(
-            choices=["tiny", "base", "small", "medium", "large"],
-            value="large",
+            choices=["tiny", "base", "small", "medium", "large", "turbo"],
+            value="turbo",
             label="Model",
         )
         lang_dropdown = gr.Dropdown(
@@ -532,11 +594,35 @@ with gr.Blocks(title="Whisper Transcription") as demo:
             value="srt",
             label="Format",
         )
-    diarize_checkbox = gr.Checkbox(
-        label="Speaker diarization (identify who is speaking)",
-        value=False,
-        interactive=PyannotePipeline is not None,
-    )
+    with gr.Row():
+        diarize_checkbox = gr.Checkbox(
+            label="Speaker diarization (identify who is speaking)",
+            value=False,
+            interactive=DIARIZATION_AVAILABLE,
+        )
+        min_speakers_input = gr.Number(
+            value=0,
+            label="Min speakers (0 = auto)",
+            minimum=0,
+            maximum=20,
+            precision=0,
+            interactive=DIARIZATION_AVAILABLE,
+        )
+        max_speakers_input = gr.Number(
+            value=0,
+            label="Max speakers (0 = auto)",
+            minimum=0,
+            maximum=20,
+            precision=0,
+            interactive=DIARIZATION_AVAILABLE,
+        )
+        batch_slider = gr.Slider(
+            minimum=1,
+            maximum=64,
+            step=1,
+            value=DEFAULT_BATCH_SIZE,
+            label="Batch size (higher = faster, more VRAM)",
+        )
     transcribe_btn = gr.Button(
         "Transcribe",
         variant="primary",
@@ -578,8 +664,16 @@ with gr.Blocks(title="Whisper Transcription") as demo:
     )
     output_file = gr.File(label="Subtitles", height=50, interactive=False)
 
-    # Enable/disable button based on file upload state
+    # Track the previous upload so we can clean it up when a new file arrives
+    _previous_upload = {"path": None}
+
     def on_file_change(f):
+        # Clean up the previous upload when a new file is uploaded
+        prev = _previous_upload["path"]
+        if prev and prev != f:
+            cleanup_upload(prev)
+        _previous_upload["path"] = f
+
         if f is not None:
             try:
                 size_mb = os.path.getsize(f) / (1024 * 1024)
@@ -597,7 +691,21 @@ with gr.Blocks(title="Whisper Transcription") as demo:
         outputs=[transcribe_btn],
     )
 
-    # Auto-transcribe when a file is uploaded; also request notification permission
+    all_inputs = [file_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox, min_speakers_input, max_speakers_input, batch_slider]
+    all_outputs = [status_text, output_text, output_file]
+
+    notification_js = """(status) => {
+        if (!status || !status.startsWith("Done --")) return;
+        if ("Notification" in window && Notification.permission === "granted") {
+            new Notification("Transcription Complete", {
+                body: status,
+                icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>"
+            });
+        }
+    }"""
+
+    # Request notification permission on upload (but don't auto-transcribe --
+    # let the user set options like diarization/model/language first)
     file_input.upload(
         fn=None,
         js="""() => {
@@ -605,41 +713,17 @@ with gr.Blocks(title="Whisper Transcription") as demo:
                 Notification.requestPermission();
             }
         }""",
-    ).then(
-        fn=transcribe,
-        inputs=[file_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox],
-        outputs=[status_text, output_text, output_file],
-    ).then(
-        fn=None,
-        inputs=[status_text],
-        js="""(status) => {
-            if (!status || !status.startsWith("Done --")) return;
-            if ("Notification" in window && Notification.permission === "granted") {
-                new Notification("Transcription Complete", {
-                    body: status,
-                    icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>"
-                });
-            }
-        }""",
     )
 
-    # Manual transcribe button (still works)
+    # Transcribe button
     transcribe_btn.click(
         fn=transcribe,
-        inputs=[file_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox],
-        outputs=[status_text, output_text, output_file],
+        inputs=all_inputs,
+        outputs=all_outputs,
     ).then(
         fn=None,
         inputs=[status_text],
-        js="""(status) => {
-            if (!status || !status.startsWith("Done --")) return;
-            if ("Notification" in window && Notification.permission === "granted") {
-                new Notification("Transcription Complete", {
-                    body: status,
-                    icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙</text></svg>"
-                });
-            }
-        }""",
+        js=notification_js,
     )
 
 # -- Launch --------------------------------------------------------------------

@@ -1,5 +1,2 @@
-faster-whisper
+whisperx
 gradio
-pyannote.audio
-torch
-torchaudio
