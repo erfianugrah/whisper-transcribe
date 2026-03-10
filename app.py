@@ -4,8 +4,8 @@ import time
 import logging
 import tempfile
 import traceback
-import glob
 import shutil
+import json
 
 # -- Logging setup -------------------------------------------------------------
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "1") == "1"
@@ -105,12 +105,12 @@ else:
 
 # -- Model management ---------------------------------------------------------
 whisper_model = None
-current_model_key = None  # (model_name, hotwords) tuple for cache invalidation
+current_model_key = None  # (model_name, hotwords, initial_prompt, suppress_numerals) for cache invalidation
 diarize_model = None
 align_model_cache = {}  # keyed by language code
 
 
-def load_whisper(model_name, hotwords=None):
+def load_whisper(model_name, hotwords=None, initial_prompt=None, suppress_numerals=False):
     """Load (or reuse) a whisperX transcription model."""
     global whisper_model, current_model_key
     # Map friendly names to actual model IDs
@@ -120,15 +120,23 @@ def load_whisper(model_name, hotwords=None):
     elif model_name == "turbo":
         actual_name = "large-v3-turbo"
 
-    cache_key = (actual_name, hotwords or "")
+    cache_key = (actual_name, hotwords or "", initial_prompt or "", suppress_numerals)
     if cache_key != current_model_key:
         log.info(f"Loading whisperX model '{actual_name}' on {DEVICE} (compute_type={COMPUTE_TYPE})...")
         if hotwords:
             log.info(f"  Hotwords: {hotwords[:100]}...")
+        if initial_prompt:
+            log.info(f"  Initial prompt: {initial_prompt[:100]}...")
+        if suppress_numerals:
+            log.info(f"  Suppress numerals: enabled")
         t0 = time.time()
         asr_options = {}
         if hotwords:
             asr_options["hotwords"] = hotwords
+        if initial_prompt:
+            asr_options["initial_prompt"] = initial_prompt
+        if suppress_numerals:
+            asr_options["suppress_numerals"] = True
         whisper_model = whisperx.load_model(
             actual_name,
             device=DEVICE,
@@ -231,7 +239,7 @@ if DEVICE == "cuda":
         vram_bytes = torch.cuda.get_device_properties(0).total_memory
         vram_gb = vram_bytes / (1024 ** 3)
         if vram_gb >= 24:
-            DEFAULT_BATCH_SIZE = 32
+            DEFAULT_BATCH_SIZE = 64
         elif vram_gb >= 16:
             DEFAULT_BATCH_SIZE = 24
         elif vram_gb >= 10:
@@ -323,7 +331,7 @@ def _words_to_segment(words, speaker):
 
 
 # -- Transcription (generator for live UI updates) ----------------------------
-def transcribe(file, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords):
+def transcribe(file, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords, initial_prompt, suppress_numerals):
     """Yields (status, transcript, subtitle_file) tuples for live progress."""
     global _previous_subtitle
     request_id = f"req-{int(time.time()*1000) % 100000}"
@@ -346,20 +354,29 @@ def transcribe(file, model_name, language, output_format, enable_diarization, mi
 
     batch_size = int(batch_size)
     hotwords_str = hotwords.strip() if hotwords else ""
+    prompt_str = initial_prompt.strip() if initial_prompt else ""
     log.info(f"[{request_id}] Model: {model_name}")
     log.info(f"[{request_id}] Language: {language}")
     log.info(f"[{request_id}] Output format: {output_format}")
     log.info(f"[{request_id}] Diarization: {enable_diarization}")
     log.info(f"[{request_id}] Batch size: {batch_size}")
+    log.info(f"[{request_id}] Suppress numerals: {suppress_numerals}")
     if hotwords_str:
         log.info(f"[{request_id}] Hotwords: {hotwords_str[:100]}")
+    if prompt_str:
+        log.info(f"[{request_id}] Initial prompt: {prompt_str[:100]}")
     log.info(f"[{request_id}] Device: {DEVICE}, compute_type: {COMPUTE_TYPE}")
 
     # -- Phase 1: Load whisperX model --
     yield f"Loading whisperX model '{model_name}'...", "", None
     log.info(f"[{request_id}] Loading whisperX model...")
     t0_model = time.time()
-    m = load_whisper(model_name, hotwords=hotwords_str or None)
+    m = load_whisper(
+        model_name,
+        hotwords=hotwords_str or None,
+        initial_prompt=prompt_str or None,
+        suppress_numerals=bool(suppress_numerals),
+    )
     model_time = time.time() - t0_model
     log.info(f"[{request_id}] WhisperX model ready in {model_time:.2f}s")
 
@@ -422,6 +439,7 @@ def transcribe(file, model_name, language, output_format, enable_diarization, mi
             audio,
             language=lang,
             batch_size=batch_size,
+            print_progress=True,
         )
     except Exception as e:
         log.error(f"[{request_id}] Transcription FAILED: {e}")
@@ -458,6 +476,7 @@ def transcribe(file, model_name, language, output_format, enable_diarization, mi
             audio,
             DEVICE,
             return_char_alignments=False,
+            print_progress=True,
         )
         align_elapsed = time.time() - t0_align
         log.info(f"[{request_id}]   Alignment complete in {align_elapsed:.1f}s")
@@ -531,6 +550,43 @@ def transcribe(file, model_name, language, output_format, enable_diarization, mi
         tmp.write(transcript)
         tmp.close()
         subtitle_file = tmp.name
+    elif output_format == "json":
+        yield "Generating JSON file...", transcript, None
+        log.info(f"[{request_id}] Generating JSON file with word-level timestamps...")
+        json_data = {
+            "language": detected_lang,
+            "duration": round(audio_duration, 2),
+            "segments": [],
+        }
+        for seg in segments:
+            seg_out = {
+                "start": round(seg.get("start", 0), 3),
+                "end": round(seg.get("end", 0), 3),
+                "text": seg.get("text", "").strip(),
+            }
+            if has_speakers:
+                seg_out["speaker"] = seg.get("speaker", "?")
+            # Include word-level timestamps when available
+            words = seg.get("words", [])
+            if words:
+                seg_out["words"] = []
+                for w in words:
+                    word_out = {"word": w.get("word", "").strip()}
+                    if "start" in w:
+                        word_out["start"] = round(w["start"], 3)
+                    if "end" in w:
+                        word_out["end"] = round(w["end"], 3)
+                    if "score" in w:
+                        word_out["confidence"] = round(w["score"], 3)
+                    if has_speakers and "speaker" in w:
+                        word_out["speaker"] = w["speaker"]
+                    seg_out["words"].append(word_out)
+            json_data["segments"].append(seg_out)
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w")
+        json.dump(json_data, tmp, ensure_ascii=False, indent=2)
+        tmp.close()
+        subtitle_file = tmp.name
+        log.info(f"[{request_id}] JSON file: {subtitle_file}")
     elif output_format in ("srt", "vtt"):
         yield f"Generating {output_format} file...", transcript, None
         log.info(f"[{request_id}] Generating {output_format} subtitle file...")
@@ -679,9 +735,13 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
             label="Language",
         )
         format_dropdown = gr.Dropdown(
-            choices=["txt", "srt", "vtt"],
+            choices=["txt", "srt", "vtt", "json"],
             value="srt",
             label="Format",
+        )
+    if not DIARIZATION_AVAILABLE:
+        gr.Markdown(
+            "<small style='opacity:0.6'>Speaker diarization is disabled -- set the <code>HF_TOKEN</code> environment variable to enable it.</small>"
         )
     with gr.Row():
         diarize_checkbox = gr.Checkbox(
@@ -718,6 +778,16 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         placeholder="e.g. proper nouns, product names, technical terms",
         lines=1,
         max_lines=1,
+    )
+    initial_prompt_input = gr.Textbox(
+        label="Initial prompt (context hint for the first transcription window)",
+        placeholder="e.g. This is a meeting about quarterly sales results.",
+        lines=1,
+        max_lines=2,
+    )
+    suppress_numerals_input = gr.Checkbox(
+        label="Suppress numerals (spell out numbers -- improves word alignment accuracy)",
+        value=False,
     )
 
     # Upload triggers transcription automatically with current settings
@@ -794,7 +864,7 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         outputs=[transcribe_btn],
     )
 
-    all_inputs = [file_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox, min_speakers_input, max_speakers_input, batch_slider, hotwords_input]
+    all_inputs = [file_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox, min_speakers_input, max_speakers_input, batch_slider, hotwords_input, initial_prompt_input, suppress_numerals_input]
     all_outputs = [status_text, output_text, output_file]
 
     notification_js = """(status) => {
