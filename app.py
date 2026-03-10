@@ -105,14 +105,14 @@ else:
 
 # -- Model management ---------------------------------------------------------
 whisper_model = None
-current_model_name = None
+current_model_key = None  # (model_name, hotwords) tuple for cache invalidation
 diarize_model = None
 align_model_cache = {}  # keyed by language code
 
 
-def load_whisper(model_name):
+def load_whisper(model_name, hotwords=None):
     """Load (or reuse) a whisperX transcription model."""
-    global whisper_model, current_model_name
+    global whisper_model, current_model_key
     # Map friendly names to actual model IDs
     actual_name = model_name
     if model_name == "large":
@@ -120,18 +120,25 @@ def load_whisper(model_name):
     elif model_name == "turbo":
         actual_name = "large-v3-turbo"
 
-    if actual_name != current_model_name:
+    cache_key = (actual_name, hotwords or "")
+    if cache_key != current_model_key:
         log.info(f"Loading whisperX model '{actual_name}' on {DEVICE} (compute_type={COMPUTE_TYPE})...")
+        if hotwords:
+            log.info(f"  Hotwords: {hotwords[:100]}...")
         t0 = time.time()
+        asr_options = {}
+        if hotwords:
+            asr_options["hotwords"] = hotwords
         whisper_model = whisperx.load_model(
             actual_name,
             device=DEVICE,
             compute_type=COMPUTE_TYPE,
-            language=None,  # auto-detect; set per-transcribe call
+            language=None,
+            asr_options=asr_options if asr_options else None,
         )
         elapsed = time.time() - t0
         log.info(f"  WhisperX model loaded in {elapsed:.2f}s")
-        current_model_name = actual_name
+        current_model_key = cache_key
     else:
         log.info(f"WhisperX model '{actual_name}' already loaded, reusing")
     return whisper_model
@@ -239,8 +246,84 @@ if DEVICE == "cuda":
         log.warning(f"VRAM detection failed ({e}), defaulting batch_size={DEFAULT_BATCH_SIZE}")
 
 
+# -- Post-processing: split segments at speaker boundaries --------------------
+def split_segments_by_speaker(segments):
+    """Split segments where the speaker changes mid-segment (using word-level labels).
+
+    Also splits overly long single-speaker segments at sentence boundaries.
+    """
+    MAX_SEGMENT_WORDS = 40  # split segments longer than this at sentence ends
+
+    new_segments = []
+    for seg in segments:
+        words = seg.get("words", [])
+        if not words:
+            new_segments.append(seg)
+            continue
+
+        # Group consecutive words by speaker
+        groups = []
+        current_speaker = None
+        current_words = []
+        for w in words:
+            speaker = w.get("speaker", seg.get("speaker", "?"))
+            if speaker != current_speaker and current_words:
+                groups.append((current_speaker, current_words))
+                current_words = []
+            current_speaker = speaker
+            current_words.append(w)
+        if current_words:
+            groups.append((current_speaker, current_words))
+
+        # Build new segments from groups
+        for speaker, group_words in groups:
+            # Further split long groups at sentence boundaries
+            sub_segments = _split_at_sentences(group_words, speaker, MAX_SEGMENT_WORDS)
+            new_segments.extend(sub_segments)
+
+    return new_segments
+
+
+def _split_at_sentences(words, speaker, max_words):
+    """Split a word list at sentence-ending punctuation if it exceeds max_words."""
+    if len(words) <= max_words:
+        return [_words_to_segment(words, speaker)]
+
+    segments = []
+    current = []
+    sentence_enders = {".", "!", "?", "。", "！", "？"}
+
+    for w in words:
+        current.append(w)
+        text = w.get("word", "").strip()
+        # Split if we hit a sentence ender and have enough words
+        if len(current) >= 8 and text and text[-1] in sentence_enders:
+            segments.append(_words_to_segment(current, speaker))
+            current = []
+
+    if current:
+        segments.append(_words_to_segment(current, speaker))
+
+    return segments
+
+
+def _words_to_segment(words, speaker):
+    """Build a segment dict from a list of word dicts."""
+    text = " ".join(w.get("word", "").strip() for w in words if w.get("word", "").strip())
+    # Use word timestamps for precise boundaries
+    starts = [w["start"] for w in words if "start" in w]
+    ends = [w["end"] for w in words if "end" in w]
+    return {
+        "start": starts[0] if starts else words[0].get("start", 0),
+        "end": ends[-1] if ends else words[-1].get("end", 0),
+        "text": text,
+        "speaker": speaker,
+        "words": words,
+    }
+
+
 # -- Transcription (generator for live UI updates) ----------------------------
-def transcribe(file, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size):
+def transcribe(file, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords):
     """Yields (status, transcript, subtitle_file) tuples for live progress."""
     global _previous_subtitle
     request_id = f"req-{int(time.time()*1000) % 100000}"
@@ -262,18 +345,21 @@ def transcribe(file, model_name, language, output_format, enable_diarization, mi
         log.info(f"[{request_id}] Could not determine file size")
 
     batch_size = int(batch_size)
+    hotwords_str = hotwords.strip() if hotwords else ""
     log.info(f"[{request_id}] Model: {model_name}")
     log.info(f"[{request_id}] Language: {language}")
     log.info(f"[{request_id}] Output format: {output_format}")
     log.info(f"[{request_id}] Diarization: {enable_diarization}")
     log.info(f"[{request_id}] Batch size: {batch_size}")
+    if hotwords_str:
+        log.info(f"[{request_id}] Hotwords: {hotwords_str[:100]}")
     log.info(f"[{request_id}] Device: {DEVICE}, compute_type: {COMPUTE_TYPE}")
 
     # -- Phase 1: Load whisperX model --
     yield f"Loading whisperX model '{model_name}'...", "", None
     log.info(f"[{request_id}] Loading whisperX model...")
     t0_model = time.time()
-    m = load_whisper(model_name)
+    m = load_whisper(model_name, hotwords=hotwords_str or None)
     model_time = time.time() - t0_model
     log.info(f"[{request_id}] WhisperX model ready in {model_time:.2f}s")
 
@@ -402,6 +488,13 @@ def transcribe(file, model_name, language, output_format, enable_diarization, mi
                 diarize_segments = dpipe(audio, min_speakers=min_spk, max_speakers=max_spk)
                 result = whisperx.assign_word_speakers(diarize_segments, result)
 
+                # Split segments at speaker boundaries and long runs
+                original_count = len(result.get("segments", []))
+                result["segments"] = split_segments_by_speaker(result.get("segments", []))
+                new_count = len(result["segments"])
+                if new_count != original_count:
+                    log.info(f"[{request_id}]   Split {original_count} -> {new_count} segments at speaker/sentence boundaries")
+
                 # Rebuild formatted lines with speaker labels
                 formatted_lines = []
                 for seg in result.get("segments", []):
@@ -424,6 +517,7 @@ def transcribe(file, model_name, language, output_format, enable_diarization, mi
 
     transcript = "\n".join(formatted_lines)
     segments = result.get("segments", [])
+    num_segments = len(segments)  # update after potential splitting
     log.info(f"[{request_id}]   Text length: {len(transcript)} chars")
 
     # -- Phase 6: Generate subtitle file --
@@ -572,12 +666,7 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         </div>
     """)
 
-    # -- Top row: file upload + settings + button --
-    file_input = gr.File(
-        label="Upload Audio/Video",
-        file_types=["audio", "video"],
-        height=140,
-    )
+    # -- Settings first, then upload --
     with gr.Row():
         model_dropdown = gr.Dropdown(
             choices=["tiny", "base", "small", "medium", "large", "turbo"],
@@ -623,6 +712,20 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
             value=DEFAULT_BATCH_SIZE,
             label="Batch size (higher = faster, more VRAM)",
         )
+
+    hotwords_input = gr.Textbox(
+        label="Hotwords (names, jargon, or terms the model might mishear)",
+        placeholder="e.g. proper nouns, product names, technical terms",
+        lines=1,
+        max_lines=1,
+    )
+
+    # Upload triggers transcription automatically with current settings
+    file_input = gr.File(
+        label="Upload Audio/Video (transcription starts automatically)",
+        file_types=["audio", "video"],
+        height=140,
+    )
     transcribe_btn = gr.Button(
         "Transcribe",
         variant="primary",
@@ -691,7 +794,7 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         outputs=[transcribe_btn],
     )
 
-    all_inputs = [file_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox, min_speakers_input, max_speakers_input, batch_slider]
+    all_inputs = [file_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox, min_speakers_input, max_speakers_input, batch_slider, hotwords_input]
     all_outputs = [status_text, output_text, output_file]
 
     notification_js = """(status) => {
@@ -704,8 +807,7 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         }
     }"""
 
-    # Request notification permission on upload (but don't auto-transcribe --
-    # let the user set options like diarization/model/language first)
+    # Auto-transcribe on upload (settings are above, so they're already configured)
     file_input.upload(
         fn=None,
         js="""() => {
@@ -713,9 +815,17 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
                 Notification.requestPermission();
             }
         }""",
+    ).then(
+        fn=transcribe,
+        inputs=all_inputs,
+        outputs=all_outputs,
+    ).then(
+        fn=None,
+        inputs=[status_text],
+        js=notification_js,
     )
 
-    # Transcribe button
+    # Manual re-transcribe button (for changing settings on an already-uploaded file)
     transcribe_btn.click(
         fn=transcribe,
         inputs=all_inputs,
