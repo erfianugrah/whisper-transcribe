@@ -331,16 +331,28 @@ def _words_to_segment(words, speaker):
 
 
 # -- Transcription (generator for live UI updates) ----------------------------
-def transcribe(file, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords, initial_prompt, suppress_numerals):
+def transcribe(file, local_path, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords, initial_prompt, suppress_numerals):
     """Yields (status, transcript, subtitle_file) tuples for live progress."""
     global _previous_subtitle
     request_id = f"req-{int(time.time()*1000) % 100000}"
+
+    # Prefer local path over uploaded file (for large files that can't be uploaded via browser)
+    local_path_str = local_path.strip() if local_path else ""
+    if local_path_str:
+        if os.path.isfile(local_path_str):
+            file = local_path_str
+            log.info(f"[{request_id}] Using local path: {file}")
+        else:
+            log.error(f"[{request_id}] Local path not found: {local_path_str}")
+            yield f"Error: file not found: {local_path_str}", "", None
+            return
+
     log.info(f"[{request_id}] == New transcription request ==")
     log.info(f"[{request_id}] File: {file}")
 
     if file is None:
         log.warning(f"[{request_id}] No file provided")
-        yield "No file uploaded.", "", None
+        yield "No file uploaded or local path specified.", "", None
         return
 
     # File info
@@ -796,10 +808,17 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         file_types=["audio", "video"],
         height=140,
     )
+    gr.Markdown("<div style='text-align:center; opacity:0.45; font-size:0.85rem; margin:-0.25rem 0 0.25rem'>or use a local path for large files (mounted at /media)</div>")
+    local_path_input = gr.Textbox(
+        label="Local file path (for large files -- skip browser upload)",
+        placeholder="/media/2026-03-23 15-30-00.mkv",
+        lines=1,
+        max_lines=1,
+    )
     transcribe_btn = gr.Button(
         "Transcribe",
         variant="primary",
-        interactive=False,
+        interactive=True,
     )
 
     # -- Output --
@@ -864,7 +883,7 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         outputs=[transcribe_btn],
     )
 
-    all_inputs = [file_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox, min_speakers_input, max_speakers_input, batch_slider, hotwords_input, initial_prompt_input, suppress_numerals_input]
+    all_inputs = [file_input, local_path_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox, min_speakers_input, max_speakers_input, batch_slider, hotwords_input, initial_prompt_input, suppress_numerals_input]
     all_outputs = [status_text, output_text, output_file]
 
     notification_js = """(status) => {

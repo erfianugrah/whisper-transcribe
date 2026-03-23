@@ -10,6 +10,7 @@ services:
       - ./uploads:/data
       - ./app.py:/app/app.py:ro
       - model-cache:/root/.cache/huggingface
+      - /mnt/d/Videos:/media:ro
     deploy:
       resources:
         reservations:
