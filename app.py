@@ -6,6 +6,7 @@ import tempfile
 import traceback
 import shutil
 import json
+import threading
 
 # -- Logging setup -------------------------------------------------------------
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "1") == "1"
@@ -108,6 +109,42 @@ whisper_model = None
 current_model_key = None  # (model_name, hotwords, initial_prompt, suppress_numerals) for cache invalidation
 diarize_model = None
 align_model_cache = {}  # keyed by language code
+
+# Idle unload: free VRAM after MODEL_IDLE_TIMEOUT seconds of no transcription
+MODEL_IDLE_TIMEOUT = int(os.environ.get("MODEL_IDLE_TIMEOUT", "300"))  # 5 min default
+_last_activity = time.time()
+_idle_timer = None
+_idle_lock = threading.Lock()
+
+
+def _unload_models():
+    """Release all GPU models to free VRAM."""
+    global whisper_model, current_model_key, diarize_model, align_model_cache
+    with _idle_lock:
+        elapsed = time.time() - _last_activity
+        if elapsed < MODEL_IDLE_TIMEOUT:
+            return  # Activity happened since timer was set
+        if whisper_model is None and diarize_model is None and not align_model_cache:
+            return  # Nothing loaded
+        log.info(f"Idle for {elapsed:.0f}s — unloading models to free VRAM")
+        whisper_model = None
+        current_model_key = None
+        diarize_model = None
+        align_model_cache = {}
+        if DEVICE == "cuda":
+            torch.cuda.empty_cache()
+        log.info("Models unloaded, VRAM freed")
+
+
+def _reset_idle_timer():
+    """Reset the idle timer. Called at start and end of transcription."""
+    global _last_activity, _idle_timer
+    _last_activity = time.time()
+    if _idle_timer is not None:
+        _idle_timer.cancel()
+    _idle_timer = threading.Timer(MODEL_IDLE_TIMEOUT + 5, _unload_models)
+    _idle_timer.daemon = True
+    _idle_timer.start()
 
 
 def load_whisper(model_name, hotwords=None, initial_prompt=None, suppress_numerals=False):
@@ -451,7 +488,6 @@ _cancel_requested = {"value": False}
 _last_result = {"segments": [], "has_speakers": False, "format": "srt"}
 
 # -- Concurrency lock ----------------------------------------------------------
-import threading
 _transcription_lock = threading.Lock()
 
 
@@ -480,6 +516,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
     """
     global _previous_subtitle
 
+    _reset_idle_timer()  # Mark activity — prevent unload during transcription
     _speaker_index_map.clear()
 
     def _plain_html(text):
@@ -843,6 +880,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
         "segments": num_segments,
     })
 
+    _reset_idle_timer()  # Start countdown to unload models
     yield done_msg, format_transcript_html(segments, has_speakers), transcript, subtitle_file
 
 
@@ -1454,13 +1492,13 @@ async def api_yt_download(request: Request):
         return JSONResponse({"error": "url is required"}, status_code=400)
 
     audio_fmt = body.get("format", "bestaudio")
+    playlist = body.get("playlist", False)
     output_dir = tempfile.mkdtemp(prefix="yt-dlp-")
 
     # Use yt-dlp to download audio, extract metadata
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
-        "--no-playlist",
         "-f", audio_fmt,
         "--extract-audio",
         "--audio-format", "wav",
@@ -1469,24 +1507,46 @@ async def api_yt_download(request: Request):
         "-o", output_template,
         url,
     ]
-    log.info(f"[API] yt-dlp download: {url}")
+    if not playlist:
+        cmd.insert(1, "--no-playlist")
+    log.info(f"[API] yt-dlp download: {url} (playlist={playlist})")
     try:
-        result = _sp.run(cmd, capture_output=True, text=True, timeout=600)
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=3600)
         if result.returncode != 0:
             log.error(f"[API] yt-dlp failed: {result.stderr[:500]}")
             return JSONResponse({"error": f"yt-dlp failed: {result.stderr[:300]}"}, status_code=500)
-        meta = json.loads(result.stdout.strip().split("\n")[-1])
-        # yt-dlp with --extract-audio --audio-format wav rewrites the extension
-        filename = meta.get("requested_downloads", [{}])[0].get("filepath", "")
-        if not filename:
-            # Fallback: construct from template
-            filename = os.path.join(output_dir, f"{meta.get('id', 'unknown')}.wav")
-        title = meta.get("title", "unknown")
-        duration = meta.get("duration", 0)
-        log.info(f"[API] Downloaded: {filename} ({duration}s)")
-        return JSONResponse({"filename": filename, "title": title, "duration": duration})
+
+        # Parse output — one JSON object per line per video
+        json_lines = [l for l in result.stdout.strip().split("\n") if l.strip().startswith("{")]
+        items = []
+        for line in json_lines:
+            try:
+                meta = json.loads(line)
+                filename = meta.get("requested_downloads", [{}])[0].get("filepath", "")
+                if not filename:
+                    filename = os.path.join(output_dir, f"{meta.get('id', 'unknown')}.wav")
+                items.append({
+                    "filename": filename,
+                    "title": meta.get("title", "unknown"),
+                    "duration": meta.get("duration", 0),
+                })
+            except json.JSONDecodeError:
+                continue
+
+        if not items:
+            return JSONResponse({"error": "yt-dlp produced no output"}, status_code=500)
+
+        # Single video: return flat response for backward compat
+        if len(items) == 1:
+            item = items[0]
+            log.info(f"[API] Downloaded: {item['filename']} ({item['duration']}s)")
+            return JSONResponse(item)
+
+        # Playlist: return list
+        log.info(f"[API] Downloaded playlist: {len(items)} items")
+        return JSONResponse({"items": items, "count": len(items)})
     except _sp.TimeoutExpired:
-        return JSONResponse({"error": "yt-dlp timed out after 600s"}, status_code=504)
+        return JSONResponse({"error": "yt-dlp timed out"}, status_code=504)
     except Exception as e:
         log.error(f"[API] yt-dlp error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
