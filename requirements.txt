@@ -1,2 +1,3 @@
 whisperx
 gradio
+yt-dlp

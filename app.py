@@ -1424,17 +1424,160 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
     upload_event.then(fn=_format_history_html, outputs=[history_html])
     transcribe_event.then(fn=_format_history_html, outputs=[history_html])
 
+# -- HTTP API (for MCP server / programmatic access) --------------------------
+import subprocess as _sp
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+
+async def api_status(request: Request):
+    """GET /api/status — GPU info, ready state."""
+    return JSONResponse({
+        "status": "ready",
+        "gpu": GPU_INFO_STR,
+        "device": DEVICE,
+        "compute_type": COMPUTE_TYPE,
+        "diarization_available": DIARIZATION_AVAILABLE,
+        "default_batch_size": DEFAULT_BATCH_SIZE,
+    })
+
+
+async def api_yt_download(request: Request):
+    """POST /api/yt-download — download audio from a YouTube URL via yt-dlp.
+    Body: {"url": "...", "format": "bestaudio"}
+    Returns: {"filename": "...", "title": "...", "duration": 123}
+    """
+    body = await request.json()
+    url = body.get("url", "").strip()
+    if not url:
+        return JSONResponse({"error": "url is required"}, status_code=400)
+
+    audio_fmt = body.get("format", "bestaudio")
+    output_dir = "/media/yt-dlp"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Use yt-dlp to download audio, extract metadata
+    output_template = os.path.join(output_dir, "%(title).80s [%(id)s].%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "-f", audio_fmt,
+        "--extract-audio",
+        "--audio-format", "wav",
+        "--audio-quality", "0",
+        "--print-json",
+        "-o", output_template,
+        url,
+    ]
+    log.info(f"[API] yt-dlp download: {url}")
+    try:
+        result = _sp.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            log.error(f"[API] yt-dlp failed: {result.stderr[:500]}")
+            return JSONResponse({"error": f"yt-dlp failed: {result.stderr[:300]}"}, status_code=500)
+        meta = json.loads(result.stdout.strip().split("\n")[-1])
+        # yt-dlp with --extract-audio --audio-format wav rewrites the extension
+        filename = meta.get("requested_downloads", [{}])[0].get("filepath", "")
+        if not filename:
+            # Fallback: construct from template
+            filename = output_template.replace("%(title).80s", meta.get("title", "unknown")[:80]).replace("%(id)s", meta.get("id", "unknown")).replace("%(ext)s", "wav")
+        title = meta.get("title", "unknown")
+        duration = meta.get("duration", 0)
+        log.info(f"[API] Downloaded: {filename} ({duration}s)")
+        return JSONResponse({"filename": filename, "title": title, "duration": duration})
+    except _sp.TimeoutExpired:
+        return JSONResponse({"error": "yt-dlp timed out after 600s"}, status_code=504)
+    except Exception as e:
+        log.error(f"[API] yt-dlp error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+def _run_transcription(file_path, model_name="turbo", language="Auto-detect",
+                       output_format="txt", enable_diarization=False,
+                       min_speakers=0, max_speakers=0, batch_size=None,
+                       hotwords="", initial_prompt="", suppress_numerals=False):
+    """Run transcription synchronously, return final result dict."""
+    if batch_size is None:
+        batch_size = DEFAULT_BATCH_SIZE
+    # Consume the generator to get the final result
+    last_status, last_html, last_text, last_file = "", "", "", None
+    for status, html, text, subtitle_file in _transcribe_inner(
+        file_path, "", model_name, language, output_format,
+        enable_diarization, min_speakers, max_speakers, batch_size,
+        hotwords, initial_prompt, suppress_numerals,
+        f"api-{int(time.time()*1000) % 100000}",
+    ):
+        last_status, last_html, last_text, last_file = status, html, text, subtitle_file
+    return {
+        "status": last_status,
+        "transcript": last_text,
+        "subtitle_file": last_file,
+    }
+
+
+async def api_transcribe(request: Request):
+    """POST /api/transcribe — transcribe a local file.
+    Body: {"file_path": "...", "model": "turbo", "language": "Auto-detect",
+           "format": "txt", "diarize": false, ...}
+    Returns: {"status": "...", "transcript": "...", "subtitle_file": "..."}
+    """
+    body = await request.json()
+    file_path = body.get("file_path", "").strip()
+    if not file_path or not os.path.isfile(file_path):
+        return JSONResponse({"error": f"file not found: {file_path}"}, status_code=400)
+
+    if not _transcription_lock.acquire(blocking=False):
+        return JSONResponse({"error": "busy — another transcription is running"}, status_code=409)
+
+    try:
+        import asyncio
+        result = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _run_transcription(
+                file_path,
+                model_name=body.get("model", "turbo"),
+                language=body.get("language", "Auto-detect"),
+                output_format=body.get("format", "txt"),
+                enable_diarization=body.get("diarize", False),
+                min_speakers=body.get("min_speakers", 0),
+                max_speakers=body.get("max_speakers", 0),
+                batch_size=body.get("batch_size"),
+                hotwords=body.get("hotwords", ""),
+                initial_prompt=body.get("initial_prompt", ""),
+                suppress_numerals=body.get("suppress_numerals", False),
+            ),
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        log.error(f"[API] Transcription error: {e}")
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        _transcription_lock.release()
+
+
+API_ROUTES = [
+    Route("/api/status", api_status, methods=["GET"]),
+    Route("/api/yt-download", api_yt_download, methods=["POST"]),
+    Route("/api/transcribe", api_transcribe, methods=["POST"]),
+]
+
+
 # -- Launch --------------------------------------------------------------------
 log.info("Launching Gradio on 0.0.0.0:7860...")
 try:
-    demo.launch(server_name="0.0.0.0", server_port=7860, theme=THEME, css=CSS, js="""
+    # Serve with custom Starlette app: API routes + Gradio mounted at /
+    import uvicorn
+    from starlette.applications import Starlette
+
+    app = Starlette(routes=API_ROUTES)
+    app = gr.mount_gradio_app(app, demo, path="/", theme=THEME, css=CSS, js="""
 () => {
-    // Auto-scroll transcript HTML to bottom as content streams in
-    const observer = new MutationObserver((mutations) => {
+    const observer = new MutationObserver(() => {
         const el = document.querySelector('#transcript-html');
         if (el) el.scrollTop = el.scrollHeight;
     });
-    // Observe once the element exists
     const init = () => {
         const el = document.querySelector('#transcript-html');
         if (el) {
@@ -1446,6 +1589,8 @@ try:
     init();
 }
 """)
+    log.info(f"Mounted {len(API_ROUTES)} API routes: {[r.path for r in API_ROUTES]}")
+    uvicorn.run(app, host="0.0.0.0", port=7860, log_level="info")
 except Exception as e:
     log.error(f"Failed to launch: {e}")
     traceback.print_exc()
