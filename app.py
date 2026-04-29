@@ -942,12 +942,15 @@ footer { display: none !important; }
 # -- Gradio UI -----------------------------------------------------------------
 log.info("Building Gradio UI...")
 
-with gr.Blocks(title="WhisperX Transcription", theme=gr.themes.Base(
+THEME = gr.themes.Base(
     primary_hue="orange",
     neutral_hue="zinc",
     font=["Inter", "system-ui", "sans-serif"],
     font_mono=["JetBrains Mono", "Fira Code", "monospace"],
-)) as demo:
+)
+
+with gr.Blocks(title="WhisperX Transcription") as demo:
+    demo.queue()
 
     gr.HTML(f"""
         <div class="header-wrap">
@@ -1158,19 +1161,22 @@ with gr.Blocks(title="WhisperX Transcription", theme=gr.themes.Base(
 
     cancel_btn.click(fn=_request_cancel, outputs=[status_text])
 
-    # Auto-transcribe on upload (settings are above, so they're already configured)
-    upload_event = file_input.upload(
+    # Request notification permission on first upload
+    file_input.upload(
         fn=None,
         js="""() => {
             if ("Notification" in window && Notification.permission === "default") {
                 Notification.requestPermission();
             }
         }""",
-    ).then(
+    )
+    # Auto-transcribe on upload
+    upload_event = file_input.upload(
         fn=transcribe,
         inputs=all_inputs,
         outputs=all_outputs,
-    ).then(
+    )
+    upload_event.then(
         fn=None,
         inputs=[status_text],
         js=notification_js,
@@ -1181,7 +1187,8 @@ with gr.Blocks(title="WhisperX Transcription", theme=gr.themes.Base(
         fn=transcribe,
         inputs=all_inputs,
         outputs=all_outputs,
-    ).then(
+    )
+    transcribe_event.then(
         fn=None,
         inputs=[status_text],
         js=notification_js,
@@ -1193,7 +1200,7 @@ with gr.Blocks(title="WhisperX Transcription", theme=gr.themes.Base(
 # -- Launch --------------------------------------------------------------------
 log.info("Launching Gradio on 0.0.0.0:7860...")
 try:
-    demo.launch(server_name="0.0.0.0", server_port=7860, css=CSS)
+    demo.launch(server_name="0.0.0.0", server_port=7860, theme=THEME, css=CSS)
 except Exception as e:
     log.error(f"Failed to launch: {e}")
     traceback.print_exc()
