@@ -1454,8 +1454,7 @@ async def api_yt_download(request: Request):
         return JSONResponse({"error": "url is required"}, status_code=400)
 
     audio_fmt = body.get("format", "bestaudio")
-    output_dir = "/media/yt-dlp"
-    os.makedirs(output_dir, exist_ok=True)
+    output_dir = tempfile.mkdtemp(prefix="yt-dlp-")
 
     # Use yt-dlp to download audio, extract metadata
     output_template = os.path.join(output_dir, "%(title).80s [%(id)s].%(ext)s")
@@ -1555,6 +1554,17 @@ async def api_transcribe(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
         _transcription_lock.release()
+        # Cleanup temp source file if requested
+        if body.get("cleanup") and os.path.isfile(file_path):
+            try:
+                parent = os.path.dirname(file_path)
+                os.remove(file_path)
+                # Remove parent if it's a yt-dlp temp dir and now empty
+                if parent.startswith("/tmp/yt-dlp-") and not os.listdir(parent):
+                    os.rmdir(parent)
+                log.info(f"[API] Cleaned up temp file: {file_path}")
+            except Exception as e:
+                log.warning(f"[API] Cleanup failed for {file_path}: {e}")
 
 
 API_ROUTES = [

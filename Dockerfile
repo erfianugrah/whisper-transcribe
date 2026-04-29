@@ -6,7 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install Python deps first (cached unless requirements.txt changes)
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
+RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt && \
+    pip install --no-cache-dir --break-system-packages yt-dlp
 
 # torchcodec is pulled in as a transitive dep but has a C++ ABI mismatch with
 # the installed PyTorch (undefined symbol). Neither whisperX nor our code uses
