@@ -269,12 +269,14 @@ def split_segments_by_speaker(segments):
             new_segments.append(seg)
             continue
 
-        # Group consecutive words by speaker
+        # Group consecutive words by speaker, propagating the last known
+        # speaker to unlabeled words instead of inserting spurious "?" groups.
+        seg_speaker = seg.get("speaker", "?")
         groups = []
         current_speaker = None
         current_words = []
         for w in words:
-            speaker = w.get("speaker", seg.get("speaker", "?"))
+            speaker = w.get("speaker") or seg_speaker
             if speaker != current_speaker and current_words:
                 groups.append((current_speaker, current_words))
                 current_words = []
@@ -282,6 +284,17 @@ def split_segments_by_speaker(segments):
             current_words.append(w)
         if current_words:
             groups.append((current_speaker, current_words))
+
+        # Merge any remaining "?" groups into their neighbor
+        merged = []
+        for speaker, grp_words in groups:
+            if speaker == "?" and merged:
+                # Attach to previous speaker's group
+                prev_speaker, prev_words = merged[-1]
+                merged[-1] = (prev_speaker, prev_words + grp_words)
+            else:
+                merged.append((speaker, grp_words))
+        groups = merged
 
         # Build new segments from groups
         for speaker, group_words in groups:
@@ -470,15 +483,17 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
     log.info(f"[{request_id}]   Detected language: {detected_lang}")
 
     # Show initial transcript before alignment
+    speed = audio_duration / transcribe_elapsed if transcribe_elapsed > 0 else 0
     formatted_lines = []
     for seg in result.get("segments", []):
         ts = format_timestamp_display(seg.get("start", 0))
         formatted_lines.append(f"[{ts}] {seg.get('text', '').strip()}")
-    yield f"Transcribed {num_segments} segments, aligning...", "\n".join(formatted_lines), None
+    yield f"Transcribed {num_segments} segments in {transcribe_elapsed:.1f}s ({speed:.1f}x realtime), aligning...", "\n".join(formatted_lines), None
 
     # -- Phase 4: Word-level alignment (wav2vec2) --
     log.info(f"[{request_id}] Running word-level alignment for '{detected_lang}'...")
     t0_align = time.time()
+    alignment_ok = False
     try:
         model_a, metadata = load_align_model(detected_lang)
         result = whisperx.align(
@@ -491,8 +506,10 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
             print_progress=True,
         )
         align_elapsed = time.time() - t0_align
+        alignment_ok = True
         log.info(f"[{request_id}]   Alignment complete in {align_elapsed:.1f}s")
     except Exception as e:
+        align_elapsed = time.time() - t0_align
         log.warning(f"[{request_id}]   Alignment failed (proceeding without): {e}")
         # result still has segment-level timestamps, just not word-level
 
@@ -501,9 +518,14 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
     for seg in result.get("segments", []):
         ts = format_timestamp_display(seg.get("start", 0))
         formatted_lines.append(f"[{ts}] {seg.get('text', '').strip()}")
-    yield f"Aligned {num_segments} segments", "\n".join(formatted_lines), None
+    align_status = f"Aligned in {align_elapsed:.1f}s" if alignment_ok else "Alignment failed (segment-level timestamps only)"
+    yield f"{align_status} -- {num_segments} segments", "\n".join(formatted_lines), None
 
     # -- Phase 5: Speaker diarization (optional) --
+    # Note: diarization works without alignment (segment-level speaker labels),
+    # but word-level speaker attribution requires aligned word timestamps.
+    if enable_diarization and DIARIZATION_AVAILABLE and not alignment_ok:
+        log.info(f"[{request_id}]   Alignment failed -- diarization will use segment-level assignment only (no per-word speakers)")
     if enable_diarization and DIARIZATION_AVAILABLE:
         yield "Loading diarization pipeline...", "\n".join(formatted_lines), None
         log.info(f"[{request_id}] Running speaker diarization...")
@@ -519,12 +541,15 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
                 diarize_segments = dpipe(audio, min_speakers=min_spk, max_speakers=max_spk)
                 result = whisperx.assign_word_speakers(diarize_segments, result)
 
-                # Split segments at speaker boundaries and long runs
-                original_count = len(result.get("segments", []))
-                result["segments"] = split_segments_by_speaker(result.get("segments", []))
-                new_count = len(result["segments"])
-                if new_count != original_count:
-                    log.info(f"[{request_id}]   Split {original_count} -> {new_count} segments at speaker/sentence boundaries")
+                # Split segments at speaker boundaries (requires word-level timestamps)
+                if alignment_ok:
+                    original_count = len(result.get("segments", []))
+                    result["segments"] = split_segments_by_speaker(result.get("segments", []))
+                    new_count = len(result["segments"])
+                    if new_count != original_count:
+                        log.info(f"[{request_id}]   Split {original_count} -> {new_count} segments at speaker/sentence boundaries")
+                else:
+                    log.info(f"[{request_id}]   Skipping segment splitting (no word timestamps)")
 
                 # Rebuild formatted lines with speaker labels
                 formatted_lines = []
@@ -545,6 +570,9 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
             traceback.print_exc()
     elif enable_diarization:
         log.warning(f"[{request_id}]   Diarization requested but HF_TOKEN not set")
+
+    # Free the raw audio array -- no longer needed after alignment/diarization
+    del audio
 
     transcript = "\n".join(formatted_lines)
     segments = result.get("segments", [])
@@ -625,7 +653,6 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
         log.info(f"[{request_id}] Subtitle file: {subtitle_file}")
 
     total_time = model_time + transcribe_elapsed
-    speed = audio_duration / transcribe_elapsed if transcribe_elapsed > 0 else 0
     done_parts = [f"{num_segments} segments", f"{transcribe_elapsed:.0f}s ({speed:.1f}x realtime)", detected_lang]
     if has_speakers:
         speaker_count = len(set(seg.get("speaker", "?") for seg in segments))
@@ -684,6 +711,25 @@ LANGUAGES = [
     "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu",
     "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa",
 ]
+
+# -- Scan /media for local files -----------------------------------------------
+MEDIA_ROOT = "/media"
+MEDIA_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wma",
+                    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".ts", ".flv"}
+
+
+def scan_media_files() -> list[str]:
+    """Walk MEDIA_ROOT and return paths to audio/video files, sorted by mtime (newest first)."""
+    if not os.path.isdir(MEDIA_ROOT):
+        return []
+    found = []
+    for root, _dirs, files in os.walk(MEDIA_ROOT):
+        for fname in files:
+            if os.path.splitext(fname)[1].lower() in MEDIA_EXTENSIONS:
+                found.append(os.path.join(root, fname))
+    found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return found
+
 
 # -- Custom CSS ----------------------------------------------------------------
 CSS = """
@@ -808,13 +854,21 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         file_types=["audio", "video"],
         height=140,
     )
-    gr.Markdown("<div style='text-align:center; opacity:0.45; font-size:0.85rem; margin:-0.25rem 0 0.25rem'>or use a local path for large files (mounted at /media)</div>")
-    local_path_input = gr.Textbox(
-        label="Local file path (for large files -- skip browser upload)",
-        placeholder="/media/2026-03-23 15-30-00.mkv",
-        lines=1,
-        max_lines=1,
-    )
+    gr.Markdown("<div style='text-align:center; opacity:0.45; font-size:0.85rem; margin:-0.25rem 0 0.25rem'>or select a local file (mounted at /media)</div>")
+    with gr.Row():
+        local_path_input = gr.Dropdown(
+            choices=scan_media_files(),
+            value=None,
+            label="Local file (/media)",
+            allow_custom_value=True,
+            scale=9,
+        )
+        refresh_media_btn = gr.Button("↻", scale=1, size="sm", variant="secondary")
+
+    def _refresh_media():
+        return gr.update(choices=scan_media_files())
+
+    refresh_media_btn.click(fn=_refresh_media, outputs=[local_path_input])
     transcribe_btn = gr.Button(
         "Transcribe",
         variant="primary",
