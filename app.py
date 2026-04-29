@@ -343,10 +343,15 @@ def _words_to_segment(words, speaker):
     }
 
 
+# -- Cancel support ------------------------------------------------------------
+_cancel_requested = {"value": False}
+
+
 # -- Transcription (generator for live UI updates) ----------------------------
 def transcribe(file, local_path, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords, initial_prompt, suppress_numerals):
     """Yields (status, transcript, subtitle_file) tuples for live progress."""
     global _previous_subtitle
+    _cancel_requested["value"] = False
     request_id = f"req-{int(time.time()*1000) % 100000}"
 
     # Prefer local path over uploaded file (for large files that can't be uploaded via browser)
@@ -407,6 +412,11 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
 
     lang = None if (not language or language == "Auto-detect") else language
 
+    if _cancel_requested["value"]:
+        log.info(f"[{request_id}] Cancelled before audio load")
+        yield "Cancelled", "", None
+        return
+
     # -- Phase 2: Load audio --
     yield f"Loading audio{file_size_str}...", "", None
 
@@ -454,6 +464,11 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
     audio_duration = len(audio) / 16000  # whisperx loads at 16kHz
     log.info(f"[{request_id}] Audio loaded in {time.time()-t0_audio:.2f}s ({audio_duration:.0f}s / {audio_duration/60:.1f} min)")
 
+    if _cancel_requested["value"]:
+        log.info(f"[{request_id}] Cancelled before transcription")
+        yield "Cancelled", "", None
+        return
+
     # -- Phase 3: Transcribe (batched) --
     yield f"Transcribing{file_size_str} (batch_size={batch_size})...", "", None
     log.info(f"[{request_id}] >> Starting batched transcription...")
@@ -489,6 +504,11 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
         ts = format_timestamp_display(seg.get("start", 0))
         formatted_lines.append(f"[{ts}] {seg.get('text', '').strip()}")
     yield f"Transcribed {num_segments} segments in {transcribe_elapsed:.1f}s ({speed:.1f}x realtime), aligning...", "\n".join(formatted_lines), None
+
+    if _cancel_requested["value"]:
+        log.info(f"[{request_id}] Cancelled before alignment")
+        yield "Cancelled (transcription complete, no alignment)", "\n".join(formatted_lines), None
+        return
 
     # -- Phase 4: Word-level alignment (wav2vec2) --
     log.info(f"[{request_id}] Running word-level alignment for '{detected_lang}'...")
@@ -734,168 +754,238 @@ def scan_media_files() -> list[str]:
 # -- Custom CSS ----------------------------------------------------------------
 CSS = """
 .gradio-container {
-    max-width: 860px !important;
+    max-width: 900px !important;
     margin: 0 auto !important;
 }
+/* Header */
 .header-wrap {
     text-align: center;
-    padding: 0.75rem 0 0.5rem;
+    padding: 0.5rem 0 0.25rem;
 }
 .header-wrap h2 {
     margin: 0 0 2px;
     font-weight: 700;
+    font-size: 1.4rem;
 }
 .header-wrap .sub {
-    opacity: 0.45;
-    font-size: 0.8rem;
+    opacity: 0.4;
+    font-size: 0.75rem;
 }
 .header-wrap .gpu {
     font-family: 'JetBrains Mono', 'Fira Code', monospace;
-    font-size: 0.75rem;
-    opacity: 0.55;
-    margin-top: 4px;
+    font-size: 0.72rem;
+    opacity: 0.5;
+    margin-top: 3px;
 }
+/* Hide Gradio footer */
 footer { display: none !important; }
+/* Status bar styling */
+#status-bar textarea {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
+    font-size: 0.82rem !important;
+    font-weight: 500;
+}
+/* Transcript area */
+#transcript-box textarea {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
+    font-size: 0.8rem !important;
+    line-height: 1.5 !important;
+}
+/* Output actions row */
+.output-actions {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
 #copy-transcript-btn {
-    max-width: 140px;
-    margin-left: auto;
-    margin-top: -0.5rem;
+    max-width: 150px;
 }
 #copy-transcript-btn button {
     font-size: 0.8rem;
-    padding: 4px 12px;
+    padding: 4px 14px;
+}
+/* Tighter accordion spacing */
+.accordion-compact .label-wrap {
+    padding: 8px 12px !important;
+}
+/* Cancel button */
+#cancel-btn button {
+    border-color: var(--color-red-500) !important;
+    color: var(--color-red-500) !important;
+}
+#cancel-btn button:hover {
+    background: var(--color-red-500) !important;
+    color: white !important;
+}
+/* Input section divider */
+.input-section {
+    border-top: 1px solid var(--border-color-primary);
+    padding-top: 0.75rem;
+    margin-top: 0.5rem;
 }
 """
 
 # -- Gradio UI -----------------------------------------------------------------
 log.info("Building Gradio UI...")
 
-with gr.Blocks(title="WhisperX Transcription") as demo:
+with gr.Blocks(title="WhisperX Transcription", theme=gr.themes.Base(
+    primary_hue="orange",
+    neutral_hue="zinc",
+    font=["Inter", "system-ui", "sans-serif"],
+    font_mono=["JetBrains Mono", "Fira Code", "monospace"],
+)) as demo:
 
     gr.HTML(f"""
         <div class="header-wrap">
             <h2>WhisperX Transcription</h2>
-            <div class="sub">whisperX (faster-whisper + wav2vec2 alignment + pyannote diarization)</div>
+            <div class="sub">faster-whisper + wav2vec2 alignment + pyannote diarization</div>
             <div class="gpu">{GPU_INFO_STR}</div>
         </div>
     """)
 
-    # -- Settings first, then upload --
+    # -- Input: File source --
+    with gr.Group():
+        file_input = gr.File(
+            label="Upload audio/video (transcription starts automatically)",
+            file_types=["audio", "video"],
+            height=120,
+        )
+        with gr.Row():
+            local_path_input = gr.Dropdown(
+                choices=scan_media_files(),
+                value=None,
+                label="Or select from /media",
+                allow_custom_value=True,
+                scale=9,
+            )
+            refresh_media_btn = gr.Button("↻", scale=1, size="sm", variant="secondary")
+
+    def _refresh_media():
+        return gr.update(choices=scan_media_files())
+
+    refresh_media_btn.click(fn=_refresh_media, outputs=[local_path_input])
+
+    # -- Core settings (always visible) --
     with gr.Row():
         model_dropdown = gr.Dropdown(
             choices=["tiny", "base", "small", "medium", "large", "turbo"],
             value="turbo",
             label="Model",
+            scale=2,
         )
         lang_dropdown = gr.Dropdown(
             choices=LANGUAGES,
             value="Auto-detect",
             label="Language",
+            scale=2,
         )
         format_dropdown = gr.Dropdown(
             choices=["txt", "srt", "vtt", "json"],
             value="srt",
             label="Format",
-        )
-    if not DIARIZATION_AVAILABLE:
-        gr.Markdown(
-            "<small style='opacity:0.6'>Speaker diarization is disabled -- set the <code>HF_TOKEN</code> environment variable to enable it.</small>"
-        )
-    with gr.Row():
-        diarize_checkbox = gr.Checkbox(
-            label="Speaker diarization (identify who is speaking)",
-            value=False,
-            interactive=DIARIZATION_AVAILABLE,
-        )
-        min_speakers_input = gr.Number(
-            value=0,
-            label="Min speakers (0 = auto)",
-            minimum=0,
-            maximum=20,
-            precision=0,
-            interactive=DIARIZATION_AVAILABLE,
-        )
-        max_speakers_input = gr.Number(
-            value=0,
-            label="Max speakers (0 = auto)",
-            minimum=0,
-            maximum=20,
-            precision=0,
-            interactive=DIARIZATION_AVAILABLE,
+            scale=1,
         )
         batch_slider = gr.Slider(
             minimum=1,
             maximum=64,
             step=1,
             value=DEFAULT_BATCH_SIZE,
-            label="Batch size (higher = faster, more VRAM)",
+            label="Batch size",
+            scale=2,
         )
 
-    hotwords_input = gr.Textbox(
-        label="Hotwords (names, jargon, or terms the model might mishear)",
-        placeholder="e.g. proper nouns, product names, technical terms",
-        lines=1,
-        max_lines=1,
-    )
-    initial_prompt_input = gr.Textbox(
-        label="Initial prompt (context hint for the first transcription window)",
-        placeholder="e.g. This is a meeting about quarterly sales results.",
-        lines=1,
-        max_lines=2,
-    )
-    suppress_numerals_input = gr.Checkbox(
-        label="Suppress numerals (spell out numbers -- improves word alignment accuracy)",
-        value=False,
-    )
+    # -- Speaker diarization --
+    with gr.Accordion("Speaker diarization", open=DIARIZATION_AVAILABLE):
+        if not DIARIZATION_AVAILABLE:
+            gr.Markdown(
+                "<small style='opacity:0.6'>Disabled — set <code>HF_TOKEN</code> env var to enable.</small>"
+            )
+        with gr.Row():
+            diarize_checkbox = gr.Checkbox(
+                label="Enable diarization",
+                value=False,
+                interactive=DIARIZATION_AVAILABLE,
+                scale=2,
+            )
+            min_speakers_input = gr.Number(
+                value=0,
+                label="Min speakers (0 = auto)",
+                minimum=0,
+                maximum=20,
+                precision=0,
+                interactive=DIARIZATION_AVAILABLE,
+                scale=1,
+            )
+            max_speakers_input = gr.Number(
+                value=0,
+                label="Max speakers (0 = auto)",
+                minimum=0,
+                maximum=20,
+                precision=0,
+                interactive=DIARIZATION_AVAILABLE,
+                scale=1,
+            )
 
-    # Upload triggers transcription automatically with current settings
-    file_input = gr.File(
-        label="Upload Audio/Video (transcription starts automatically)",
-        file_types=["audio", "video"],
-        height=140,
-    )
-    gr.Markdown("<div style='text-align:center; opacity:0.45; font-size:0.85rem; margin:-0.25rem 0 0.25rem'>or select a local file (mounted at /media)</div>")
+    # -- Advanced options (collapsed by default) --
+    with gr.Accordion("Advanced options", open=False):
+        hotwords_input = gr.Textbox(
+            label="Hotwords",
+            placeholder="proper nouns, product names, technical terms the model might mishear",
+            lines=1,
+            max_lines=1,
+        )
+        initial_prompt_input = gr.Textbox(
+            label="Initial prompt",
+            placeholder="Context hint for the first transcription window",
+            lines=1,
+            max_lines=2,
+        )
+        suppress_numerals_input = gr.Checkbox(
+            label="Suppress numerals (spell out numbers — improves alignment)",
+            value=False,
+        )
+
+    # -- Action buttons --
     with gr.Row():
-        local_path_input = gr.Dropdown(
-            choices=scan_media_files(),
-            value=None,
-            label="Local file (/media)",
-            allow_custom_value=True,
-            scale=9,
+        transcribe_btn = gr.Button(
+            "Transcribe",
+            variant="primary",
+            interactive=True,
+            scale=4,
         )
-        refresh_media_btn = gr.Button("↻", scale=1, size="sm", variant="secondary")
+        cancel_btn = gr.Button(
+            "Cancel",
+            variant="stop",
+            scale=1,
+            elem_id="cancel-btn",
+        )
 
-    def _refresh_media():
-        return gr.update(choices=scan_media_files())
-
-    refresh_media_btn.click(fn=_refresh_media, outputs=[local_path_input])
-    transcribe_btn = gr.Button(
-        "Transcribe",
-        variant="primary",
-        interactive=True,
-    )
-
-    # -- Output --
+    # -- Output section --
     status_text = gr.Textbox(
         label="Status",
         lines=1,
         max_lines=1,
         interactive=False,
         placeholder="Ready",
+        elem_id="status-bar",
     )
     output_text = gr.Textbox(
         label="Transcript",
-        lines=14,
-        max_lines=14,
+        lines=18,
+        max_lines=30,
         placeholder="Transcript will appear here...",
         elem_id="transcript-box",
+        show_copy_button=True,
     )
-    copy_btn = gr.Button(
-        "Copy Transcript",
-        size="sm",
-        variant="secondary",
-        elem_id="copy-transcript-btn",
-    )
+    with gr.Row():
+        output_file = gr.File(label="Download", height=50, interactive=False, scale=3)
+        copy_btn = gr.Button(
+            "Copy transcript",
+            size="sm",
+            variant="secondary",
+            elem_id="copy-transcript-btn",
+            scale=1,
+        )
     copy_btn.click(
         fn=None,
         inputs=[output_text],
@@ -908,7 +998,6 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
             });
         }""",
     )
-    output_file = gr.File(label="Subtitles", height=50, interactive=False)
 
     # Track the previous upload so we can clean it up when a new file arrives
     _previous_upload = {"path": None}
@@ -950,8 +1039,15 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         }
     }"""
 
+    # Cancel handler
+    def _request_cancel():
+        _cancel_requested["value"] = True
+        return "Cancelling..."
+
+    cancel_btn.click(fn=_request_cancel, outputs=[status_text])
+
     # Auto-transcribe on upload (settings are above, so they're already configured)
-    file_input.upload(
+    upload_event = file_input.upload(
         fn=None,
         js="""() => {
             if ("Notification" in window && Notification.permission === "default") {
@@ -969,7 +1065,7 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
     )
 
     # Manual re-transcribe button (for changing settings on an already-uploaded file)
-    transcribe_btn.click(
+    transcribe_event = transcribe_btn.click(
         fn=transcribe,
         inputs=all_inputs,
         outputs=all_outputs,
@@ -978,6 +1074,9 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         inputs=[status_text],
         js=notification_js,
     )
+
+    # Cancel aborts running transcription events
+    cancel_btn.click(fn=None, cancels=[upload_event, transcribe_event])
 
 # -- Launch --------------------------------------------------------------------
 log.info("Launching Gradio on 0.0.0.0:7860...")
