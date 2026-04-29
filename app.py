@@ -392,6 +392,9 @@ def format_transcript_plain(segments, has_speakers=False):
 # -- Cancel support ------------------------------------------------------------
 _cancel_requested = {"value": False}
 
+# -- Last transcription result (for speaker renaming) --------------------------
+_last_result = {"segments": [], "has_speakers": False, "format": "srt"}
+
 # -- Concurrency lock ----------------------------------------------------------
 import threading
 _transcription_lock = threading.Lock()
@@ -768,6 +771,11 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
             pass
     _previous_subtitle = subtitle_file
 
+    # Store for speaker renaming
+    _last_result["segments"] = segments
+    _last_result["has_speakers"] = has_speakers
+    _last_result["format"] = output_format
+
     yield done_msg, format_transcript_html(segments, has_speakers), transcript, subtitle_file
 
 
@@ -937,6 +945,14 @@ footer { display: none !important; }
 .spk-5 { color: #eab308; background: rgba(234,179,8,0.12); }
 .spk-6 { color: #06b6d4; background: rgba(6,182,212,0.12); }
 .spk-7 { color: #f43f5e; background: rgba(244,63,94,0.12); }
+/* Search box */
+#transcript-search {
+    margin-bottom: 0.25rem;
+}
+#transcript-search input {
+    font-size: 0.82rem !important;
+    padding: 6px 10px !important;
+}
 """
 
 # -- Gradio UI -----------------------------------------------------------------
@@ -1086,12 +1102,59 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         placeholder="Ready",
         elem_id="status-bar",
     )
+    search_box = gr.Textbox(
+        placeholder="Search transcript...",
+        lines=1,
+        max_lines=1,
+        elem_id="transcript-search",
+        show_label=False,
+        container=False,
+    )
+    search_box.input(
+        fn=None,
+        inputs=[search_box],
+        js="""(query) => {
+            const container = document.querySelector('#transcript-html');
+            if (!container) return;
+            const lines = container.querySelectorAll('.transcript-line');
+            const q = (query || '').toLowerCase().trim();
+            lines.forEach(el => {
+                if (!q) {
+                    el.style.display = '';
+                    el.querySelectorAll('mark').forEach(m => m.replaceWith(m.textContent));
+                } else {
+                    const text = el.textContent.toLowerCase();
+                    if (text.includes(q)) {
+                        el.style.display = '';
+                    } else {
+                        el.style.display = 'none';
+                    }
+                }
+            });
+        }""",
+    )
     output_html = gr.HTML(
         value="<div id='transcript-view' class='transcript-empty'>Transcript will appear here...</div>",
         elem_id="transcript-html",
     )
     # Hidden textbox holds plain text for copy/download
     output_text = gr.Textbox(visible=False, elem_id="transcript-raw")
+
+    # State: store segments for speaker renaming
+    segments_state = gr.State(value=[])
+    has_speakers_state = gr.State(value=False)
+
+    # Speaker rename section
+    with gr.Accordion("Rename speakers", open=False, visible=False) as speaker_accordion:
+        gr.Markdown("<small>Rename detected speakers and click Apply to update transcript and subtitle file.</small>")
+        speaker_rename_input = gr.Textbox(
+            label="Speaker names (one per line: SPEAKER_00=Alice)",
+            placeholder="SPEAKER_00=Alice\nSPEAKER_01=Bob",
+            lines=4,
+            max_lines=8,
+        )
+        apply_rename_btn = gr.Button("Apply renames", variant="secondary", size="sm")
+
     with gr.Row():
         output_file = gr.File(label="Download", height=50, interactive=False, scale=3)
         copy_btn = gr.Button(
@@ -1112,6 +1175,85 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
                 if (btn) { const o = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = o, 1500); }
             });
         }""",
+    )
+
+    # -- Speaker rename logic --
+    def _show_speaker_rename(status, *_):
+        """After transcription, show the rename UI if speakers were detected."""
+        if not _last_result["has_speakers"]:
+            return gr.update(visible=False), ""
+        speakers = sorted(set(seg.get("speaker", "?") for seg in _last_result["segments"]))
+        prefill = "\n".join(f"{s}={s}" for s in speakers)
+        return gr.update(visible=True, open=True), prefill
+
+    def _apply_speaker_renames(rename_text):
+        """Apply speaker name mappings and regenerate outputs."""
+        renames = {}
+        for line in rename_text.strip().split("\n"):
+            if "=" in line:
+                old, new = line.split("=", 1)
+                old, new = old.strip(), new.strip()
+                if old and new:
+                    renames[old] = new
+        if not renames:
+            return gr.update(), gr.update(), gr.update()
+
+        segments = _last_result["segments"]
+        # Apply renames to segments
+        for seg in segments:
+            if seg.get("speaker") in renames:
+                seg["speaker"] = renames[seg["speaker"]]
+            for w in seg.get("words", []):
+                if w.get("speaker") in renames:
+                    w["speaker"] = renames[w["speaker"]]
+
+        has_speakers = _last_result["has_speakers"]
+        html = format_transcript_html(segments, has_speakers)
+        plain = format_transcript_plain(segments, has_speakers)
+
+        # Regenerate subtitle file
+        output_format = _last_result["format"]
+        subtitle_file = None
+        if output_format == "txt":
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
+            tmp.write(plain)
+            tmp.close()
+            subtitle_file = tmp.name
+        elif output_format in ("srt", "vtt"):
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}", mode="w")
+            if output_format == "srt":
+                for i, seg in enumerate(segments, 1):
+                    start_ts = format_timestamp_srt(seg.get("start", 0))
+                    end_ts = format_timestamp_srt(seg.get("end", 0))
+                    speaker_prefix = f"[{seg.get('speaker', '?')}] " if has_speakers else ""
+                    tmp.write(f"{i}\n{start_ts} --> {end_ts}\n{speaker_prefix}{seg.get('text', '').strip()}\n\n")
+            else:
+                tmp.write("WEBVTT\n\n")
+                for seg in segments:
+                    start_ts = format_timestamp_vtt(seg.get("start", 0))
+                    end_ts = format_timestamp_vtt(seg.get("end", 0))
+                    speaker_prefix = f"[{seg.get('speaker', '?')}] " if has_speakers else ""
+                    tmp.write(f"{start_ts} --> {end_ts}\n{speaker_prefix}{seg.get('text', '').strip()}\n\n")
+            tmp.close()
+            subtitle_file = tmp.name
+        elif output_format == "json":
+            json_data = {"segments": []}
+            for seg in segments:
+                seg_out = {"start": round(seg.get("start", 0), 3), "end": round(seg.get("end", 0), 3), "text": seg.get("text", "").strip()}
+                if has_speakers:
+                    seg_out["speaker"] = seg.get("speaker", "?")
+                json_data["segments"].append(seg_out)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w")
+            json.dump(json_data, tmp, ensure_ascii=False, indent=2)
+            tmp.close()
+            subtitle_file = tmp.name
+
+        return html, plain, subtitle_file
+
+    apply_rename_btn.click(
+        fn=_apply_speaker_renames,
+        inputs=[speaker_rename_input],
+        outputs=[output_html, output_text, output_file],
     )
 
     # Track the previous upload so we can clean it up when a new file arrives
@@ -1180,6 +1322,10 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         fn=None,
         inputs=[status_text],
         js=notification_js,
+    ).then(
+        fn=_show_speaker_rename,
+        inputs=[status_text],
+        outputs=[speaker_accordion, speaker_rename_input],
     )
 
     # Manual re-transcribe button (for changing settings on an already-uploaded file)
@@ -1192,6 +1338,10 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         fn=None,
         inputs=[status_text],
         js=notification_js,
+    ).then(
+        fn=_show_speaker_rename,
+        inputs=[status_text],
+        outputs=[speaker_accordion, speaker_rename_input],
     )
 
     # Cancel aborts running transcription events
@@ -1200,7 +1350,25 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
 # -- Launch --------------------------------------------------------------------
 log.info("Launching Gradio on 0.0.0.0:7860...")
 try:
-    demo.launch(server_name="0.0.0.0", server_port=7860, theme=THEME, css=CSS)
+    demo.launch(server_name="0.0.0.0", server_port=7860, theme=THEME, css=CSS, js="""
+() => {
+    // Auto-scroll transcript HTML to bottom as content streams in
+    const observer = new MutationObserver((mutations) => {
+        const el = document.querySelector('#transcript-html');
+        if (el) el.scrollTop = el.scrollHeight;
+    });
+    // Observe once the element exists
+    const init = () => {
+        const el = document.querySelector('#transcript-html');
+        if (el) {
+            observer.observe(el, { childList: true, subtree: true, characterData: true });
+        } else {
+            setTimeout(init, 500);
+        }
+    };
+    init();
+}
+""")
 except Exception as e:
     log.error(f"Failed to launch: {e}")
     traceback.print_exc()
