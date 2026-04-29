@@ -343,6 +343,52 @@ def _words_to_segment(words, speaker):
     }
 
 
+# -- Transcript HTML formatting ------------------------------------------------
+import html as html_module
+
+_speaker_index_map = {}
+
+
+def _speaker_class(speaker_label):
+    """Map a speaker label to a CSS class (spk-0 through spk-7, cycling)."""
+    if speaker_label not in _speaker_index_map:
+        _speaker_index_map[speaker_label] = len(_speaker_index_map) % 8
+    return f"spk-{_speaker_index_map[speaker_label]}"
+
+
+def format_transcript_html(segments, has_speakers=False):
+    """Convert segments to HTML with timestamps and optional speaker colors."""
+    if not segments:
+        return "<div class='transcript-empty'>No segments</div>"
+    lines = []
+    for seg in segments:
+        ts = format_timestamp_display(seg.get("start", 0))
+        text = html_module.escape(seg.get("text", "").strip())
+        ts_span = f"<span class='transcript-ts'>[{ts}]</span>"
+        if has_speakers:
+            speaker = seg.get("speaker", "?")
+            cls = _speaker_class(speaker)
+            spk_span = f"<span class='transcript-speaker {cls}'>{html_module.escape(speaker)}</span>"
+            lines.append(f"<div class='transcript-line'>{ts_span}{spk_span}{text}</div>")
+        else:
+            lines.append(f"<div class='transcript-line'>{ts_span}{text}</div>")
+    return "\n".join(lines)
+
+
+def format_transcript_plain(segments, has_speakers=False):
+    """Convert segments to plain text for copy/export."""
+    lines = []
+    for seg in segments:
+        ts = format_timestamp_display(seg.get("start", 0))
+        text = seg.get("text", "").strip()
+        if has_speakers:
+            speaker = seg.get("speaker", "?")
+            lines.append(f"[{ts}] [{speaker}] {text}")
+        else:
+            lines.append(f"[{ts}] {text}")
+    return "\n".join(lines)
+
+
 # -- Cancel support ------------------------------------------------------------
 _cancel_requested = {"value": False}
 
@@ -361,7 +407,7 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
     # Prevent concurrent transcriptions (would OOM on GPU)
     if not _transcription_lock.acquire(blocking=False):
         log.warning(f"[{request_id}] Rejected -- another transcription is in progress")
-        yield "Busy — another transcription is already running", "", None
+        yield "Busy — another transcription is already running", "", "", None
         return
 
     try:
@@ -371,8 +417,19 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
 
 
 def _transcribe_inner(file, local_path, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords, initial_prompt, suppress_numerals, request_id):
-    """Inner generator — runs under _transcription_lock."""
+    """Inner generator — runs under _transcription_lock.
+    Yields 4-tuples: (status, html_view, plain_text, subtitle_file)
+    """
     global _previous_subtitle
+
+    _speaker_index_map.clear()
+
+    def _plain_html(text):
+        """Wrap plain text in a pre-formatted div for intermediate progress."""
+        if not text:
+            return ""
+        escaped = html_module.escape(text)
+        return f"<div style='white-space:pre-wrap;font-size:0.8rem;line-height:1.5'>{escaped}</div>"
 
     # Prefer local path over uploaded file (for large files that can't be uploaded via browser)
     local_path_str = local_path.strip() if local_path else ""
@@ -382,7 +439,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
             log.info(f"[{request_id}] Using local path: {file}")
         else:
             log.error(f"[{request_id}] Local path not found: {local_path_str}")
-            yield f"Error: file not found: {local_path_str}", "", None
+            yield f"Error: file not found: {local_path_str}", "", "", None
             return
 
     log.info(f"[{request_id}] == New transcription request ==")
@@ -390,7 +447,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
 
     if file is None:
         log.warning(f"[{request_id}] No file provided")
-        yield "No file uploaded or local path specified.", "", None
+        yield "No file uploaded or local path specified.", "", "", None
         return
 
     # File info
@@ -418,7 +475,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
     log.info(f"[{request_id}] Device: {DEVICE}, compute_type: {COMPUTE_TYPE}")
 
     # -- Phase 1: Load whisperX model --
-    yield f"Loading whisperX model '{model_name}'...", "", None
+    yield f"Loading whisperX model '{model_name}'...", "", "", None
     log.info(f"[{request_id}] Loading whisperX model...")
     t0_model = time.time()
     m = load_whisper(
@@ -434,16 +491,16 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
 
     if _cancel_requested["value"]:
         log.info(f"[{request_id}] Cancelled before audio load")
-        yield "Cancelled", "", None
+        yield "Cancelled", "", "", None
         return
 
     # -- Phase 2: Load audio --
-    yield f"Loading audio{file_size_str}...", "", None
+    yield f"Loading audio{file_size_str}...", "", "", None
 
     # Verify the file still exists (Gradio temp files can vanish between yields)
     if not os.path.exists(file):
         log.error(f"[{request_id}] File no longer exists: {file}")
-        yield f"Error: uploaded file no longer exists (may have been cleaned up)", "", None
+        yield f"Error: uploaded file no longer exists (may have been cleaned up)", "", "", None
         return
 
     # Create a safe temp path without spaces (ffmpeg subprocess can have issues
@@ -463,7 +520,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
             shutil.copy2(file, safe_path)
         except Exception as e:
             log.error(f"[{request_id}] Failed to copy file: {e}")
-            yield f"Error copying file: {e}", "", None
+            yield f"Error copying file: {e}", "", "", None
             return
 
     log.info(f"[{request_id}] Loading audio...")
@@ -473,7 +530,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
     except Exception as e:
         log.error(f"[{request_id}] Failed to load audio: {e}")
         traceback.print_exc()
-        yield f"Error loading audio: {e}", "", None
+        yield f"Error loading audio: {e}", "", "", None
         return
     finally:
         # Remove the safe copy now that audio is in memory
@@ -486,12 +543,12 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
 
     if _cancel_requested["value"]:
         log.info(f"[{request_id}] Cancelled before transcription")
-        yield "Cancelled", "", None
+        yield "Cancelled", "", "", None
         return
 
     # -- Phase 3: Transcribe (batched) --
     duration_str = f"{audio_duration/60:.1f} min" if audio_duration >= 60 else f"{audio_duration:.0f}s"
-    yield f"Transcribing {duration_str} of audio (batch_size={batch_size})...", "", None
+    yield f"Transcribing {duration_str} of audio (batch_size={batch_size})...", "", "", None
     log.info(f"[{request_id}] >> Starting batched transcription...")
     t0 = time.time()
 
@@ -505,7 +562,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
     except Exception as e:
         log.error(f"[{request_id}] Transcription FAILED: {e}")
         traceback.print_exc()
-        yield f"Error: {e}", "", None
+        yield f"Error: {e}", "", "", None
         return
 
     transcribe_elapsed = time.time() - t0
@@ -524,11 +581,11 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
     for seg in result.get("segments", []):
         ts = format_timestamp_display(seg.get("start", 0))
         formatted_lines.append(f"[{ts}] {seg.get('text', '').strip()}")
-    yield f"Transcribed {num_segments} segments in {transcribe_elapsed:.1f}s ({speed:.1f}x realtime), aligning...", "\n".join(formatted_lines), None
+    yield f"Transcribed {num_segments} segments in {transcribe_elapsed:.1f}s ({speed:.1f}x realtime), aligning...", _plain_html("\n".join(formatted_lines)), "\n".join(formatted_lines), None
 
     if _cancel_requested["value"]:
         log.info(f"[{request_id}] Cancelled before alignment")
-        yield "Cancelled (transcription complete, no alignment)", "\n".join(formatted_lines), None
+        yield "Cancelled (transcription complete, no alignment)", _plain_html("\n".join(formatted_lines)), "\n".join(formatted_lines), None
         return
 
     # -- Phase 4: Word-level alignment (wav2vec2) --
@@ -560,7 +617,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
         ts = format_timestamp_display(seg.get("start", 0))
         formatted_lines.append(f"[{ts}] {seg.get('text', '').strip()}")
     align_status = f"Aligned in {align_elapsed:.1f}s" if alignment_ok else "Alignment failed (segment-level timestamps only)"
-    yield f"{align_status} -- {num_segments} segments", "\n".join(formatted_lines), None
+    yield f"{align_status} -- {num_segments} segments", _plain_html("\n".join(formatted_lines)), "\n".join(formatted_lines), None
 
     # -- Phase 5: Speaker diarization (optional) --
     # Note: diarization works without alignment (segment-level speaker labels),
@@ -568,7 +625,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
     if enable_diarization and DIARIZATION_AVAILABLE and not alignment_ok:
         log.info(f"[{request_id}]   Alignment failed -- diarization will use segment-level assignment only (no per-word speakers)")
     if enable_diarization and DIARIZATION_AVAILABLE:
-        yield "Loading diarization pipeline...", "\n".join(formatted_lines), None
+        yield "Loading diarization pipeline...", _plain_html("\n".join(formatted_lines)), "\n".join(formatted_lines), None
         log.info(f"[{request_id}] Running speaker diarization...")
         min_spk = int(min_speakers) if min_speakers and int(min_speakers) > 0 else None
         max_spk = int(max_speakers) if max_speakers and int(max_speakers) > 0 else None
@@ -578,7 +635,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
         try:
             dpipe = load_diarization()
             if dpipe is not None:
-                yield "Running speaker diarization...", "\n".join(formatted_lines), None
+                yield "Running speaker diarization...", _plain_html("\n".join(formatted_lines)), "\n".join(formatted_lines), None
                 diarize_segments = dpipe(audio, min_speakers=min_spk, max_speakers=max_spk)
                 result = whisperx.assign_word_speakers(diarize_segments, result)
 
@@ -625,14 +682,14 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
     has_speakers = enable_diarization and any(seg.get("speaker") for seg in segments)
 
     if output_format == "txt":
-        yield "Generating txt file...", transcript, None
+        yield "Generating txt file...", _plain_html(transcript), transcript, None
         log.info(f"[{request_id}] Generating txt file...")
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".txt", mode="w")
         tmp.write(transcript)
         tmp.close()
         subtitle_file = tmp.name
     elif output_format == "json":
-        yield "Generating JSON file...", transcript, None
+        yield "Generating JSON file...", _plain_html(transcript), transcript, None
         log.info(f"[{request_id}] Generating JSON file with word-level timestamps...")
         json_data = {
             "language": detected_lang,
@@ -669,7 +726,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
         subtitle_file = tmp.name
         log.info(f"[{request_id}] JSON file: {subtitle_file}")
     elif output_format in ("srt", "vtt"):
-        yield f"Generating {output_format} file...", transcript, None
+        yield f"Generating {output_format} file...", _plain_html(transcript), transcript, None
         log.info(f"[{request_id}] Generating {output_format} subtitle file...")
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}", mode="w")
         if output_format == "srt":
@@ -711,7 +768,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
             pass
     _previous_subtitle = subtitle_file
 
-    yield done_msg, transcript, subtitle_file
+    yield done_msg, format_transcript_html(segments, has_speakers), transcript, subtitle_file
 
 
 # -- Timestamp formatting ------------------------------------------------------
@@ -838,12 +895,48 @@ footer { display: none !important; }
     background: var(--color-red-500) !important;
     color: white !important;
 }
-/* Input section divider */
-.input-section {
-    border-top: 1px solid var(--border-color-primary);
-    padding-top: 0.75rem;
-    margin-top: 0.5rem;
+/* Transcript HTML viewer */
+#transcript-html {
+    min-height: 300px;
+    max-height: 500px;
+    overflow-y: auto;
+    border: 1px solid var(--border-color-primary);
+    border-radius: var(--radius-lg);
+    padding: 0.75rem 1rem;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    background: var(--background-fill-secondary);
 }
+.transcript-empty {
+    opacity: 0.4;
+    font-style: italic;
+}
+.transcript-line {
+    margin-bottom: 0.3rem;
+    padding: 2px 0;
+}
+.transcript-ts {
+    opacity: 0.45;
+    font-size: 0.75rem;
+    margin-right: 0.5rem;
+}
+.transcript-speaker {
+    font-weight: 600;
+    font-size: 0.75rem;
+    padding: 1px 5px;
+    border-radius: 3px;
+    margin-right: 0.4rem;
+}
+/* Speaker color palette */
+.spk-0 { color: #f97316; background: rgba(249,115,22,0.12); }
+.spk-1 { color: #3b82f6; background: rgba(59,130,246,0.12); }
+.spk-2 { color: #10b981; background: rgba(16,185,129,0.12); }
+.spk-3 { color: #a855f7; background: rgba(168,85,247,0.12); }
+.spk-4 { color: #ec4899; background: rgba(236,72,153,0.12); }
+.spk-5 { color: #eab308; background: rgba(234,179,8,0.12); }
+.spk-6 { color: #06b6d4; background: rgba(6,182,212,0.12); }
+.spk-7 { color: #f43f5e; background: rgba(244,63,94,0.12); }
 """
 
 # -- Gradio UI -----------------------------------------------------------------
@@ -990,14 +1083,12 @@ with gr.Blocks(title="WhisperX Transcription", theme=gr.themes.Base(
         placeholder="Ready",
         elem_id="status-bar",
     )
-    output_text = gr.Textbox(
-        label="Transcript",
-        lines=18,
-        max_lines=30,
-        placeholder="Transcript will appear here...",
-        elem_id="transcript-box",
-        show_copy_button=True,
+    output_html = gr.HTML(
+        value="<div id='transcript-view' class='transcript-empty'>Transcript will appear here...</div>",
+        elem_id="transcript-html",
     )
+    # Hidden textbox holds plain text for copy/download
+    output_text = gr.Textbox(visible=False, elem_id="transcript-raw")
     with gr.Row():
         output_file = gr.File(label="Download", height=50, interactive=False, scale=3)
         copy_btn = gr.Button(
@@ -1048,7 +1139,7 @@ with gr.Blocks(title="WhisperX Transcription", theme=gr.themes.Base(
     )
 
     all_inputs = [file_input, local_path_input, model_dropdown, lang_dropdown, format_dropdown, diarize_checkbox, min_speakers_input, max_speakers_input, batch_slider, hotwords_input, initial_prompt_input, suppress_numerals_input]
-    all_outputs = [status_text, output_text, output_file]
+    all_outputs = [status_text, output_html, output_text, output_file]
 
     notification_js = """(status) => {
         if (!status || !status.startsWith("Done --")) return;
