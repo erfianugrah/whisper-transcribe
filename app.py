@@ -346,6 +346,10 @@ def _words_to_segment(words, speaker):
 # -- Cancel support ------------------------------------------------------------
 _cancel_requested = {"value": False}
 
+# -- Concurrency lock ----------------------------------------------------------
+import threading
+_transcription_lock = threading.Lock()
+
 
 # -- Transcription (generator for live UI updates) ----------------------------
 def transcribe(file, local_path, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords, initial_prompt, suppress_numerals):
@@ -353,6 +357,22 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
     global _previous_subtitle
     _cancel_requested["value"] = False
     request_id = f"req-{int(time.time()*1000) % 100000}"
+
+    # Prevent concurrent transcriptions (would OOM on GPU)
+    if not _transcription_lock.acquire(blocking=False):
+        log.warning(f"[{request_id}] Rejected -- another transcription is in progress")
+        yield "Busy — another transcription is already running", "", None
+        return
+
+    try:
+        yield from _transcribe_inner(file, local_path, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords, initial_prompt, suppress_numerals, request_id)
+    finally:
+        _transcription_lock.release()
+
+
+def _transcribe_inner(file, local_path, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords, initial_prompt, suppress_numerals, request_id):
+    """Inner generator — runs under _transcription_lock."""
+    global _previous_subtitle
 
     # Prefer local path over uploaded file (for large files that can't be uploaded via browser)
     local_path_str = local_path.strip() if local_path else ""
@@ -470,7 +490,8 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
         return
 
     # -- Phase 3: Transcribe (batched) --
-    yield f"Transcribing{file_size_str} (batch_size={batch_size})...", "", None
+    duration_str = f"{audio_duration/60:.1f} min" if audio_duration >= 60 else f"{audio_duration:.0f}s"
+    yield f"Transcribing {duration_str} of audio (batch_size={batch_size})...", "", None
     log.info(f"[{request_id}] >> Starting batched transcription...")
     t0 = time.time()
 
