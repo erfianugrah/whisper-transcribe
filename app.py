@@ -1457,7 +1457,7 @@ async def api_yt_download(request: Request):
     output_dir = tempfile.mkdtemp(prefix="yt-dlp-")
 
     # Use yt-dlp to download audio, extract metadata
-    output_template = os.path.join(output_dir, "%(title).80s [%(id)s].%(ext)s")
+    output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
         "--no-playlist",
@@ -1480,7 +1480,7 @@ async def api_yt_download(request: Request):
         filename = meta.get("requested_downloads", [{}])[0].get("filepath", "")
         if not filename:
             # Fallback: construct from template
-            filename = output_template.replace("%(title).80s", meta.get("title", "unknown")[:80]).replace("%(id)s", meta.get("id", "unknown")).replace("%(ext)s", "wav")
+            filename = os.path.join(output_dir, f"{meta.get('id', 'unknown')}.wav")
         title = meta.get("title", "unknown")
         duration = meta.get("duration", 0)
         log.info(f"[API] Downloaded: {filename} ({duration}s)")
