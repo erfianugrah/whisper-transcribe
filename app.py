@@ -232,6 +232,61 @@ def cleanup_stale_gradio_tmp():
 cleanup_stale_gradio_tmp()
 
 
+# -- History -------------------------------------------------------------------
+HISTORY_FILE = "/data/history.json"
+
+
+def _load_history() -> list[dict]:
+    """Load transcription history from JSON file."""
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _save_history_entry(entry: dict):
+    """Append an entry to the history file."""
+    history = _load_history()
+    history.insert(0, entry)
+    # Keep last 50 entries
+    history = history[:50]
+    os.makedirs(os.path.dirname(HISTORY_FILE), exist_ok=True)
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning(f"Failed to save history: {e}")
+
+
+def _format_history_html() -> str:
+    """Render history as an HTML table."""
+    history = _load_history()
+    if not history:
+        return "<div style='opacity:0.4;font-style:italic;padding:0.5rem'>No transcription history yet.</div>"
+    rows = []
+    for entry in history[:20]:
+        ts = entry.get("timestamp", "?")
+        fname = entry.get("filename", "?")
+        duration = entry.get("duration_str", "?")
+        lang = entry.get("language", "?")
+        speakers = entry.get("speakers", "")
+        speed = entry.get("speed", "")
+        spk_badge = f" <small>({speakers} spk)</small>" if speakers else ""
+        rows.append(
+            f"<tr><td style='opacity:0.5;white-space:nowrap'>{ts}</td>"
+            f"<td>{fname}</td>"
+            f"<td>{duration}</td>"
+            f"<td>{lang}{spk_badge}</td>"
+            f"<td>{speed}</td></tr>"
+        )
+    return f"""<table style='width:100%;font-size:0.78rem;border-collapse:collapse'>
+<thead><tr style='opacity:0.5;text-align:left'><th>Time</th><th>File</th><th>Duration</th><th>Lang</th><th>Speed</th></tr></thead>
+<tbody>{"".join(rows)}</tbody></table>"""
+
+
 # -- Default batch size based on VRAM -----------------------------------------
 DEFAULT_BATCH_SIZE = 4  # conservative CPU default
 if DEVICE == "cuda":
@@ -775,6 +830,18 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
     _last_result["segments"] = segments
     _last_result["has_speakers"] = has_speakers
     _last_result["format"] = output_format
+
+    # Save to history
+    import datetime
+    _save_history_entry({
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "filename": os.path.basename(file) if file else "unknown",
+        "duration_str": duration_str,
+        "language": detected_lang,
+        "speakers": len(set(seg.get("speaker", "?") for seg in segments)) if has_speakers else "",
+        "speed": f"{speed:.1f}x",
+        "segments": num_segments,
+    })
 
     yield done_msg, format_transcript_html(segments, has_speakers), transcript, subtitle_file
 
@@ -1346,6 +1413,16 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
 
     # Cancel aborts running transcription events
     cancel_btn.click(fn=None, cancels=[upload_event, transcribe_event])
+
+    # -- History section --
+    with gr.Accordion("History", open=False):
+        history_html = gr.HTML(value=_format_history_html())
+        refresh_history_btn = gr.Button("Refresh", size="sm", variant="secondary")
+        refresh_history_btn.click(fn=_format_history_html, outputs=[history_html])
+
+    # Also refresh history after transcription completes
+    upload_event.then(fn=_format_history_html, outputs=[history_html])
+    transcribe_event.then(fn=_format_history_html, outputs=[history_html])
 
 # -- Launch --------------------------------------------------------------------
 log.info("Launching Gradio on 0.0.0.0:7860...")
