@@ -1122,11 +1122,22 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
             elem_id="media-select",
         )
         refresh_media_btn = gr.Button("↻", scale=1, size="sm", variant="secondary", elem_id="refresh-media-btn")
+    with gr.Row():
+        yt_url_input = gr.Textbox(
+            label="Or paste a YouTube URL",
+            placeholder="https://www.youtube.com/watch?v=...",
+            lines=1,
+            max_lines=1,
+            scale=20,
+        )
+        yt_fetch_btn = gr.Button("Fetch", scale=1, size="sm", variant="secondary", elem_id="yt-fetch-btn")
 
     def _refresh_media():
         return gr.update(choices=scan_media_files())
 
     refresh_media_btn.click(fn=_refresh_media, outputs=[local_path_input])
+
+    # yt_fetch_btn event wiring is registered later (after status_text is defined)
 
     # -- Core settings (always visible) --
     with gr.Row():
@@ -1478,6 +1489,54 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
 
     # Cancel aborts running transcription events
     cancel_btn.click(fn=None, cancels=[upload_event, transcribe_event])
+
+    # -- YouTube fetch handler (registered here so status_text exists) --
+    def _fetch_youtube(url):
+        """Download a YouTube URL via yt-dlp and load the path into local_path_input."""
+        url = (url or "").strip()
+        if not url:
+            yield gr.update(), "Enter a YouTube URL first"
+            return
+        yield gr.update(), "Downloading from YouTube..."
+        output_dir = tempfile.mkdtemp(prefix="yt-dlp-")
+        output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
+        cmd = [
+            "yt-dlp", "--no-playlist",
+            "-f", "bestaudio",
+            "--extract-audio", "--audio-format", "wav", "--audio-quality", "0",
+            "--print-json",
+            "-o", output_template,
+            url,
+        ]
+        try:
+            result = _sp.run(cmd, capture_output=True, text=True, timeout=600)
+        except _sp.TimeoutExpired:
+            yield gr.update(), "yt-dlp timed out after 600s"
+            return
+        except Exception as e:
+            yield gr.update(), f"yt-dlp error: {e}"
+            return
+        if result.returncode != 0:
+            yield gr.update(), f"yt-dlp failed: {result.stderr.strip()[:200]}"
+            return
+        try:
+            meta = json.loads(result.stdout.strip().split("\n")[-1])
+        except Exception:
+            yield gr.update(), "Failed to parse yt-dlp output"
+            return
+        filename = meta.get("requested_downloads", [{}])[0].get("filepath", "")
+        if not filename:
+            filename = os.path.join(output_dir, f"{meta.get('id', 'unknown')}.wav")
+        title = meta.get("title", "unknown")
+        duration = meta.get("duration", 0)
+        log.info(f"[UI] YT download: {filename} ({duration}s)")
+        yield gr.update(value=filename), f"Downloaded '{title}' ({duration}s) -- click Transcribe."
+
+    yt_fetch_btn.click(
+        fn=_fetch_youtube,
+        inputs=[yt_url_input],
+        outputs=[local_path_input, status_text],
+    )
 
     # -- History section --
     with gr.Accordion("History", open=False):
