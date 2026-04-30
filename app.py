@@ -929,17 +929,19 @@ MEDIA_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".
                     ".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".ts", ".flv"}
 
 
-def scan_media_files() -> list[str]:
-    """Walk MEDIA_ROOT and return paths to audio/video files, sorted by mtime (newest first)."""
+def scan_media_files() -> list[tuple[str, str]]:
+    """Walk MEDIA_ROOT and return (display, full_path) tuples sorted newest-first.
+    Display shows filename only; value keeps the full path for transcription."""
     if not os.path.isdir(MEDIA_ROOT):
         return []
     found = []
     for root, _dirs, files in os.walk(MEDIA_ROOT):
         for fname in files:
             if os.path.splitext(fname)[1].lower() in MEDIA_EXTENSIONS:
-                found.append(os.path.join(root, fname))
+                full_path = os.path.join(root, fname)
+                found.append(full_path)
     found.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-    return found
+    return [(os.path.basename(p), p) for p in found]
 
 
 # -- Custom CSS ----------------------------------------------------------------
@@ -951,25 +953,49 @@ CSS = """
 /* Header */
 .header-wrap {
     text-align: center;
-    padding: 0.5rem 0 0.25rem;
+    padding: 0.5rem 0 0.5rem;
 }
 .header-wrap h2 {
-    margin: 0 0 2px;
+    margin: 0 0 4px;
     font-weight: 700;
     font-size: 1.4rem;
-}
-.header-wrap .sub {
-    opacity: 0.4;
-    font-size: 0.75rem;
 }
 .header-wrap .gpu {
     font-family: 'JetBrains Mono', 'Fira Code', monospace;
     font-size: 0.72rem;
     opacity: 0.5;
-    margin-top: 3px;
 }
 /* Hide Gradio footer */
 footer { display: none !important; }
+/* Fix file upload label — keep it inside the box at the top */
+.gradio-container .file-preview,
+.gradio-container [data-testid="file"] {
+    position: relative;
+}
+.gradio-container [data-testid="file"] label {
+    position: static !important;
+    transform: none !important;
+    margin-bottom: 0.25rem;
+}
+/* Constrain media dropdown height + scroll */
+#media-select ul[role="listbox"],
+#media-select .options {
+    max-height: 280px !important;
+    overflow-y: auto !important;
+}
+/* Refresh button — icon-only, compact, aligned with dropdown */
+#refresh-media-btn {
+    max-width: 40px;
+    min-width: 40px;
+    align-self: flex-end;
+    margin-bottom: 0;
+}
+#refresh-media-btn button {
+    min-width: 40px !important;
+    height: 42px !important;
+    padding: 0 !important;
+    font-size: 1.1rem !important;
+}
 /* Status bar styling */
 #status-bar textarea {
     font-family: 'JetBrains Mono', 'Fira Code', monospace !important;
@@ -1076,27 +1102,26 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
     gr.HTML(f"""
         <div class="header-wrap">
             <h2>WhisperX Transcription</h2>
-            <div class="sub">faster-whisper + wav2vec2 alignment + pyannote diarization</div>
             <div class="gpu">{GPU_INFO_STR}</div>
         </div>
     """)
 
     # -- Input: File source --
-    with gr.Group():
-        file_input = gr.File(
-            label="Upload audio/video (transcription starts automatically)",
-            file_types=["audio", "video"],
-            height=120,
+    file_input = gr.File(
+        label="Upload audio/video",
+        file_types=["audio", "video"],
+        height=110,
+    )
+    with gr.Row():
+        local_path_input = gr.Dropdown(
+            choices=scan_media_files(),
+            value=None,
+            label="Or select from /media",
+            allow_custom_value=True,
+            scale=20,
+            elem_id="media-select",
         )
-        with gr.Row():
-            local_path_input = gr.Dropdown(
-                choices=scan_media_files(),
-                value=None,
-                label="Or select from /media",
-                allow_custom_value=True,
-                scale=9,
-            )
-            refresh_media_btn = gr.Button("↻", scale=1, size="sm", variant="secondary")
+        refresh_media_btn = gr.Button("↻", scale=1, size="sm", variant="secondary", elem_id="refresh-media-btn")
 
     def _refresh_media():
         return gr.update(choices=scan_media_files())
@@ -1133,21 +1158,22 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         )
 
     # -- Speaker diarization --
-    with gr.Accordion("Speaker diarization", open=DIARIZATION_AVAILABLE):
+    with gr.Accordion("Speaker diarization", open=False):
         if not DIARIZATION_AVAILABLE:
             gr.Markdown(
                 "<small style='opacity:0.6'>Disabled — set <code>HF_TOKEN</code> env var to enable.</small>"
             )
         with gr.Row():
             diarize_checkbox = gr.Checkbox(
-                label="Enable diarization",
+                label="Enable (identify speakers)",
                 value=False,
                 interactive=DIARIZATION_AVAILABLE,
                 scale=2,
             )
             min_speakers_input = gr.Number(
                 value=0,
-                label="Min speakers (0 = auto)",
+                label="Min speakers",
+                info="0 = auto",
                 minimum=0,
                 maximum=20,
                 precision=0,
@@ -1156,7 +1182,8 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
             )
             max_speakers_input = gr.Number(
                 value=0,
-                label="Max speakers (0 = auto)",
+                label="Max speakers",
+                info="0 = auto",
                 minimum=0,
                 maximum=20,
                 precision=0,
