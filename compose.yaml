@@ -1,6 +1,8 @@
 services:
   whisper:
+    image: erfianugrah/whisper-transcribe:latest
     build: .
+    pull_policy: missing
     environment:
       - DEBUG_MODE=1  # Set to 0 for clean production logs
       - HF_TOKEN=${HF_TOKEN}  # HuggingFace token for pyannote diarization
