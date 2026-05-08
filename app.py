@@ -346,6 +346,87 @@ if DEVICE == "cuda":
         log.warning(f"VRAM detection failed ({e}), defaulting batch_size={DEFAULT_BATCH_SIZE}")
 
 
+# -- Gender estimation from pitch (F0) -----------------------------------------
+import numpy as np
+
+
+def estimate_speaker_genders(audio, segments, sample_rate=16000):
+    """Estimate gender for each speaker based on median fundamental frequency (F0).
+
+    Uses autocorrelation pitch detection on each speaker's audio segments.
+    Male: median F0 < 165 Hz, Female: >= 165 Hz.
+    Returns dict: {speaker_label: "M" | "F"}
+    """
+    from scipy.signal import correlate
+
+    # Collect audio samples per speaker
+    speaker_samples = {}
+    for seg in segments:
+        speaker = seg.get("speaker")
+        if not speaker:
+            continue
+        start_sample = int(seg.get("start", 0) * sample_rate)
+        end_sample = int(seg.get("end", 0) * sample_rate)
+        if end_sample <= start_sample:
+            continue
+        chunk = audio[start_sample:min(end_sample, len(audio))]
+        if len(chunk) < sample_rate * 0.1:  # skip < 100ms
+            continue
+        if speaker not in speaker_samples:
+            speaker_samples[speaker] = []
+        speaker_samples[speaker].append(chunk)
+
+    # Estimate F0 per speaker using autocorrelation
+    genders = {}
+    for speaker, chunks in speaker_samples.items():
+        pitches = []
+        for chunk in chunks[:10]:  # sample up to 10 segments per speaker
+            # Window: take a 50ms frame from the middle
+            frame_len = min(int(sample_rate * 0.05), len(chunk))
+            mid = len(chunk) // 2
+            frame = chunk[mid - frame_len // 2 : mid + frame_len // 2]
+            if len(frame) < 200:
+                continue
+            # Autocorrelation
+            frame = frame - frame.mean()
+            corr = correlate(frame, frame, mode='full')
+            corr = corr[len(corr) // 2:]  # positive lags only
+            # Find first peak after min_lag (max freq 500Hz)
+            min_lag = int(sample_rate / 500)
+            max_lag = int(sample_rate / 60)  # min freq 60Hz
+            if max_lag > len(corr):
+                continue
+            search = corr[min_lag:max_lag]
+            if len(search) == 0:
+                continue
+            peak_idx = search.argmax() + min_lag
+            if corr[peak_idx] > 0.2 * corr[0]:  # confidence threshold
+                f0 = sample_rate / peak_idx
+                pitches.append(f0)
+
+        if pitches:
+            median_f0 = float(np.median(pitches))
+            genders[speaker] = "F" if median_f0 >= 165 else "M"
+            log.debug(f"  Speaker {speaker}: median F0={median_f0:.0f} Hz → {genders[speaker]}")
+        else:
+            genders[speaker] = "?"
+
+    return genders
+
+
+def apply_gender_labels(segments, genders):
+    """Rename speaker labels to include gender prefix: SPEAKER_00 → M-SPEAKER_00."""
+    for seg in segments:
+        speaker = seg.get("speaker")
+        if speaker and speaker in genders and genders[speaker] != "?":
+            new_label = f"{genders[speaker]}-{speaker}"
+            seg["speaker"] = new_label
+            for w in seg.get("words", []):
+                if w.get("speaker") == speaker:
+                    w["speaker"] = new_label
+    return segments
+
+
 # -- Post-processing: split segments at speaker boundaries --------------------
 def split_segments_by_speaker(segments):
     """Split segments where the speaker changes mid-segment (using word-level labels).
@@ -744,6 +825,16 @@ def _transcribe_inner(file, local_path, model_name, language, output_format, ena
                 else:
                     log.info(f"[{request_id}]   Skipping segment splitting (no word timestamps)")
 
+                # Estimate gender from pitch and apply labels (after splitting so all segments get labeled)
+                try:
+                    genders = estimate_speaker_genders(audio, result.get("segments", []))
+                    if genders:
+                        result["segments"] = apply_gender_labels(result.get("segments", []), genders)
+                        gender_summary = ", ".join(f"{k}={v}" for k, v in sorted(genders.items()))
+                        log.info(f"[{request_id}]   Gender estimates: {gender_summary}")
+                except Exception as e:
+                    log.warning(f"[{request_id}]   Gender estimation failed (non-critical): {e}")
+
                 # Rebuild formatted lines with speaker labels
                 formatted_lines = []
                 for seg in result.get("segments", []):
@@ -1034,11 +1125,11 @@ footer { display: none !important; }
     background: var(--color-red-500) !important;
     color: white !important;
 }
-/* Transcript HTML viewer */
+/* Transcript HTML viewer — force containment */
 #transcript-html {
-    min-height: 300px;
-    max-height: 500px;
-    overflow-y: auto;
+    max-height: 450px !important;
+    overflow-y: auto !important;
+    overflow-x: hidden !important;
     border: 1px solid var(--border-color-primary);
     border-radius: var(--radius-lg);
     padding: 0.75rem 1rem;
@@ -1046,6 +1137,11 @@ footer { display: none !important; }
     font-size: 0.8rem;
     line-height: 1.6;
     background: var(--background-fill-secondary);
+}
+/* Ensure Gradio's wrapper div doesn't expand beyond the inner constraint */
+#transcript-html > div {
+    max-height: 430px !important;
+    overflow-y: auto !important;
 }
 .transcript-empty {
     opacity: 0.4;
@@ -1106,31 +1202,36 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         </div>
     """)
 
-    # -- Input: File source --
-    file_input = gr.File(
-        label="Upload audio/video",
-        file_types=["audio", "video"],
-        height=110,
-    )
-    with gr.Row():
-        local_path_input = gr.Dropdown(
-            choices=scan_media_files(),
-            value=None,
-            label="Or select from /media",
-            allow_custom_value=True,
-            scale=20,
-            elem_id="media-select",
-        )
-        refresh_media_btn = gr.Button("↻", scale=1, size="sm", variant="secondary", elem_id="refresh-media-btn")
-    with gr.Row():
-        yt_url_input = gr.Textbox(
-            label="Or paste a YouTube URL",
-            placeholder="https://www.youtube.com/watch?v=...",
-            lines=1,
-            max_lines=1,
-            scale=20,
-        )
-        yt_fetch_btn = gr.Button("Fetch", scale=1, size="sm", variant="secondary", elem_id="yt-fetch-btn")
+    # -- Input: File source (tabbed) --
+    with gr.Tabs():
+        with gr.Tab("Upload"):
+            file_input = gr.File(
+                label="Drop or click to upload audio/video",
+                file_types=["audio", "video"],
+                height=100,
+            )
+        with gr.Tab("Local file"):
+            with gr.Row():
+                local_path_input = gr.Dropdown(
+                    choices=scan_media_files(),
+                    value=None,
+                    label="Select from /media",
+                    allow_custom_value=True,
+                    scale=12,
+                    elem_id="media-select",
+                )
+                refresh_media_btn = gr.Button("↻", scale=1, size="sm", variant="secondary", elem_id="refresh-media-btn")
+        with gr.Tab("YouTube"):
+            with gr.Row():
+                yt_url_input = gr.Textbox(
+                    placeholder="https://www.youtube.com/watch?v=...",
+                    lines=1,
+                    max_lines=1,
+                    scale=12,
+                    show_label=False,
+                    container=False,
+                )
+                yt_fetch_btn = gr.Button("Fetch", scale=1, size="sm", variant="primary", elem_id="yt-fetch-btn")
 
     def _refresh_media():
         return gr.update(choices=scan_media_files())
@@ -1491,13 +1592,11 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
     cancel_btn.click(fn=None, cancels=[upload_event, transcribe_event])
 
     # -- YouTube fetch handler (registered here so status_text exists) --
-    def _fetch_youtube(url):
-        """Download a YouTube URL via yt-dlp and load the path into local_path_input."""
+    def _yt_download(url):
+        """Download YouTube audio. Returns (path, status_msg)."""
         url = (url or "").strip()
         if not url:
-            yield gr.update(), "Enter a YouTube URL first"
-            return
-        yield gr.update(), "Downloading from YouTube..."
+            return "", "Enter a YouTube URL first"
         output_dir = tempfile.mkdtemp(prefix="yt-dlp-")
         output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
         cmd = [
@@ -1511,31 +1610,39 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         try:
             result = _sp.run(cmd, capture_output=True, text=True, timeout=600)
         except _sp.TimeoutExpired:
-            yield gr.update(), "yt-dlp timed out after 600s"
-            return
+            return "", "yt-dlp timed out after 600s"
         except Exception as e:
-            yield gr.update(), f"yt-dlp error: {e}"
-            return
+            return "", f"yt-dlp error: {e}"
         if result.returncode != 0:
-            yield gr.update(), f"yt-dlp failed: {result.stderr.strip()[:200]}"
-            return
+            return "", f"yt-dlp failed: {result.stderr.strip()[:200]}"
         try:
             meta = json.loads(result.stdout.strip().split("\n")[-1])
         except Exception:
-            yield gr.update(), "Failed to parse yt-dlp output"
-            return
+            return "", "Failed to parse yt-dlp output"
         filename = meta.get("requested_downloads", [{}])[0].get("filepath", "")
         if not filename:
             filename = os.path.join(output_dir, f"{meta.get('id', 'unknown')}.wav")
         title = meta.get("title", "unknown")
         duration = meta.get("duration", 0)
         log.info(f"[UI] YT download: {filename} ({duration}s)")
-        yield gr.update(value=filename), f"Downloaded '{title}' ({duration}s) -- click Transcribe."
+        return filename, f"Downloaded '{title}' ({duration}s)"
+
+    def _yt_fetch_and_transcribe(url, _file, _local, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords, initial_prompt, suppress_numerals):
+        """Download YT audio then transcribe (same as clicking Fetch + Transcribe)."""
+        yield "Downloading from YouTube...", "", "", None
+        path, msg = _yt_download(url)
+        if not path:
+            yield msg, "", "", None
+            return
+        yield msg + " — transcribing...", "", "", None
+        # Run transcription with downloaded file as local_path
+        for result in transcribe(None, path, model_name, language, output_format, enable_diarization, min_speakers, max_speakers, batch_size, hotwords, initial_prompt, suppress_numerals):
+            yield result
 
     yt_fetch_btn.click(
-        fn=_fetch_youtube,
-        inputs=[yt_url_input],
-        outputs=[local_path_input, status_text],
+        fn=_yt_fetch_and_transcribe,
+        inputs=[yt_url_input] + all_inputs,
+        outputs=all_outputs,
     )
 
     # -- History section --
