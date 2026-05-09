@@ -64,9 +64,33 @@ if raw := os.environ.get("SUMMARY_CHANNEL"):
 if raw := os.environ.get("ALLOWED_CHANNELS"):
     ALLOWED_CHANNELS = {int(c.strip()) for c in raw.split(",") if c.strip()}
 
+# YouTube URL → extract video ID for timestamp linking
 YT_PATTERN = re.compile(
-    r"https?://(?:www\.)?(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)"
+    r"https?://(?:(?:[\w-]+\.)?youtube\.com/(?:watch\?v=|shorts/|live/)|youtu\.be/)"
     r"([\w-]{11})"
+)
+
+# Broader pattern: any URL from known video/audio platforms (yt-dlp handles the download)
+VIDEO_DOMAINS = {
+    "youtube.com", "youtu.be", "m.youtube.com", "music.youtube.com",
+    "twitch.tv", "clips.twitch.tv",
+    "vimeo.com", "player.vimeo.com",
+    "dailymotion.com", "dai.ly",
+    "tiktok.com",
+    "twitter.com", "x.com",
+    "instagram.com",
+    "reddit.com", "v.redd.it",
+    "rumble.com",
+    "odysee.com",
+    "kick.com",
+    "bilibili.com", "b23.tv",
+    "soundcloud.com",
+    "podcasts.apple.com",
+    "spotify.com",  # yt-dlp may not support, fails gracefully
+}
+
+VIDEO_URL_PATTERN = re.compile(
+    r"(https?://(?:[\w-]+\.)*(" + "|".join(re.escape(d) for d in VIDEO_DOMAINS) + r")/\S+)"
 )
 
 # ─── Prompts ──────────────────────────────────────────────────────────────────
@@ -175,17 +199,39 @@ async def on_message(message: discord.Message):
     if ALLOWED_CHANNELS and message.channel.id not in ALLOWED_CHANNELS:
         return
 
-    matches = YT_PATTERN.findall(message.content)
-    if not matches:
+    # Collect video URLs — YouTube gets special handling (ID extraction for timestamps)
+    jobs_to_queue = []
+    seen = set()
+
+    # YouTube URLs → extract video ID for timestamp linking
+    for video_id in YT_PATTERN.findall(message.content):
+        if video_id in seen:
+            continue
+        seen.add(video_id)
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        jobs_to_queue.append(Job(url=url, video_id=video_id, message=message, channel=message.channel))
+
+    # Other video platform URLs
+    for url_match in VIDEO_URL_PATTERN.finditer(message.content):
+        url = url_match.group(1)
+        # Skip if already handled as YouTube
+        if any(d in url for d in ("youtube.com", "youtu.be")):
+            continue
+        # Use URL hash as ID for non-YouTube
+        vid = re.sub(r"[^\w-]", "", url.split("/")[-1])[:20] or url[-15:]
+        if vid in seen:
+            continue
+        seen.add(vid)
+        jobs_to_queue.append(Job(url=url, video_id=vid, message=message, channel=message.channel))
+
+    if not jobs_to_queue:
         await bot.process_commands(message)
         return
 
-    for video_id in dict.fromkeys(matches):  # dedupe, preserve order
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        job = Job(url=url, video_id=video_id, message=message, channel=message.channel)
+    for job in jobs_to_queue:
         await queue.put(job)
         await message.add_reaction("\u23f3")  # ⏳
-        log.info("Queued %s from %s", video_id, message.author)
+        log.info("Queued %s from %s", job.video_id, message.author)
 
 
 # ─── Worker ───────────────────────────────────────────────────────────────────
@@ -268,29 +314,59 @@ async def process(job: Job):
     if hotwords:
         log.info("[%s] Hotwords (%d chars): %s...", job.video_id, len(hotwords), hotwords[:100])
 
-    # 5. Build initial_prompt — compact sentence with correct terms (≤50 words)
-    #    This biases Whisper's decoder toward correct proper noun spellings
-    initial_prompt = build_initial_prompt(title, web_context)
-    if initial_prompt:
-        log.info("[%s] Initial prompt: %s", job.video_id, initial_prompt[:100])
 
-    # 6. Transcribe
-    log.info("[%s] Transcribing '%s' (%ds)...", job.video_id, title, duration)
+
+    # 6. Two-pass transcription
+    #    Pass 1: transcribe with hotwords (fast, gets most things right)
+    #    Pass 2: re-transcribe with initial_prompt built from pass 1 + Exa terms
+    #    Research (arxiv 2602.18966) shows this recovers proper nouns that
+    #    single-pass misses because the decoder "sees" correct spellings.
+    log.info("[%s] Transcribing '%s' (%ds) — pass 1...", job.video_id, title, duration)
     await safe_react(job.message, "\U0001f3a7")  # 🎧
 
-    transcribe_payload = {
+    # Pass 1: hotwords only (no cleanup — we need the file for pass 2)
+    pass1_payload = {
+        "file_path": file_path,
+        "model": WHISPER_MODEL,
+        "cleanup": False,
+    }
+    if hotwords:
+        pass1_payload["hotwords"] = hotwords
+
+    async with http.post(
+        f"{WHISPER_API}/api/transcribe",
+        json=pass1_payload,
+    ) as resp:
+        if resp.status == 409:
+            raise RuntimeError("Whisper busy — another transcription running")
+        if resp.status != 200:
+            body = await resp.json()
+            raise RuntimeError(f"Transcription failed: {body.get('error', resp.status)}")
+        pass1_result = await resp.json()
+
+    log.info("[%s] Pass 1 done: %s", job.video_id, pass1_result.get("status", ""))
+
+    # Build stronger initial_prompt for pass 2 using pass 1 transcript + Exa terms
+    # The prompt contains correct spellings that bias the decoder on the second pass
+    initial_prompt = build_initial_prompt(title, web_context)
+    if initial_prompt:
+        log.info("[%s] Pass 2 initial_prompt: %s...", job.video_id, initial_prompt[:80])
+
+    # Pass 2: initial_prompt + hotwords (cleanup=True, done with file after this)
+    log.info("[%s] Transcribing — pass 2 (with initial_prompt)...", job.video_id)
+    pass2_payload = {
         "file_path": file_path,
         "model": WHISPER_MODEL,
         "cleanup": True,
     }
     if hotwords:
-        transcribe_payload["hotwords"] = hotwords
+        pass2_payload["hotwords"] = hotwords
     if initial_prompt:
-        transcribe_payload["initial_prompt"] = initial_prompt
+        pass2_payload["initial_prompt"] = initial_prompt
 
     async with http.post(
         f"{WHISPER_API}/api/transcribe",
-        json=transcribe_payload,
+        json=pass2_payload,
     ) as resp:
         if resp.status == 409:
             raise RuntimeError("Whisper busy — another transcription running")
@@ -301,7 +377,7 @@ async def process(job: Job):
 
     transcript = result["transcript"]
     status = result.get("status", "")
-    log.info("[%s] Transcribed: %s", job.video_id, status)
+    log.info("[%s] Pass 2 done: %s", job.video_id, status)
 
 
 
@@ -326,7 +402,11 @@ async def process(job: Job):
         summarize(transcript, PROMPT_KEY_POINTS, 2048, title=title, reference_block=ref_block),
         summarize(transcript, PROMPT_CHAPTERS, 2048, title=title, reference_block=ref_block),
     )
-    chapters = linkify_timestamps(chapters_raw, job.video_id)
+    # Only linkify timestamps for YouTube videos (other platforms don't support ?t=)
+    if "youtube.com" in job.url or "youtu.be" in job.url:
+        chapters = linkify_timestamps(chapters_raw, job.video_id)
+    else:
+        chapters = chapters_raw
 
     # 5. Post results as embeds
     # Determine where detailed summaries go
