@@ -94,24 +94,31 @@ RUN install -d -o ubuntu -g ubuntu \
         /home/ubuntu/.cache/torch
 
 WORKDIR /app
-COPY --chown=ubuntu:ubuntu app.py .
 
+# Switch to runtime user. Everything below this line runs as ubuntu (uid 1000).
+# COPY --chown still works under non-root because BuildKit applies the
+# ownership during layer creation, not as the running user.
 USER ubuntu
 
-# Pre-warm the English wav2vec2 alignment model (~360 MB) so the first
-# transcription doesn't pay the download cost on every cold container start.
-# Lives in TORCH_HOME (torch.hub) which is NOT volume-mounted — so the file
-# stays in the image layer and survives across container recreations.
+# ─── Pre-warm wav2vec2 alignment models ──────────────────────────────────────
+# Run BEFORE the COPY app.py below so that editing source code doesn't bust
+# this expensive cache layer. Cache invalidates only when ALIGN_LANGS or the
+# pip-installed whisperx version changes.
 #
-# Other languages (~50-400 MB each) download lazily on first use; baking
-# all of them would balloon the image. Override ALIGN_LANGS with a
-# comma-separated list to pre-warm more, e.g. `--build-arg ALIGN_LANGS=en,es,fr`.
+# Lives in TORCH_HOME (torch.hub) which is NOT volume-mounted — so the
+# downloaded files stay in the image layer and survive container recreations.
+# Other languages download lazily on first use; baking all of them would
+# balloon the image. Override ALIGN_LANGS to pre-warm more:
+#   docker compose build --build-arg ALIGN_LANGS=en,es,fr,ja whisper
 ARG ALIGN_LANGS=en
 RUN for lang in $(echo "$ALIGN_LANGS" | tr ',' ' '); do \
         echo "Pre-warming wav2vec2 alignment model for '$lang'..." && \
         python3 -c "import whisperx; whisperx.load_align_model('$lang', device='cpu')" \
         || echo "WARN: pre-warm for '$lang' failed (will download lazily)"; \
     done
+
+# ─── Source code (changes here invalidate only this layer + CMD) ─────────────
+COPY --chown=ubuntu:ubuntu app.py .
 
 EXPOSE 7860
 
