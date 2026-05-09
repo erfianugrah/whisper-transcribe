@@ -217,8 +217,9 @@ async def on_message(message: discord.Message):
         # Skip if already handled as YouTube
         if any(d in url for d in ("youtube.com", "youtu.be")):
             continue
-        # Use URL hash as ID for non-YouTube
-        vid = re.sub(r"[^\w-]", "", url.split("/")[-1])[:20] or url[-15:]
+        # Use last non-empty path segment as ID for non-YouTube (filesystem-safe)
+        path_parts = [p for p in url.rstrip("/").split("/") if p and "." not in p and "//" not in p]
+        vid = re.sub(r"[^\w-]", "", path_parts[-1])[:20] if path_parts else "unknown"
         if vid in seen:
             continue
         seen.add(vid)
@@ -375,6 +376,7 @@ async def process(job: Job):
     # Only linkify timestamps for YouTube videos (other platforms don't support ?t=)
     if "youtube.com" in job.url or "youtu.be" in job.url:
         chapters = linkify_timestamps(chapters_raw, job.video_id)
+
     else:
         chapters = chapters_raw
 
