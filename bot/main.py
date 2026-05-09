@@ -71,40 +71,16 @@ YT_PATTERN = re.compile(
 
 # ─── Prompts ──────────────────────────────────────────────────────────────────
 
-PROMPT_HOTWORDS = """\
-Given this video title and description, list proper nouns, technical terms, \
-jargon, and names that a speech-to-text model might mishear. Include character \
-names, place names, game/product terminology, brand names, and specialized vocabulary. \
-Output ONLY a comma-separated list, nothing else. No explanations.
 
-Title: {title}
-Description: {description}"""
-
-PROMPT_CORRECTIONS = """\
-Video title: {title}
-
-Below is a transcript from speech recognition. Some proper nouns, names, and \
-technical terms may be misspelled or misheard.
-
-I have fetched reference material from the web about this specific topic. \
-ONLY correct terms where the reference material contains the correct spelling. \
-Do NOT guess or use knowledge from other topics. If the reference doesn't \
-mention a term, leave it as-is.
-
-Output ONLY a JSON object mapping wrong → correct. If nothing needs fixing, output {{}}.
-
-Reference material:
-{reference}
-
-Transcript excerpt (first 5000 chars):
-{excerpt}"""
 
 PROMPT_BRIEF = """\
 Video title: {title}
 
+{reference_block}\
 Summarize this video transcript in a single concise paragraph (3-5 sentences). \
 Capture the main thesis, key argument, and conclusion. No bullet points. \
-No timestamps. Plain language.
+No timestamps. Plain language. Use correct spellings from the reference material \
+when available.
 
 Transcript:
 {transcript}"""
@@ -112,6 +88,7 @@ Transcript:
 PROMPT_KEY_POINTS = """\
 Video title: {title}
 
+{reference_block}\
 Summarize this video transcript as a structured list of key points.
 
 Format:
@@ -120,7 +97,7 @@ Format:
 - Note any calls-to-action or recommendations made
 - Keep each bullet to 1 sentence
 - No timestamps
-- Preserve all proper nouns, names, and terminology exactly as they appear — do not guess spellings
+- Use correct spellings from the reference material when available
 - IMPORTANT: Keep total output under 3500 characters
 
 Transcript:
@@ -129,6 +106,7 @@ Transcript:
 PROMPT_CHAPTERS = """\
 Video title: {title}
 
+{reference_block}\
 Summarize this video transcript by dividing it into logical sections/chapters.
 
 The transcript has timestamps in [MM:SS] or [H:MM:SS] format at the start of lines.
@@ -139,7 +117,7 @@ Format:
 - Give each section a short descriptive heading
 - Under each heading, write 1-2 sentences summarizing that section
 - Format: **[H:MM:SS] Section Title** followed by summary
-- Preserve all proper nouns, names, and terminology exactly as they appear — do not guess spellings
+- Use correct spellings from the reference material when available
 - IMPORTANT: Keep total output under 3500 characters
 
 Transcript:
@@ -258,7 +236,7 @@ async def process(job: Job):
             f"Video too long ({duration}s > {MAX_DURATION}s limit)"
         )
 
-    # 3. Gather context for proper noun accuracy
+    # 3. Gather context for terminology accuracy
     description, web_context = await asyncio.gather(
         fetch_video_description(job.video_id),
         search_topic_context(title),
@@ -268,8 +246,9 @@ async def process(job: Job):
     if web_context:
         log.info("[%s] Got web context (%d chars)", job.video_id, len(web_context))
 
-    # 4. Generate hotwords from title + description + web context
-    hotwords = await generate_hotwords(title, description, web_context)
+    # 4. Extract hotwords directly from reference material (no LLM needed)
+    all_context = f"{title}\n{description}\n{web_context}"
+    hotwords = extract_hotwords_from_context(all_context)
     if hotwords:
         log.info("[%s] Hotwords (%d chars): %s...", job.video_id, len(hotwords), hotwords[:100])
 
@@ -300,8 +279,7 @@ async def process(job: Job):
     status = result.get("status", "")
     log.info("[%s] Transcribed: %s", job.video_id, status)
 
-    # 6. Post-transcription correction — fix remaining misheard terms
-    transcript = await correct_transcript(transcript, title, web_context)
+
 
     # Cache transcript to disk
     cache_file = CACHE_DIR / f"{job.video_id}.txt"
@@ -311,10 +289,18 @@ async def process(job: Job):
     log.info("[%s] Summarizing (%d chars)...", job.video_id, len(transcript))
     await safe_react(job.message, "\U0001f9e0")  # 🧠
 
+    # Build reference block for summary prompts (gives LLM correct terminology)
+    ref_block = ""
+    if web_context:
+        ref_block = (
+            "Reference material (use correct spellings from this):\n"
+            f"{web_context[:2000]}\n\n"
+        )
+
     brief, key_points, chapters_raw = await asyncio.gather(
-        summarize(transcript, PROMPT_BRIEF, 1024, title=title),
-        summarize(transcript, PROMPT_KEY_POINTS, 2048, title=title),
-        summarize(transcript, PROMPT_CHAPTERS, 2048, title=title),
+        summarize(transcript, PROMPT_BRIEF, 1024, title=title, reference_block=ref_block),
+        summarize(transcript, PROMPT_KEY_POINTS, 2048, title=title, reference_block=ref_block),
+        summarize(transcript, PROMPT_CHAPTERS, 2048, title=title, reference_block=ref_block),
     )
     chapters = linkify_timestamps(chapters_raw, job.video_id)
 
@@ -521,92 +507,25 @@ async def search_topic_context(title: str, description: str = "") -> str:
     return context
 
 
-async def generate_hotwords(title: str, description: str, web_context: str = "") -> str:
-    """Ask LLM to generate hotwords from video title + description + web context."""
-    assert http
-    if not title:
+
+
+
+def extract_hotwords_from_context(text: str) -> str:
+    """Extract unique terms from reference text to use as whisper hotwords.
+    No language assumptions — just finds words that look distinctive."""
+    if not text:
         return ""
-
-    context_parts = []
-    if description:
-        context_parts.append(f"Description: {description[:2000]}")
-    if web_context:
-        context_parts.append(f"Web search results: {web_context[:2000]}")
-    context = "\n".join(context_parts) or "(no additional context)"
-
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": PROMPT_HOTWORDS.format(title=title, description=context),
-            }
-        ],
-        "temperature": 0.1,
-        "max_tokens": 256,
-    }
-
-    try:
-        async with http.post(f"{LLM_API}/chat/completions", json=payload) as resp:
-            if resp.status != 200:
-                return ""
-            data = await resp.json()
-            return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        log.warning("Hotword generation failed: %s", e)
-        return ""
-
-
-async def correct_transcript(transcript: str, title: str, web_context: str = "") -> str:
-    """Use LLM to identify and fix misheard proper nouns in transcript."""
-    assert http
-
-    excerpt = transcript[:5000]
-    reference = web_context[:3000] if web_context else "(no reference material available)"
-
-    payload = {
-        "model": LLM_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": PROMPT_CORRECTIONS.format(
-                    title=title, excerpt=excerpt, reference=reference
-                ),
-            }
-        ],
-        "temperature": 0.1,
-        "max_tokens": 512,
-    }
-
-    try:
-        async with http.post(f"{LLM_API}/chat/completions", json=payload) as resp:
-            if resp.status != 200:
-                return transcript
-            data = await resp.json()
-            content = data["choices"][0]["message"]["content"].strip()
-
-        # Parse JSON corrections
-        # Strip markdown code fences if present
-        if content.startswith("```"):
-            content = re.sub(r"^```\w*\n?", "", content)
-            content = re.sub(r"\n?```$", "", content)
-
-        corrections = json_mod.loads(content)
-
-        if not corrections:
-            return transcript
-
-        log.info("Applying %d corrections: %s", len(corrections), corrections)
-        for wrong, correct in corrections.items():
-            transcript = transcript.replace(wrong, correct)
-
-        return transcript
-    except (json_mod.JSONDecodeError, KeyError, ValueError) as e:
-        log.warning("Correction parse failed: %s", e)
-        return transcript
-    except Exception as e:
-        log.warning("Correction pass failed: %s", e)
-        return transcript
+    # Extract all words 3+ chars that contain uppercase (proper nouns in any latin script)
+    # Plus any quoted terms, hyphenated terms, or terms with apostrophes
+    terms = set()
+    # Capitalized words/phrases
+    terms.update(re.findall(r"\b[A-Z][a-zA-Z''-]{2,}(?:\s[A-Z][a-zA-Z''-]{2,})*\b", text))
+    # Quoted terms
+    terms.update(re.findall(r'"([^"]{2,30})"', text))
+    # Terms with special characters (apostrophes, hyphens) likely proper nouns
+    terms.update(re.findall(r"\b[A-Za-z]+['''-][A-Za-z]+\b", text))
+    # Filter to unique, non-trivial terms
+    return ", ".join(sorted(t for t in terms if len(t) >= 3)[:150])
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
