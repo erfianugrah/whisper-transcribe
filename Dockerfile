@@ -80,17 +80,38 @@ RUN pip install --no-cache-dir --break-system-packages "yt-dlp>=${YT_DLP_VERSION
 #   docker run --rm -v whisper-transcribe_model-cache:/cache \
 #     alpine chown -R 1000:1000 /cache
 ENV HF_HOME=/home/ubuntu/.cache/huggingface \
-    XDG_CACHE_HOME=/home/ubuntu/.cache
+    XDG_CACHE_HOME=/home/ubuntu/.cache \
+    TORCH_HOME=/home/ubuntu/.cache/torch
 
 # Pre-create writable paths and own them by the runtime user.
+# /home/ubuntu/.cache/torch is for the wav2vec2 alignment models (lives in
+# torch.hub, NOT under HF cache — so it isn't shadowed by the named volume
+# mount and persists in the image after the warmup below).
 RUN install -d -o ubuntu -g ubuntu \
         /app /data \
-        /home/ubuntu/.cache /home/ubuntu/.cache/huggingface
+        /home/ubuntu/.cache \
+        /home/ubuntu/.cache/huggingface \
+        /home/ubuntu/.cache/torch
 
 WORKDIR /app
 COPY --chown=ubuntu:ubuntu app.py .
 
 USER ubuntu
+
+# Pre-warm the English wav2vec2 alignment model (~360 MB) so the first
+# transcription doesn't pay the download cost on every cold container start.
+# Lives in TORCH_HOME (torch.hub) which is NOT volume-mounted — so the file
+# stays in the image layer and survives across container recreations.
+#
+# Other languages (~50-400 MB each) download lazily on first use; baking
+# all of them would balloon the image. Override ALIGN_LANGS with a
+# comma-separated list to pre-warm more, e.g. `--build-arg ALIGN_LANGS=en,es,fr`.
+ARG ALIGN_LANGS=en
+RUN for lang in $(echo "$ALIGN_LANGS" | tr ',' ' '); do \
+        echo "Pre-warming wav2vec2 alignment model for '$lang'..." && \
+        python3 -c "import whisperx; whisperx.load_align_model('$lang', device='cpu')" \
+        || echo "WARN: pre-warm for '$lang' failed (will download lazily)"; \
+    done
 
 EXPOSE 7860
 
