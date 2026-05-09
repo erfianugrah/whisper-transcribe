@@ -22,5 +22,33 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
 
+  bot:
+    build:
+      context: ./bot
+    image: whisper-transcribe-bot:latest
+    pull_policy: missing
+    env_file:
+      - ./bot/.env
+    environment:
+      # Inside the compose network, services are reached by name.
+      - WHISPER_API_URL=http://whisper:7860
+      # model_proxy lives on the external llm-compose_llm network.
+      - LLM_API_URL=http://model_proxy:11434/v1
+    volumes:
+      - bot-cache:/app/cache
+    networks:
+      - default
+      - llm
+    depends_on:
+      - whisper
+    restart: unless-stopped
+
 volumes:
   model-cache:
+  bot-cache:
+
+networks:
+  default:
+  llm:
+    external: true
+    name: llm-compose_llm
