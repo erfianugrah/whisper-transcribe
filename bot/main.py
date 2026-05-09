@@ -86,12 +86,17 @@ PROMPT_CORRECTIONS = """\
 Video title: {title}
 
 Below is a transcript from speech recognition. Some proper nouns, names, and \
-technical terms may be misspelled or misheard. Using your knowledge of the subject \
-matter and the context from the transcript, identify words that are likely \
-speech recognition errors and provide corrections.
+technical terms may be misspelled or misheard.
+
+I have fetched reference material from the web about this topic. Use it as \
+ground truth for correct spellings of names, places, mechanics, and terminology. \
+Compare the transcript against the reference and fix any misheard terms.
 
 Output ONLY a JSON object mapping wrong → correct. If nothing needs fixing, output {{}}.
-Example: {{"Kalgoorin": "Kalguuran", "Eziomite": "Ezomyte"}}
+Example: {{"Kalgoorin": "Kalguuran", "Eziomite": "Ezomyte", "Pharoah": "Farrow"}}
+
+Reference material:
+{reference}
 
 Transcript excerpt (first 5000 chars):
 {excerpt}"""
@@ -486,27 +491,59 @@ async def fetch_video_description(video_id: str) -> str:
 
 
 async def search_topic_context(title: str) -> str:
-    """Web search for the video title to find correct terminology."""
+    """Web search for the video title, fetch top result for correct terminology."""
     assert http
-    # Use DuckDuckGo HTML lite (no API key needed)
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; TLDWBot/1.0)"}
+
+    # Step 1: Search DuckDuckGo for the video title
     query = title.replace(" ", "+")
-    url = f"https://html.duckduckgo.com/html/?q={query}"
+    search_url = f"https://html.duckduckgo.com/html/?q={query}+summary+guide+wiki"
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        async with http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with http.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
                 return ""
             page = await resp.text()
-        # Extract result snippets — they contain correct terminology
-        snippets = re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', page)
-        if not snippets:
-            snippets = re.findall(r'class="result__snippet">(.*?)</span>', page)
-        # Clean HTML tags from snippets
-        clean = [re.sub(r"<[^>]+>", "", s) for s in snippets[:5]]
-        return "\n".join(clean)
     except Exception as e:
         log.warning("Web search failed: %s", e)
-    return ""
+        return ""
+
+    # Step 2: Extract result URLs — prefer wikis, guides, official sources
+    urls = re.findall(r'<a rel="nofollow" class="result__a" href="([^"]+)"', page)
+    if not urls:
+        urls = re.findall(r'href="(https?://[^"]+)"', page)
+
+    # Rank URLs: prefer wiki/guide/official over random
+    preferred = ["wiki", "guide", "fandom", "mobalytics", "ign.com", "gamespot",
+                 "polygon", "eurogamer", "pcgamer", "official"]
+    ranked = sorted(urls[:10], key=lambda u: -sum(p in u.lower() for p in preferred))
+
+    # Step 3: Fetch the top 1-2 result pages and extract text
+    context_parts = []
+    for url in ranked[:2]:
+        try:
+            async with http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    continue
+                content_type = resp.headers.get("content-type", "")
+                if "html" not in content_type:
+                    continue
+                page_html = await resp.text()
+
+            # Extract visible text from paragraphs and headings
+            text_chunks = re.findall(r"<(?:p|h[1-6]|li|td)[^>]*>(.*?)</(?:p|h[1-6]|li|td)>", page_html, re.DOTALL)
+            clean = [re.sub(r"<[^>]+>", "", chunk).strip() for chunk in text_chunks]
+            clean = [c for c in clean if len(c) > 20]  # skip tiny fragments
+            page_text = "\n".join(clean[:50])  # first 50 paragraphs
+
+            if page_text:
+                context_parts.append(page_text[:3000])
+                log.info("Fetched context from %s (%d chars)", url[:60], len(page_text))
+
+        except Exception as e:
+            log.debug("Failed to fetch %s: %s", url[:60], e)
+            continue
+
+    return "\n---\n".join(context_parts)
 
 
 async def generate_hotwords(title: str, description: str, web_context: str = "") -> str:
@@ -550,16 +587,16 @@ async def correct_transcript(transcript: str, title: str, web_context: str = "")
     assert http
 
     excerpt = transcript[:5000]
-    context_note = ""
-    if web_context:
-        context_note = f"\n\nReference (correct spellings from web):\n{web_context[:1500]}\n"
+    reference = web_context[:3000] if web_context else "(no reference material available)"
 
     payload = {
         "model": LLM_MODEL,
         "messages": [
             {
                 "role": "user",
-                "content": PROMPT_CORRECTIONS.format(title=title, excerpt=excerpt) + context_note,
+                "content": PROMPT_CORRECTIONS.format(
+                    title=title, excerpt=excerpt, reference=reference
+                ),
             }
         ],
         "temperature": 0.1,
