@@ -53,6 +53,17 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(Path(__file__).parent / "cache"
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "86400"))
 CACHE_DIR.mkdir(exist_ok=True)
 
+# ─── Summary tuning ───────────────────────────────────────────────────────────
+# Discord embed description hard cap is 4096 chars; leave safety margin so the
+# model's overshoot still fits in a single embed before send_long_embed splits.
+EMBED_DESC_LIMIT = 4096
+SUMMARY_CHAR_CAP = EMBED_DESC_LIMIT - 300
+
+# Tail-coverage invariant: the final chapter must start within the last
+# CHAPTER_TAIL_FRACTION of the video. This is the only chapter-count constraint;
+# the LLM picks the actual section count and density from semantic shifts.
+CHAPTER_TAIL_FRACTION = float(os.environ.get("CHAPTER_TAIL_FRACTION", "0.25"))
+
 
 
 # Optional: channel ID for detailed summaries (key points + chapters)
@@ -97,55 +108,76 @@ VIDEO_URL_PATTERN = re.compile(
 
 
 
-PROMPT_BRIEF = """\
-Video title: {title}
+_REF_RULES = """\
+STRICT RULES:
+- Summarize ONLY what the transcript states. Do NOT add facts, dates, numbers, \
+release dates, version numbers, or claims that are not in the transcript, \
+even if they appear in the reference material.
+- The reference material is for SPELLING and TERMINOLOGY ONLY (proper nouns, \
+product names, jargon). Never copy content from it into the summary."""
 
-{reference_block}\
+
+PROMPT_BRIEF = f"""\
+Video title: {{title}}
+Video duration: {{duration}}
+
+{{reference_block}}\
 Summarize this video transcript in a single concise paragraph (3-5 sentences). \
 Capture the main thesis, key argument, and conclusion. No bullet points. \
-No timestamps. Plain language. Use correct spellings from the reference material \
-when available.
+No timestamps. Plain language.
+
+{_REF_RULES}
 
 Transcript:
-{transcript}"""
+{{transcript}}"""
 
-PROMPT_KEY_POINTS = """\
-Video title: {title}
+PROMPT_KEY_POINTS = f"""\
+Video title: {{title}}
+Video duration: {{duration}}
 
-{reference_block}\
+{{reference_block}}\
 Summarize this video transcript as a structured list of key points.
 
 Format:
 - One-sentence overview at the top
-- 5-10 bullet points covering the most important ideas, arguments, and conclusions
+- A bulleted list of the most important ideas, arguments, and conclusions \
+(use as many bullets as the content warrants)
 - Note any calls-to-action or recommendations made
 - Keep each bullet to 1 sentence
 - No timestamps
-- Use correct spellings from the reference material when available
-- IMPORTANT: Keep total output under 3500 characters
+- Keep total output under {{char_cap}} characters
+
+{_REF_RULES}
 
 Transcript:
-{transcript}"""
+{{transcript}}"""
 
-PROMPT_CHAPTERS = """\
-Video title: {title}
+PROMPT_CHAPTERS = f"""\
+Video title: {{title}}
+Video duration: {{duration}}
 
-{reference_block}\
-Summarize this video transcript by dividing it into logical sections/chapters.
+{{reference_block}}\
+Summarize this video transcript by dividing it into logical sections/chapters \
+based on semantic topic shifts. Choose the number of sections that best fits \
+the content — do not pad or compress.
 
 The transcript has timestamps in [MM:SS] or [H:MM:SS] format at the start of lines.
 
 Format:
-- Identify 4-8 major topic shifts or sections in the video
-- For each section, include the approximate start timestamp from the transcript
+- Sections must span the ENTIRE video from start to finish
+- The first section MUST start at or near 0:00
+- The final section MUST start at or after {{tail_start}} (within the last \
+portion of the {{duration}} runtime). Do NOT stop summarizing before the end.
+- For each section, use the approximate start timestamp from the transcript
 - Give each section a short descriptive heading
 - Under each heading, write 1-2 sentences summarizing that section
 - Format: **[H:MM:SS] Section Title** followed by summary
-- Use correct spellings from the reference material when available
-- IMPORTANT: Keep total output under 3500 characters
+- Keep total output under {{char_cap}} characters
+
+{_REF_RULES}
 
 Transcript:
-{transcript}"""
+{{transcript}}"""
 
 
 # ─── Data ─────────────────────────────────────────────────────────────────────
@@ -309,18 +341,14 @@ async def process(job: Job):
     if web_context:
         log.info("[%s] Got web context (%d chars)", job.video_id, len(web_context))
 
-    # 4. Extract hotwords directly from reference material (no LLM needed)
-    all_context = f"{title}\n{description}\n{web_context}"
-    hotwords = extract_hotwords_from_context(all_context)
-    if hotwords:
-        log.info("[%s] Hotwords (%d chars): %s...", job.video_id, len(hotwords), hotwords[:100])
-
-
-
-    # 5. Transcribe with hotwords + initial_prompt (single pass)
-    initial_prompt = build_initial_prompt(title, web_context)
+    # 4. Build initial_prompt for whisper (proper-noun bias for the decoder).
+    # Note: we deliberately do NOT pass `hotwords` — initial_prompt and hotwords
+    # share whisper's 448-token prompt context, and passing both has caused
+    # "position >= 448" errors. initial_prompt alone covers terminology bias.
+    initial_prompt = build_initial_prompt(title, f"{description}\n{web_context}")
     if initial_prompt:
-        log.info("[%s] Initial prompt: %s...", job.video_id, initial_prompt[:80])
+        log.info("[%s] Initial prompt (%d chars): %s...",
+                 job.video_id, len(initial_prompt), initial_prompt[:80])
 
     log.info("[%s] Transcribing '%s' (%ds)...", job.video_id, title, duration)
     await safe_react(job.message, "\U0001f3a7")  # 🎧
@@ -330,8 +358,6 @@ async def process(job: Job):
         "model": WHISPER_MODEL,
         "cleanup": True,
     }
-    if hotwords:
-        transcribe_payload["hotwords"] = hotwords
     if initial_prompt:
         transcribe_payload["initial_prompt"] = initial_prompt
 
@@ -350,7 +376,11 @@ async def process(job: Job):
     status = result.get("status", "")
     log.info("[%s] Transcribed: %s", job.video_id, status)
 
-
+    # Whisper sometimes returns a status like "Error: ..." with empty transcript
+    # (e.g. prompt-context overflow). Fail loudly so retry logic kicks in instead
+    # of summarising an empty string and posting blank embeds.
+    if not transcript.strip() or status.lower().startswith("error"):
+        raise RuntimeError(f"Transcription produced no usable text: {status or 'empty transcript'}")
 
     # Cache transcript to disk
     cache_file = CACHE_DIR / f"{job.video_id}.txt"
@@ -360,18 +390,34 @@ async def process(job: Job):
     log.info("[%s] Summarizing (%d chars)...", job.video_id, len(transcript))
     await safe_react(job.message, "\U0001f9e0")  # 🧠
 
-    # Build reference block for summary prompts (gives LLM correct terminology)
+    # Build reference block for summary prompts (terminology/spelling ONLY)
     ref_block = ""
     if web_context:
         ref_block = (
-            "Reference material (use correct spellings from this):\n"
+            "Reference material — USE FOR SPELLING/TERMINOLOGY ONLY. "
+            "Do NOT copy facts, dates, numbers, or claims from this into the summary. "
+            "Summary content must come exclusively from the transcript below.\n"
             f"{web_context[:2000]}\n\n"
         )
 
+    duration_str = format_duration(duration)
+    tail_start = format_duration(int(duration * (1 - CHAPTER_TAIL_FRACTION)))
+
     brief, key_points, chapters_raw = await asyncio.gather(
-        summarize(transcript, PROMPT_BRIEF, 1024, title=title, reference_block=ref_block),
-        summarize(transcript, PROMPT_KEY_POINTS, 2048, title=title, reference_block=ref_block),
-        summarize(transcript, PROMPT_CHAPTERS, 2048, title=title, reference_block=ref_block),
+        summarize(
+            transcript, PROMPT_BRIEF, 1024,
+            title=title, duration=duration_str, reference_block=ref_block,
+        ),
+        summarize(
+            transcript, PROMPT_KEY_POINTS, 2048,
+            title=title, duration=duration_str, reference_block=ref_block,
+            char_cap=SUMMARY_CHAR_CAP,
+        ),
+        summarize(
+            transcript, PROMPT_CHAPTERS, 3000,
+            title=title, duration=duration_str, reference_block=ref_block,
+            tail_start=tail_start, char_cap=SUMMARY_CHAR_CAP,
+        ),
     )
     # Only linkify timestamps for YouTube videos (other platforms don't support ?t=)
     if "youtube.com" in job.url or "youtu.be" in job.url:
@@ -586,10 +632,16 @@ async def search_topic_context(title: str, description: str = "") -> str:
 
 
 
+# Whisper's prompt context window is 448 tokens total. initial_prompt and
+# hotwords share that budget. Stay well under by capping the prompt at
+# ~600 chars (≈ 150 tokens) and skipping hotwords entirely.
+INITIAL_PROMPT_CHAR_CAP = 600
+
+
 def build_initial_prompt(title: str, web_context: str) -> str:
     """Build a compact natural-language sentence with key proper nouns for Whisper's
-    initial_prompt. Limited to ~50 words (≤224 tokens). Places highest-value terms
-    near the end for maximum decoder influence."""
+    initial_prompt. Hard-capped at INITIAL_PROMPT_CHAR_CAP chars to stay within
+    Whisper's 448-token prompt context (shared with hotwords)."""
     if not web_context:
         return ""
 
@@ -606,17 +658,25 @@ def build_initial_prompt(title: str, web_context: str) -> str:
     if not terms:
         return ""
 
-    # Build compact sentence — whisper uses last ≤224 tokens, so keep it tight
-    # Use max ~40 terms to stay under token limit
-    selected = terms[:40]
-    prompt = f"This video is about {title}. Key terms: {', '.join(selected)}."
+    # Greedily add terms until char cap hit (highest-value terms first by length)
+    base = f"This video is about {title}. Key terms: "
+    suffix = "."
+    budget = INITIAL_PROMPT_CHAR_CAP - len(base) - len(suffix)
+    if budget <= 0:
+        return base[:INITIAL_PROMPT_CHAR_CAP]
 
-    # Hard cap at ~200 words (rough token proxy)
-    words = prompt.split()
-    if len(words) > 200:
-        prompt = " ".join(words[:200])
+    picked: list[str] = []
+    used = 0
+    for term in terms:
+        addition = (", " if picked else "") + term
+        if used + len(addition) > budget:
+            break
+        picked.append(term)
+        used += len(addition)
 
-    return prompt
+    if not picked:
+        return ""
+    return base + ", ".join(picked) + suffix
 
 
 def extract_hotwords_from_context(text: str) -> str:
