@@ -45,6 +45,7 @@ LLM_API = os.environ.get("LLM_API_URL", "http://localhost:11434/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen3.5-4B-Q8_0")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "turbo")
 MAX_DURATION = int(os.environ.get("MAX_DURATION", "14400"))  # 4 hours
+EXA_API_KEY = os.environ.get("EXA_API_KEY", "")
 ALLOWED_CHANNELS: set[int] | None = None
 
 # Transcript cache directory and TTL (default 24 hours)
@@ -52,10 +53,7 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(Path(__file__).parent / "cache"
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "86400"))
 CACHE_DIR.mkdir(exist_ok=True)
 
-# Persistent hotwords dictionary — learns correct terms over time
-DATA_DIR = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent / "data")))
-DATA_DIR.mkdir(exist_ok=True)
-HOTWORDS_DB = DATA_DIR / "hotwords.json"
+
 
 # Optional: channel ID for detailed summaries (key points + chapters)
 # If unset, all embeds go to the original channel
@@ -88,12 +86,12 @@ Video title: {title}
 Below is a transcript from speech recognition. Some proper nouns, names, and \
 technical terms may be misspelled or misheard.
 
-I have fetched reference material from the web about this topic. Use it as \
-ground truth for correct spellings of names, places, mechanics, and terminology. \
-Compare the transcript against the reference and fix any misheard terms.
+I have fetched reference material from the web about this specific topic. \
+ONLY correct terms where the reference material contains the correct spelling. \
+Do NOT guess or use knowledge from other topics. If the reference doesn't \
+mention a term, leave it as-is.
 
 Output ONLY a JSON object mapping wrong → correct. If nothing needs fixing, output {{}}.
-Example: {{"Kalgoorin": "Kalguuran", "Eziomite": "Ezomyte", "Pharoah": "Farrow"}}
 
 Reference material:
 {reference}
@@ -270,10 +268,8 @@ async def process(job: Job):
     if web_context:
         log.info("[%s] Got web context (%d chars)", job.video_id, len(web_context))
 
-    # 4. Generate hotwords from title + description + web context + accumulated dictionary
-    generated = await generate_hotwords(title, description, web_context)
-    accumulated = get_accumulated_hotwords()
-    hotwords = ", ".join(filter(None, [generated, accumulated]))
+    # 4. Generate hotwords from title + description + web context
+    hotwords = await generate_hotwords(title, description, web_context)
     if hotwords:
         log.info("[%s] Hotwords (%d chars): %s...", job.video_id, len(hotwords), hotwords[:100])
 
@@ -397,50 +393,6 @@ async def summarize(transcript: str, prompt_template: str, max_tokens: int, **kw
     return data["choices"][0]["message"]["content"]
 
 
-# ─── Hotwords Dictionary ──────────────────────────────────────────────────────
-
-
-def load_hotwords_db() -> dict[str, int]:
-    """Load accumulated hotwords with frequency counts."""
-    if HOTWORDS_DB.exists():
-        try:
-            return json_mod.loads(HOTWORDS_DB.read_text())
-        except (json_mod.JSONDecodeError, OSError):
-            pass
-    return {}
-
-
-def save_hotwords_db(db: dict[str, int]):
-    """Save hotwords dictionary, pruning terms seen only once if >500 entries."""
-    if len(db) > 500:
-        db = {k: v for k, v in db.items() if v > 1}
-    HOTWORDS_DB.write_text(json_mod.dumps(db, indent=2))
-
-
-def learn_hotwords(corrections: dict[str, str]):
-    """Add corrected terms to the persistent dictionary."""
-    if not corrections:
-        return
-    db = load_hotwords_db()
-    for correct in corrections.values():
-        # Store each word in the correction as a known term
-        for word in correct.split():
-            if len(word) > 2 and not word.isdigit():
-                db[word] = db.get(word, 0) + 1
-    save_hotwords_db(db)
-    log.info("Learned %d terms, dictionary size: %d", len(corrections), len(db))
-
-
-def get_accumulated_hotwords(limit: int = 100) -> str:
-    """Get top accumulated hotwords as comma-separated string."""
-    db = load_hotwords_db()
-    if not db:
-        return ""
-    # Sort by frequency, take top N
-    sorted_terms = sorted(db.items(), key=lambda x: x[1], reverse=True)[:limit]
-    return ", ".join(term for term, _ in sorted_terms)
-
-
 # ─── Video Context ────────────────────────────────────────────────────────────
 
 
@@ -490,60 +442,83 @@ async def fetch_video_description(video_id: str) -> str:
     return ""
 
 
-async def search_topic_context(title: str) -> str:
-    """Web search for the video title, fetch top result for correct terminology."""
+async def search_topic_context(title: str, description: str = "") -> str:
+    """Use Exa to find authoritative sources with correct terminology."""
     assert http
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; TLDWBot/1.0)"}
-
-    # Step 1: Search DuckDuckGo for the video title
-    query = title.replace(" ", "+")
-    search_url = f"https://html.duckduckgo.com/html/?q={query}+summary+guide+wiki"
-    try:
-        async with http.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status != 200:
-                return ""
-            page = await resp.text()
-    except Exception as e:
-        log.warning("Web search failed: %s", e)
+    if not EXA_API_KEY:
+        log.debug("No EXA_API_KEY — skipping web research")
         return ""
 
-    # Step 2: Extract result URLs — prefer wikis, guides, official sources
-    urls = re.findall(r'<a rel="nofollow" class="result__a" href="([^"]+)"', page)
-    if not urls:
-        urls = re.findall(r'href="(https?://[^"]+)"', page)
+    # Build a focused query using title + description context
+    query = title
+    if description:
+        # Add first sentence of description for topic specificity
+        first_sentence = description.split(".")[0] if "." in description else description[:100]
+        query = f"{title} — {first_sentence}"
 
-    # Rank URLs: prefer wiki/guide/official over random
-    preferred = ["wiki", "guide", "fandom", "mobalytics", "ign.com", "gamespot",
-                 "polygon", "eurogamer", "pcgamer", "official"]
-    ranked = sorted(urls[:10], key=lambda u: -sum(p in u.lower() for p in preferred))
+    payload = {
+        "query": query,
+        "type": "auto",
+        "numResults": 5,
+        "contents": {
+            "highlights": True,
+            "text": {"maxCharacters": 5000},
+        },
+        "excludeDomains": ["youtube.com", "reddit.com"],
+    }
 
-    # Step 3: Fetch the top 1-2 result pages and extract text
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": EXA_API_KEY,
+    }
+
+    try:
+        async with http.post(
+            "https://api.exa.ai/search",
+            json=payload,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                log.warning("Exa search failed (%d): %s", resp.status, body[:200])
+                return ""
+            data = await resp.json()
+    except Exception as e:
+        log.warning("Exa search error: %s", e)
+        return ""
+
+    results = data.get("results", [])
+    if not results:
+        log.info("Exa: no results for '%s'", title[:60])
+        return ""
+
+    # Combine highlights and text from top results
     context_parts = []
-    for url in ranked[:2]:
-        try:
-            async with http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    continue
-                content_type = resp.headers.get("content-type", "")
-                if "html" not in content_type:
-                    continue
-                page_html = await resp.text()
+    for r in results[:3]:
+        parts = []
+        url = r.get("url", "")
+        r_title = r.get("title", "")
+        if r_title:
+            parts.append(f"Source: {r_title} ({url})")
 
-            # Extract visible text from paragraphs and headings
-            text_chunks = re.findall(r"<(?:p|h[1-6]|li|td)[^>]*>(.*?)</(?:p|h[1-6]|li|td)>", page_html, re.DOTALL)
-            clean = [re.sub(r"<[^>]+>", "", chunk).strip() for chunk in text_chunks]
-            clean = [c for c in clean if len(c) > 20]  # skip tiny fragments
-            page_text = "\n".join(clean[:50])  # first 50 paragraphs
+        # Highlights are query-relevant excerpts
+        highlights = r.get("highlights", [])
+        if highlights:
+            parts.extend(highlights)
 
-            if page_text:
-                context_parts.append(page_text[:3000])
-                log.info("Fetched context from %s (%d chars)", url[:60], len(page_text))
+        # Full text if available
+        text = r.get("text", "")
+        if text and not highlights:
+            parts.append(text[:2000])
 
-        except Exception as e:
-            log.debug("Failed to fetch %s: %s", url[:60], e)
-            continue
+        if parts:
+            context_parts.append("\n".join(parts))
 
-    return "\n---\n".join(context_parts)
+    context = "\n---\n".join(context_parts)
+    if context:
+        log.info("Exa: got %d results, %d chars context", len(results), len(context))
+    return context
 
 
 async def generate_hotwords(title: str, description: str, web_context: str = "") -> str:
@@ -624,9 +599,6 @@ async def correct_transcript(transcript: str, title: str, web_context: str = "")
         log.info("Applying %d corrections: %s", len(corrections), corrections)
         for wrong, correct in corrections.items():
             transcript = transcript.replace(wrong, correct)
-
-        # Learn correct terms for future transcriptions
-        learn_hotwords(corrections)
 
         return transcript
     except (json_mod.JSONDecodeError, KeyError, ValueError) as e:
