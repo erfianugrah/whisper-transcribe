@@ -9,6 +9,8 @@ Posts three embeds per video:
 """
 
 import asyncio
+import html as html_mod
+import json as json_mod
 import logging
 import os
 import re
@@ -50,6 +52,11 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(Path(__file__).parent / "cache"
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "86400"))
 CACHE_DIR.mkdir(exist_ok=True)
 
+# Persistent hotwords dictionary — learns correct terms over time
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(Path(__file__).parent / "data")))
+DATA_DIR.mkdir(exist_ok=True)
+HOTWORDS_DB = DATA_DIR / "hotwords.json"
+
 # Optional: channel ID for detailed summaries (key points + chapters)
 # If unset, all embeds go to the original channel
 SUMMARY_CHANNEL: int | None = None
@@ -66,7 +73,32 @@ YT_PATTERN = re.compile(
 
 # ─── Prompts ──────────────────────────────────────────────────────────────────
 
+PROMPT_HOTWORDS = """\
+Given this video title and description, list proper nouns, technical terms, \
+jargon, and names that a speech-to-text model might mishear. Include character \
+names, place names, game/product terminology, brand names, and specialized vocabulary. \
+Output ONLY a comma-separated list, nothing else. No explanations.
+
+Title: {title}
+Description: {description}"""
+
+PROMPT_CORRECTIONS = """\
+Video title: {title}
+
+Below is a transcript from speech recognition. Some proper nouns, names, and \
+technical terms may be misspelled or misheard. Using your knowledge of the subject \
+matter and the context from the transcript, identify words that are likely \
+speech recognition errors and provide corrections.
+
+Output ONLY a JSON object mapping wrong → correct. If nothing needs fixing, output {{}}.
+Example: {{"Kalgoorin": "Kalguuran", "Eziomite": "Ezomyte"}}
+
+Transcript excerpt (first 5000 chars):
+{excerpt}"""
+
 PROMPT_BRIEF = """\
+Video title: {title}
+
 Summarize this video transcript in a single concise paragraph (3-5 sentences). \
 Capture the main thesis, key argument, and conclusion. No bullet points. \
 No timestamps. Plain language.
@@ -75,6 +107,8 @@ Transcript:
 {transcript}"""
 
 PROMPT_KEY_POINTS = """\
+Video title: {title}
+
 Summarize this video transcript as a structured list of key points.
 
 Format:
@@ -83,13 +117,15 @@ Format:
 - Note any calls-to-action or recommendations made
 - Keep each bullet to 1 sentence
 - No timestamps
-- Use plain language; preserve technical terms only when necessary
+- Preserve all proper nouns, names, and terminology exactly as they appear — do not guess spellings
 - IMPORTANT: Keep total output under 3500 characters
 
 Transcript:
 {transcript}"""
 
 PROMPT_CHAPTERS = """\
+Video title: {title}
+
 Summarize this video transcript by dividing it into logical sections/chapters.
 
 The transcript has timestamps in [MM:SS] or [H:MM:SS] format at the start of lines.
@@ -100,7 +136,7 @@ Format:
 - Give each section a short descriptive heading
 - Under each heading, write 1-2 sentences summarizing that section
 - Format: **[H:MM:SS] Section Title** followed by summary
-- Use plain language
+- Preserve all proper nouns, names, and terminology exactly as they appear — do not guess spellings
 - IMPORTANT: Keep total output under 3500 characters
 
 Transcript:
@@ -219,17 +255,38 @@ async def process(job: Job):
             f"Video too long ({duration}s > {MAX_DURATION}s limit)"
         )
 
-    # 3. Transcribe
+    # 3. Gather context for proper noun accuracy
+    description, web_context = await asyncio.gather(
+        fetch_video_description(job.video_id),
+        search_topic_context(title),
+    )
+    if description:
+        log.info("[%s] Got video description (%d chars)", job.video_id, len(description))
+    if web_context:
+        log.info("[%s] Got web context (%d chars)", job.video_id, len(web_context))
+
+    # 4. Generate hotwords from title + description + web context + accumulated dictionary
+    generated = await generate_hotwords(title, description, web_context)
+    accumulated = get_accumulated_hotwords()
+    hotwords = ", ".join(filter(None, [generated, accumulated]))
+    if hotwords:
+        log.info("[%s] Hotwords (%d chars): %s...", job.video_id, len(hotwords), hotwords[:100])
+
+    # 5. Transcribe
     log.info("[%s] Transcribing '%s' (%ds)...", job.video_id, title, duration)
     await safe_react(job.message, "\U0001f3a7")  # 🎧
 
+    transcribe_payload = {
+        "file_path": file_path,
+        "model": WHISPER_MODEL,
+        "cleanup": True,
+    }
+    if hotwords:
+        transcribe_payload["hotwords"] = hotwords
+
     async with http.post(
         f"{WHISPER_API}/api/transcribe",
-        json={
-            "file_path": file_path,
-            "model": WHISPER_MODEL,
-            "cleanup": True,
-        },
+        json=transcribe_payload,
     ) as resp:
         if resp.status == 409:
             raise RuntimeError("Whisper busy — another transcription running")
@@ -242,6 +299,9 @@ async def process(job: Job):
     status = result.get("status", "")
     log.info("[%s] Transcribed: %s", job.video_id, status)
 
+    # 6. Post-transcription correction — fix remaining misheard terms
+    transcript = await correct_transcript(transcript, title, web_context)
+
     # Cache transcript to disk
     cache_file = CACHE_DIR / f"{job.video_id}.txt"
     cache_file.write_text(f"# {title}\n# {status}\n\n{transcript}")
@@ -251,9 +311,9 @@ async def process(job: Job):
     await safe_react(job.message, "\U0001f9e0")  # 🧠
 
     brief, key_points, chapters_raw = await asyncio.gather(
-        summarize(transcript, PROMPT_BRIEF, 1024),
-        summarize(transcript, PROMPT_KEY_POINTS, 2048),
-        summarize(transcript, PROMPT_CHAPTERS, 2048),
+        summarize(transcript, PROMPT_BRIEF, 1024, title=title),
+        summarize(transcript, PROMPT_KEY_POINTS, 2048, title=title),
+        summarize(transcript, PROMPT_CHAPTERS, 2048, title=title),
     )
     chapters = linkify_timestamps(chapters_raw, job.video_id)
 
@@ -308,7 +368,7 @@ async def process(job: Job):
     log.info("[%s] Done — posted 3 embeds", job.video_id)
 
 
-async def summarize(transcript: str, prompt_template: str, max_tokens: int) -> str:
+async def summarize(transcript: str, prompt_template: str, max_tokens: int, **kwargs) -> str:
     assert http
 
     payload = {
@@ -316,7 +376,7 @@ async def summarize(transcript: str, prompt_template: str, max_tokens: int) -> s
         "messages": [
             {
                 "role": "user",
-                "content": prompt_template.format(transcript=transcript),
+                "content": prompt_template.format(transcript=transcript, **kwargs),
             }
         ],
         "temperature": 0.3,
@@ -330,6 +390,214 @@ async def summarize(transcript: str, prompt_template: str, max_tokens: int) -> s
         data = await resp.json()
 
     return data["choices"][0]["message"]["content"]
+
+
+# ─── Hotwords Dictionary ──────────────────────────────────────────────────────
+
+
+def load_hotwords_db() -> dict[str, int]:
+    """Load accumulated hotwords with frequency counts."""
+    if HOTWORDS_DB.exists():
+        try:
+            return json_mod.loads(HOTWORDS_DB.read_text())
+        except (json_mod.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_hotwords_db(db: dict[str, int]):
+    """Save hotwords dictionary, pruning terms seen only once if >500 entries."""
+    if len(db) > 500:
+        db = {k: v for k, v in db.items() if v > 1}
+    HOTWORDS_DB.write_text(json_mod.dumps(db, indent=2))
+
+
+def learn_hotwords(corrections: dict[str, str]):
+    """Add corrected terms to the persistent dictionary."""
+    if not corrections:
+        return
+    db = load_hotwords_db()
+    for correct in corrections.values():
+        # Store each word in the correction as a known term
+        for word in correct.split():
+            if len(word) > 2 and not word.isdigit():
+                db[word] = db.get(word, 0) + 1
+    save_hotwords_db(db)
+    log.info("Learned %d terms, dictionary size: %d", len(corrections), len(db))
+
+
+def get_accumulated_hotwords(limit: int = 100) -> str:
+    """Get top accumulated hotwords as comma-separated string."""
+    db = load_hotwords_db()
+    if not db:
+        return ""
+    # Sort by frequency, take top N
+    sorted_terms = sorted(db.items(), key=lambda x: x[1], reverse=True)[:limit]
+    return ", ".join(term for term, _ in sorted_terms)
+
+
+# ─── Video Context ────────────────────────────────────────────────────────────
+
+
+async def fetch_video_description(video_id: str) -> str:
+    """Fetch full YouTube video description from page JSON data."""
+    assert http
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en"}
+        async with http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return ""
+            page = await resp.text()
+
+        # Try to extract full description from ytInitialPlayerResponse JSON
+        match = re.search(r"var ytInitialPlayerResponse\s*=\s*(\{.+?\});", page)
+        if match:
+            try:
+                data = json_mod.loads(match.group(1))
+                desc = data.get("videoDetails", {}).get("shortDescription", "")
+                if desc:
+                    return desc
+            except (json_mod.JSONDecodeError, KeyError):
+                pass
+
+        # Fallback: try ytInitialData for description
+        match = re.search(r"var ytInitialData\s*=\s*(\{.+?\});", page)
+        if match:
+            try:
+                data = json_mod.loads(match.group(1))
+                # Navigate to description in structured data
+                contents = (
+                    data.get("engagementPanels", [{}])[0]
+                    .get("engagementPanelSectionListRenderer", {})
+                    .get("content", {})
+                )
+                # This path varies — fallback to meta tag
+            except Exception:
+                pass
+
+        # Final fallback: meta description (short, ~160 chars)
+        match = re.search(r'<meta\s+name="description"\s+content="([^"]*)"', page)
+        if match:
+            return html_mod.unescape(match.group(1))
+    except Exception as e:
+        log.warning("Failed to fetch video description: %s", e)
+    return ""
+
+
+async def search_topic_context(title: str) -> str:
+    """Web search for the video title to find correct terminology."""
+    assert http
+    # Use DuckDuckGo HTML lite (no API key needed)
+    query = title.replace(" ", "+")
+    url = f"https://html.duckduckgo.com/html/?q={query}"
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return ""
+            page = await resp.text()
+        # Extract result snippets — they contain correct terminology
+        snippets = re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', page)
+        if not snippets:
+            snippets = re.findall(r'class="result__snippet">(.*?)</span>', page)
+        # Clean HTML tags from snippets
+        clean = [re.sub(r"<[^>]+>", "", s) for s in snippets[:5]]
+        return "\n".join(clean)
+    except Exception as e:
+        log.warning("Web search failed: %s", e)
+    return ""
+
+
+async def generate_hotwords(title: str, description: str, web_context: str = "") -> str:
+    """Ask LLM to generate hotwords from video title + description + web context."""
+    assert http
+    if not title:
+        return ""
+
+    context_parts = []
+    if description:
+        context_parts.append(f"Description: {description[:2000]}")
+    if web_context:
+        context_parts.append(f"Web search results: {web_context[:2000]}")
+    context = "\n".join(context_parts) or "(no additional context)"
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": PROMPT_HOTWORDS.format(title=title, description=context),
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": 256,
+    }
+
+    try:
+        async with http.post(f"{LLM_API}/chat/completions", json=payload) as resp:
+            if resp.status != 200:
+                return ""
+            data = await resp.json()
+            return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.warning("Hotword generation failed: %s", e)
+        return ""
+
+
+async def correct_transcript(transcript: str, title: str, web_context: str = "") -> str:
+    """Use LLM to identify and fix misheard proper nouns in transcript."""
+    assert http
+
+    excerpt = transcript[:5000]
+    context_note = ""
+    if web_context:
+        context_note = f"\n\nReference (correct spellings from web):\n{web_context[:1500]}\n"
+
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": PROMPT_CORRECTIONS.format(title=title, excerpt=excerpt) + context_note,
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": 512,
+    }
+
+    try:
+        async with http.post(f"{LLM_API}/chat/completions", json=payload) as resp:
+            if resp.status != 200:
+                return transcript
+            data = await resp.json()
+            content = data["choices"][0]["message"]["content"].strip()
+
+        # Parse JSON corrections
+        # Strip markdown code fences if present
+        if content.startswith("```"):
+            content = re.sub(r"^```\w*\n?", "", content)
+            content = re.sub(r"\n?```$", "", content)
+
+        corrections = json_mod.loads(content)
+
+        if not corrections:
+            return transcript
+
+        log.info("Applying %d corrections: %s", len(corrections), corrections)
+        for wrong, correct in corrections.items():
+            transcript = transcript.replace(wrong, correct)
+
+        # Learn correct terms for future transcriptions
+        learn_hotwords(corrections)
+
+        return transcript
+    except (json_mod.JSONDecodeError, KeyError, ValueError) as e:
+        log.warning("Correction parse failed: %s", e)
+        return transcript
+    except Exception as e:
+        log.warning("Correction pass failed: %s", e)
+        return transcript
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
