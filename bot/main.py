@@ -50,6 +50,12 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(Path(__file__).parent / "cache"
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "86400"))
 CACHE_DIR.mkdir(exist_ok=True)
 
+# Optional: channel ID for detailed summaries (key points + chapters)
+# If unset, all embeds go to the original channel
+SUMMARY_CHANNEL: int | None = None
+if raw := os.environ.get("SUMMARY_CHANNEL"):
+    SUMMARY_CHANNEL = int(raw.strip())
+
 if raw := os.environ.get("ALLOWED_CHANNELS"):
     ALLOWED_CHANNELS = {int(c.strip()) for c in raw.split(",") if c.strip()}
 
@@ -73,11 +79,12 @@ Summarize this video transcript as a structured list of key points.
 
 Format:
 - One-sentence overview at the top
-- 5-12 bullet points covering the most important ideas, arguments, and conclusions
+- 5-10 bullet points covering the most important ideas, arguments, and conclusions
 - Note any calls-to-action or recommendations made
-- Keep each bullet to 1-2 sentences
+- Keep each bullet to 1 sentence
 - No timestamps
 - Use plain language; preserve technical terms only when necessary
+- IMPORTANT: Keep total output under 3500 characters
 
 Transcript:
 {transcript}"""
@@ -85,13 +92,16 @@ Transcript:
 PROMPT_CHAPTERS = """\
 Summarize this video transcript by dividing it into logical sections/chapters.
 
+The transcript has timestamps in [MM:SS] or [H:MM:SS] format at the start of lines.
+
 Format:
 - Identify 4-8 major topic shifts or sections in the video
+- For each section, include the approximate start timestamp from the transcript
 - Give each section a short descriptive heading
-- Under each heading, write 2-3 sentences summarizing that section
-- Sections should be in chronological order
-- No timestamps
+- Under each heading, write 1-2 sentences summarizing that section
+- Format: **[H:MM:SS] Section Title** followed by summary
 - Use plain language
+- IMPORTANT: Keep total output under 3500 characters
 
 Transcript:
 {transcript}"""
@@ -240,13 +250,37 @@ async def process(job: Job):
     log.info("[%s] Summarizing (%d chars)...", job.video_id, len(transcript))
     await safe_react(job.message, "\U0001f9e0")  # 🧠
 
-    brief, key_points, chapters = await asyncio.gather(
+    brief, key_points, chapters_raw = await asyncio.gather(
         summarize(transcript, PROMPT_BRIEF, 1024),
         summarize(transcript, PROMPT_KEY_POINTS, 2048),
         summarize(transcript, PROMPT_CHAPTERS, 2048),
     )
+    chapters = linkify_timestamps(chapters_raw, job.video_id)
 
     # 5. Post results as embeds
+    # Determine where detailed summaries go
+    detail_channel = job.channel
+    if SUMMARY_CHANNEL:
+        detail_channel = bot.get_channel(SUMMARY_CHANNEL) or job.channel
+
+    use_split = detail_channel.id != job.channel.id
+
+    # Post detailed summaries first (so we can link to them)
+    detail_msg = None
+    if use_split:
+        header = discord.Embed(
+            title=f"{truncate(title, 240)}",
+            url=job.url,
+            description=f"Requested by {job.message.author.mention} in <#{job.channel.id}>",
+            color=0xFF0000,
+        )
+        header.set_footer(text=format_duration(duration))
+        detail_msg = await detail_channel.send(embed=header)
+
+    await send_long_embed(detail_channel, "Key Points", key_points, 0xFF6600)
+    await send_long_embed(detail_channel, "Chapters", chapters, 0xFFAA00)
+
+    # Post brief TL;DW in original channel
     embed = discord.Embed(
         title=f"TL;DW: {truncate(title, 240)}",
         url=job.url,
@@ -254,21 +288,16 @@ async def process(job: Job):
         color=0xFF0000,
     )
     embed.set_footer(text=f"{format_duration(duration)} | {status}")
+
+    if use_split and detail_msg:
+        jump_url = detail_msg.jump_url
+        embed.add_field(
+            name="",
+            value=f"[Full breakdown →]({jump_url})",
+            inline=False,
+        )
+
     await job.channel.send(embed=embed, reference=job.message)
-
-    kp_embed = discord.Embed(
-        title="Key Points",
-        description=truncate(key_points, 4000),
-        color=0xFF6600,
-    )
-    await job.channel.send(embed=kp_embed)
-
-    ch_embed = discord.Embed(
-        title="Chapters",
-        description=truncate(chapters, 4000),
-        color=0xFFAA00,
-    )
-    await job.channel.send(embed=ch_embed)
 
     # Clean up reactions
     await safe_remove_react(job.message, "\u23f3")
@@ -304,6 +333,69 @@ async def summarize(transcript: str, prompt_template: str, max_tokens: int) -> s
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
+
+
+async def send_long_embed(channel, title: str, content: str, color: int):
+    """Send embed, splitting into continuation embeds if >4000 chars."""
+    chunks = split_content(content, 4000)
+    for i, chunk in enumerate(chunks):
+        t = title if i == 0 else f"{title} (cont.)"
+        embed = discord.Embed(title=t, description=chunk, color=color)
+        await channel.send(embed=embed)
+
+
+# Matches [H:MM:SS], [MM:SS], or bare H:MM:SS / MM:SS at start of line or after **
+TIMESTAMP_RE = re.compile(
+    r"\[(\d{1,2}):(\d{2}):(\d{2})\]"       # [H:MM:SS]
+    r"|\[(\d{1,2}):(\d{2})\]"               # [MM:SS]
+    r"|(?:^|\*\*)(\d{1,2}):(\d{2}):(\d{2})" # bare H:MM:SS (start of line or after **)
+    r"|(?:^|\*\*)(\d{1,2}):(\d{2})(?=\s)",   # bare MM:SS followed by space
+    re.MULTILINE
+)
+
+
+def linkify_timestamps(text: str, video_id: str) -> str:
+    """Replace timestamps with clickable YouTube timestamp links."""
+    def replace(match):
+        groups = match.groups()
+        if groups[0] is not None:  # [H:MM:SS]
+            h, m, s = int(groups[0]), int(groups[1]), int(groups[2])
+        elif groups[3] is not None:  # [MM:SS]
+            h, m, s = 0, int(groups[3]), int(groups[4])
+        elif groups[5] is not None:  # bare H:MM:SS
+            h, m, s = int(groups[5]), int(groups[6]), int(groups[7])
+        else:  # bare MM:SS
+            h, m, s = 0, int(groups[8]), int(groups[9])
+        total_seconds = h * 3600 + m * 60 + s
+        display = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+        url = f"https://www.youtube.com/watch?v={video_id}&t={total_seconds}"
+        link = f"[{display}]({url})"
+        # Preserve ** prefix if present
+        full = match.group(0)
+        if full.startswith("**"):
+            return f"**{link}"
+        return link
+    return TIMESTAMP_RE.sub(replace, text)
+
+
+def split_content(text: str, max_len: int) -> list[str]:
+    """Split text into chunks at paragraph boundaries."""
+    if len(text) <= max_len:
+        return [text]
+    chunks = []
+    while text:
+        if len(text) <= max_len:
+            chunks.append(text)
+            break
+        # Find last double newline within limit
+        split_at = text.rfind("\n\n", 0, max_len)
+        if split_at == -1:
+            split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = max_len
+        chunks.append(text[:split_at])
+        text = text[split_at:].lstrip("\n")
+    return chunks
 
 
 def truncate(s: str, max_len: int) -> str:
