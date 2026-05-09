@@ -316,57 +316,27 @@ async def process(job: Job):
 
 
 
-    # 6. Two-pass transcription
-    #    Pass 1: transcribe with hotwords (fast, gets most things right)
-    #    Pass 2: re-transcribe with initial_prompt built from pass 1 + Exa terms
-    #    Research (arxiv 2602.18966) shows this recovers proper nouns that
-    #    single-pass misses because the decoder "sees" correct spellings.
-    log.info("[%s] Transcribing '%s' (%ds) — pass 1...", job.video_id, title, duration)
-    await safe_react(job.message, "\U0001f3a7")  # 🎧
-
-    # Pass 1: hotwords only (no cleanup — we need the file for pass 2)
-    pass1_payload = {
-        "file_path": file_path,
-        "model": WHISPER_MODEL,
-        "cleanup": False,
-    }
-    if hotwords:
-        pass1_payload["hotwords"] = hotwords
-
-    async with http.post(
-        f"{WHISPER_API}/api/transcribe",
-        json=pass1_payload,
-    ) as resp:
-        if resp.status == 409:
-            raise RuntimeError("Whisper busy — another transcription running")
-        if resp.status != 200:
-            body = await resp.json()
-            raise RuntimeError(f"Transcription failed: {body.get('error', resp.status)}")
-        pass1_result = await resp.json()
-
-    log.info("[%s] Pass 1 done: %s", job.video_id, pass1_result.get("status", ""))
-
-    # Build stronger initial_prompt for pass 2 using pass 1 transcript + Exa terms
-    # The prompt contains correct spellings that bias the decoder on the second pass
+    # 5. Transcribe with hotwords + initial_prompt (single pass)
     initial_prompt = build_initial_prompt(title, web_context)
     if initial_prompt:
-        log.info("[%s] Pass 2 initial_prompt: %s...", job.video_id, initial_prompt[:80])
+        log.info("[%s] Initial prompt: %s...", job.video_id, initial_prompt[:80])
 
-    # Pass 2: initial_prompt + hotwords (cleanup=True, done with file after this)
-    log.info("[%s] Transcribing — pass 2 (with initial_prompt)...", job.video_id)
-    pass2_payload = {
+    log.info("[%s] Transcribing '%s' (%ds)...", job.video_id, title, duration)
+    await safe_react(job.message, "\U0001f3a7")  # 🎧
+
+    transcribe_payload = {
         "file_path": file_path,
         "model": WHISPER_MODEL,
         "cleanup": True,
     }
     if hotwords:
-        pass2_payload["hotwords"] = hotwords
+        transcribe_payload["hotwords"] = hotwords
     if initial_prompt:
-        pass2_payload["initial_prompt"] = initial_prompt
+        transcribe_payload["initial_prompt"] = initial_prompt
 
     async with http.post(
         f"{WHISPER_API}/api/transcribe",
-        json=pass2_payload,
+        json=transcribe_payload,
     ) as resp:
         if resp.status == 409:
             raise RuntimeError("Whisper busy — another transcription running")
@@ -377,7 +347,7 @@ async def process(job: Job):
 
     transcript = result["transcript"]
     status = result.get("status", "")
-    log.info("[%s] Pass 2 done: %s", job.video_id, status)
+    log.info("[%s] Transcribed: %s", job.video_id, status)
 
 
 
@@ -677,12 +647,12 @@ async def send_long_embed(channel, title: str, content: str, color: int):
         await channel.send(embed=embed)
 
 
-# Matches [H:MM:SS], [MM:SS], or bare H:MM:SS / MM:SS at start of line or after **
+# Matches timestamps in various formats the LLM might output
 TIMESTAMP_RE = re.compile(
-    r"\[(\d{1,2}):(\d{2}):(\d{2})\]"       # [H:MM:SS]
-    r"|\[(\d{1,2}):(\d{2})\]"               # [MM:SS]
-    r"|(?:^|\*\*)(\d{1,2}):(\d{2}):(\d{2})" # bare H:MM:SS (start of line or after **)
-    r"|(?:^|\*\*)(\d{1,2}):(\d{2})(?=\s)",   # bare MM:SS followed by space
+    r"\[(\d{1,3}):(\d{2}):(\d{2})\]"        # [H:MM:SS] or [MMM:SS:??]
+    r"|\[(\d{1,3}):(\d{2})\]"               # [MM:SS] or [MMM:SS]
+    r"|(?:^|\*\*)(\d{1,3}):(\d{2}):(\d{2})" # bare H:MM:SS
+    r"|(?:^|\*\*)(\d{1,3}):(\d{2})(?=\s)",   # bare MM:SS followed by space
     re.MULTILINE
 )
 
@@ -693,12 +663,18 @@ def linkify_timestamps(text: str, video_id: str) -> str:
         groups = match.groups()
         if groups[0] is not None:  # [H:MM:SS]
             h, m, s = int(groups[0]), int(groups[1]), int(groups[2])
-        elif groups[3] is not None:  # [MM:SS]
+        elif groups[3] is not None:  # [MM:SS] — might be >59 min
             h, m, s = 0, int(groups[3]), int(groups[4])
         elif groups[5] is not None:  # bare H:MM:SS
             h, m, s = int(groups[5]), int(groups[6]), int(groups[7])
         else:  # bare MM:SS
             h, m, s = 0, int(groups[8]), int(groups[9])
+
+        # Normalize: if minutes > 59, convert to hours
+        if m >= 60:
+            h += m // 60
+            m = m % 60
+
         total_seconds = h * 3600 + m * 60 + s
         display = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
         url = f"https://www.youtube.com/watch?v={video_id}&t={total_seconds}"
