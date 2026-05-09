@@ -1916,20 +1916,46 @@ async def api_status(request: Request):
 
 
 async def api_yt_download(request: Request):
-    """POST /api/yt-download — download audio from a YouTube URL via yt-dlp.
-    Body: {"url": "...", "format": "bestaudio"}
-    Returns: {"filename": "...", "title": "...", "duration": 123}
+    """POST /api/yt-download — download audio (and optionally video) via yt-dlp.
+
+    Body fields:
+      url:         str   (required) — YouTube/etc. URL
+      format:      str   — yt-dlp format spec (default depends on keep_video)
+      keep_video:  bool  (default false) — when true, downloads a low-res
+                   video stream alongside the audio so /api/describe can
+                   extract frames later. When false, audio-extracted to WAV
+                   (smaller; the legacy default for transcription-only).
+      playlist:    bool  (default false) — process as playlist
+      max_height:  int   (default VIDEO_DOWNLOAD_MAX_HEIGHT, currently 480)
+                   — cap on video resolution when keep_video=true. Frames are
+                   downscaled to VLM_FRAME_WIDTH for inference anyway, so
+                   higher resolution wastes bandwidth.
+
+    Returns (single video): {"filename": "...", "title": "...", "duration": 123}
+    Returns (playlist):     {"items": [{...}, ...], "count": N}
     """
     body = await request.json()
     url = body.get("url", "").strip()
     if not url:
         return JSONResponse({"error": "url is required"}, status_code=400)
 
-    audio_fmt = body.get("format", "bestaudio")
+    keep_video = bool(body.get("keep_video", False))
     playlist = body.get("playlist", False)
+    max_height = int(body.get("max_height", os.environ.get("VIDEO_DOWNLOAD_MAX_HEIGHT", "480")))
     output_dir = tempfile.mkdtemp(prefix="yt-dlp-")
 
-    # Use yt-dlp to download audio, extract metadata
+    # Format spec depends on whether the caller will need video frames later.
+    # keep_video=false (default, legacy): pure audio → WAV via --extract-audio.
+    # keep_video=true (VLM-enabled bot): low-res video + best audio in a single
+    # container; whisperX's ffmpeg pipeline transcodes the audio in-memory
+    # at transcribe time, and /api/describe extracts frames from the same file.
+    if keep_video:
+        default_fmt = (f"bestvideo[height<={max_height}]+bestaudio/"
+                       f"best[height<={max_height}]/best")
+    else:
+        default_fmt = "bestaudio"
+    fmt = body.get("format", default_fmt)
+
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
@@ -1937,14 +1963,19 @@ async def api_yt_download(request: Request):
         # Required for YouTube Music / signature-protected streams as of 2026.
         "--remote-components", "ejs:github",
         *_yt_dlp_auth_args(),
-        "-f", audio_fmt,
-        "--extract-audio",
-        "--audio-format", "wav",
-        "--audio-quality", "0",
+        "-f", fmt,
+    ]
+    if not keep_video:
+        cmd.extend([
+            "--extract-audio",
+            "--audio-format", "wav",
+            "--audio-quality", "0",
+        ])
+    cmd.extend([
         "--print-json",
         "-o", output_template,
         url,
-    ]
+    ])
     if not playlist:
         cmd.insert(1, "--no-playlist")
     log.info(f"[API] yt-dlp download: {url} (playlist={playlist})")
@@ -2153,6 +2184,24 @@ def _ffprobe_duration(file_path: str) -> float:
     return 0.0
 
 
+class NoVideoStreamError(Exception):
+    """The input file contains no video stream — frame extraction is
+    impossible regardless of retries. Mapped to HTTP 422 (permanent) so
+    clients short-circuit retry loops."""
+
+
+# ffmpeg stderr fragments that indicate a permanent extraction failure
+# (missing video stream, unsupported codec, corrupt header, etc.).
+_FFMPEG_PERMANENT_PATTERNS = (
+    "Output file does not contain any stream",
+    "does not contain any stream",
+    "Stream specifier",
+    "no video streams",
+    "Invalid data found when processing input",
+    "Cannot find a matching stream",
+)
+
+
 def _extract_frames(file_path: str, out_dir: str,
                     fps_interval: float, max_frames: int,
                     width: int) -> list[str]:
@@ -2160,6 +2209,11 @@ def _extract_frames(file_path: str, out_dir: str,
 
     Returns a sorted list of frame file paths. The interval auto-stretches
     for long videos so we never exceed `max_frames` regardless of duration.
+
+    Raises:
+        NoVideoStreamError: input has no video track (e.g. an audio-only
+            yt-dlp download). Caller should map to HTTP 422.
+        RuntimeError: any other ffmpeg failure (transient — caller may retry).
     """
     duration = _ffprobe_duration(file_path)
     # Auto-stretch interval to fit max_frames over the whole video.
@@ -2178,7 +2232,13 @@ def _extract_frames(file_path: str, out_dir: str,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg frame extraction failed: {result.stderr[:300]}")
+        stderr = result.stderr or ""
+        if any(p in stderr for p in _FFMPEG_PERMANENT_PATTERNS):
+            raise NoVideoStreamError(
+                f"input file has no video stream — likely audio-only "
+                f"download. ffmpeg said: {stderr[:200]}"
+            )
+        raise RuntimeError(f"ffmpeg frame extraction failed: {stderr[:300]}")
     frames = sorted(
         os.path.join(out_dir, f) for f in os.listdir(out_dir)
         if f.startswith("frame_") and f.endswith(".jpg")
@@ -2310,6 +2370,15 @@ async def api_describe(request: Request):
                                     vlm_model, prompt),
         )
         return JSONResponse(result)
+    except NoVideoStreamError as e:
+        # Permanent: no video stream means the bot downloaded audio-only.
+        # Surface as 422 + permanent:true so the bot's retry loop short-
+        # circuits. The bot fix is to pass keep_video=true on yt-download.
+        log.error(f"[API] describe permanent error: {e}")
+        return JSONResponse(
+            {"error": str(e), "permanent": True},
+            status_code=422,
+        )
     except Exception as e:
         log.error(f"[API] describe error: {e}")
         traceback.print_exc()

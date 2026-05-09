@@ -396,11 +396,14 @@ async def process(job: Job):
         title, status, transcript, duration = cached
         log.info("[%s] Cache hit (%d chars, '%s')", job.video_id, len(transcript), title)
     else:
-        # 2. Download audio
-        log.info("[%s] Downloading...", job.video_id)
+        # 2. Download. Keep the video stream alongside audio when VLM is
+        # enabled — /api/describe needs a video file to extract frames
+        # from. When VLM is off, audio-only WAV (smaller, current default).
+        log.info("[%s] Downloading%s...", job.video_id,
+                 " (audio+video)" if VLM_ENABLED else "")
         async with http.post(
             f"{WHISPER_API}/api/yt-download",
-            json={"url": job.url},
+            json={"url": job.url, "keep_video": VLM_ENABLED},
         ) as resp:
             if resp.status != 200:
                 try:
