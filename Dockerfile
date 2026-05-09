@@ -1,8 +1,14 @@
+FROM denoland/deno:bin-2.7.14 AS deno
+
 FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip ffmpeg libpython3.12t64 \
     && rm -rf /var/lib/apt/lists/*
+
+# yt-dlp now requires a JS runtime to decipher YouTube Music / signature-protected
+# streams. Deno is yt-dlp's default supported runtime.
+COPY --from=deno /deno /usr/local/bin/deno
 
 # Install Python deps first (cached unless requirements.txt changes)
 COPY requirements.txt /tmp/requirements.txt

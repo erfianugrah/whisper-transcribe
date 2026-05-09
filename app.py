@@ -1601,6 +1601,7 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
         output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
         cmd = [
             "yt-dlp", "--no-playlist",
+            "--remote-components", "ejs:github",
             "-f", "bestaudio",
             "--extract-audio", "--audio-format", "wav", "--audio-quality", "0",
             "--print-json",
@@ -1692,6 +1693,9 @@ async def api_yt_download(request: Request):
     output_template = os.path.join(output_dir, "%(id)s.%(ext)s")
     cmd = [
         "yt-dlp",
+        # Allow yt-dlp to auto-fetch the JS challenge solver script from GitHub.
+        # Required for YouTube Music / signature-protected streams as of 2026.
+        "--remote-components", "ejs:github",
         "-f", audio_fmt,
         "--extract-audio",
         "--audio-format", "wav",
