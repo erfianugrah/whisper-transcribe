@@ -191,21 +191,37 @@ async def on_message(message: discord.Message):
 # ─── Worker ───────────────────────────────────────────────────────────────────
 
 
+MAX_RETRIES = 3
+RETRY_BACKOFF = [10, 30, 90]  # seconds
+
+
 async def worker():
     """Sequential worker — one transcription at a time (GPU bound)."""
     while True:
         job = await queue.get()
-        try:
-            await process(job)
-        except Exception as e:
-            log.exception("Job failed: %s", job.video_id)
+        last_error = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                if attempt > 0:
+                    delay = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
+                    log.info("[%s] Retry %d/%d in %ds...", job.video_id, attempt, MAX_RETRIES, delay)
+                    await asyncio.sleep(delay)
+                await process(job)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                log.warning("[%s] Attempt %d failed: %s", job.video_id, attempt + 1, e)
+
+        if last_error:
+            log.error("[%s] All %d attempts failed", job.video_id, MAX_RETRIES + 1)
             await safe_react(job.message, "\u274c")  # ❌
             await job.channel.send(
-                f"Failed to process `{job.video_id}`: {type(e).__name__}: {e}",
+                f"Failed to process `{job.video_id}` after {MAX_RETRIES + 1} attempts: "
+                f"{type(last_error).__name__}: {last_error}",
                 reference=job.message,
             )
-        finally:
-            queue.task_done()
+        queue.task_done()
 
 
 async def process(job: Job):
