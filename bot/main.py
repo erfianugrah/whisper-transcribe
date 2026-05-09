@@ -268,7 +268,13 @@ async def process(job: Job):
     if hotwords:
         log.info("[%s] Hotwords (%d chars): %s...", job.video_id, len(hotwords), hotwords[:100])
 
-    # 5. Transcribe
+    # 5. Build initial_prompt — compact sentence with correct terms (≤50 words)
+    #    This biases Whisper's decoder toward correct proper noun spellings
+    initial_prompt = build_initial_prompt(title, web_context)
+    if initial_prompt:
+        log.info("[%s] Initial prompt: %s", job.video_id, initial_prompt[:100])
+
+    # 6. Transcribe
     log.info("[%s] Transcribing '%s' (%ds)...", job.video_id, title, duration)
     await safe_react(job.message, "\U0001f3a7")  # 🎧
 
@@ -279,6 +285,8 @@ async def process(job: Job):
     }
     if hotwords:
         transcribe_payload["hotwords"] = hotwords
+    if initial_prompt:
+        transcribe_payload["initial_prompt"] = initial_prompt
 
     async with http.post(
         f"{WHISPER_API}/api/transcribe",
@@ -524,6 +532,39 @@ async def search_topic_context(title: str, description: str = "") -> str:
 
 
 
+
+
+def build_initial_prompt(title: str, web_context: str) -> str:
+    """Build a compact natural-language sentence with key proper nouns for Whisper's
+    initial_prompt. Limited to ~50 words (≤224 tokens). Places highest-value terms
+    near the end for maximum decoder influence."""
+    if not web_context:
+        return ""
+
+    # Extract unique capitalized terms from web context (likely proper nouns)
+    terms = set()
+    terms.update(re.findall(r"\b[A-Z][a-zA-Z''-]{2,}(?:\s[A-Z][a-zA-Z''-]{2,})*\b", web_context))
+    terms.update(re.findall(r'"([^"]{2,30})"', web_context))
+
+    # Filter to unique, non-trivial terms (skip generic words)
+    generic = {"The", "This", "That", "New", "Each", "Some", "More", "Also",
+               "However", "Instead", "Players", "Content", "Update", "System"}
+    terms = sorted(t for t in terms if t not in generic and len(t) >= 3)
+
+    if not terms:
+        return ""
+
+    # Build compact sentence — whisper uses last ≤224 tokens, so keep it tight
+    # Use max ~40 terms to stay under token limit
+    selected = terms[:40]
+    prompt = f"This video is about {title}. Key terms: {', '.join(selected)}."
+
+    # Hard cap at ~200 words (rough token proxy)
+    words = prompt.split()
+    if len(words) > 200:
+        prompt = " ".join(words[:200])
+
+    return prompt
 
 
 def extract_hotwords_from_context(text: str) -> str:
