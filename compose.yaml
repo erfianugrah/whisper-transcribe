@@ -23,9 +23,9 @@ services:
     restart: unless-stopped
 
   bot:
+    image: erfianugrah/whisper-transcribe-bot:latest
     build:
       context: ./bot
-    image: whisper-transcribe-bot:latest
     pull_policy: missing
     env_file:
       - ./bot/.env
