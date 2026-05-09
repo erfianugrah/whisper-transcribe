@@ -1,3 +1,8 @@
-whisperx
-gradio
-yt-dlp
+# Heavy stable deps. Pinned exactly so the pip install layer is reproducible
+# and Docker Hub's layer cache survives across rebuilds.
+#
+# yt-dlp is intentionally NOT here — it's installed in a separate Dockerfile
+# layer so its frequent updates don't invalidate the multi-GB whisperx layer.
+# Bump via the YT_DLP_VERSION build-arg in the Dockerfile.
+whisperx==3.8.5
+gradio==6.14.0

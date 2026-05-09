@@ -14,6 +14,7 @@ import json as json_mod
 import logging
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,12 +40,28 @@ log = logging.getLogger("tldw")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
+def _csv_env(name: str, default: str) -> set[str]:
+    """Parse a comma-separated env var into a set of stripped non-empty values."""
+    return {x.strip() for x in os.environ.get(name, default).split(",") if x.strip()}
+
+
+def _csv_env_list(name: str, default: str) -> list[str]:
+    return [x.strip() for x in os.environ.get(name, default).split(",") if x.strip()]
+
+
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")
+if not DISCORD_TOKEN:
+    log.error("DISCORD_TOKEN not set — refusing to start. "
+              "Set it via env or bot/.env (see bot/.env.example).")
+    sys.exit(2)
 WHISPER_API = os.environ.get("WHISPER_API_URL", "http://localhost:7860")
 LLM_API = os.environ.get("LLM_API_URL", "http://localhost:11434/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen3.5-4B-Q8_0")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "turbo")
-MAX_DURATION = int(os.environ.get("MAX_DURATION", "14400"))  # 4 hours
+# No hard duration limit by default — transcript length (text density) is what
+# actually matters for context budget, not video runtime. Set MAX_DURATION>0
+# to enforce a soft runtime ceiling (e.g. to bound disk usage).
+MAX_DURATION = int(os.environ.get("MAX_DURATION", "0"))
 EXA_API_KEY = os.environ.get("EXA_API_KEY", "")
 ALLOWED_CHANNELS: set[int] | None = None
 
@@ -53,11 +70,93 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", str(Path(__file__).parent / "cache"
 CACHE_TTL = int(os.environ.get("CACHE_TTL", "86400"))
 CACHE_DIR.mkdir(exist_ok=True)
 
+# ─── Retry / backoff ──────────────────────────────────────────────────────────
+# Worker retries transient errors. Permanent errors (4xx, oversized inputs)
+# raise PermanentError and skip the retry loop entirely.
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+RETRY_BACKOFF = [int(x) for x in _csv_env_list("RETRY_BACKOFF", "10,30,90")]
+
 # ─── Summary tuning ───────────────────────────────────────────────────────────
 # Discord embed description hard cap is 4096 chars; leave safety margin so the
 # model's overshoot still fits in a single embed before send_long_embed splits.
 EMBED_DESC_LIMIT = 4096
-SUMMARY_CHAR_CAP = EMBED_DESC_LIMIT - 300
+EMBED_SAFE_LIMIT = EMBED_DESC_LIMIT - 96  # 4000, used for split + truncate
+SUMMARY_CHAR_CAP = EMBED_DESC_LIMIT - 300  # asked of LLM (gives margin for overshoot)
+
+# LLM call parameters — temperature + per-style max_tokens budgets.
+LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.3"))
+LLM_MAX_TOKENS_BRIEF = int(os.environ.get("LLM_MAX_TOKENS_BRIEF", "1024"))
+LLM_MAX_TOKENS_KEY_POINTS = int(os.environ.get("LLM_MAX_TOKENS_KEY_POINTS", "2048"))
+LLM_MAX_TOKENS_CHAPTERS = int(os.environ.get("LLM_MAX_TOKENS_CHAPTERS", "3000"))
+
+# LLM input budget — derived from the model's context window so users can
+# point at a single knob (the model they're actually serving) and the chunk
+# size auto-adjusts.
+#
+# Empirical: whisper transcripts tokenize at ~2 chars/token (lots of
+# `[HH:MM:SS]` timestamps + short lines). Earlier 3.5-char-per-token
+# estimate produced 80000-char chunks → 40k tokens, blowing past 32k
+# context. Default LLM_CHARS_PER_TOKEN=1.8 leaves margin.
+#
+# Calculation:
+#   chunk_chars = (context - prompt_overhead - max_output) * chars_per_token
+# For 32768 ctx: (32768 - 3000 - 3000) * 1.8 ≈ 48 200 chars per chunk.
+# For 128k ctx:  ~224 000 chars per chunk.
+#
+# Override LLM_INPUT_CHAR_BUDGET directly to bypass the calculation.
+# Default 40960 (40k) is a slight bump over the 32k floor most local models
+# expose. If the actual model is smaller, the adaptive-halving fallback in
+# _llm_call_with_chunk_fallback recovers automatically on the first overflow.
+LLM_CONTEXT_SIZE = int(os.environ.get("LLM_CONTEXT_SIZE", "40960"))
+LLM_PROMPT_OVERHEAD_TOKENS = int(os.environ.get("LLM_PROMPT_OVERHEAD_TOKENS", "3000"))
+LLM_CHARS_PER_TOKEN = float(os.environ.get("LLM_CHARS_PER_TOKEN", "1.8"))
+_max_output_tokens = max(LLM_MAX_TOKENS_BRIEF, LLM_MAX_TOKENS_KEY_POINTS,
+                         LLM_MAX_TOKENS_CHAPTERS)
+_derived_budget = max(
+    1000,
+    int((LLM_CONTEXT_SIZE - LLM_PROMPT_OVERHEAD_TOKENS - _max_output_tokens)
+        * LLM_CHARS_PER_TOKEN),
+)
+LLM_INPUT_CHAR_BUDGET = int(os.environ.get("LLM_INPUT_CHAR_BUDGET", str(_derived_budget)))
+log.info(
+    "LLM budget: ctx=%d, overhead=%d, max_out=%d, chars/tok=%.1f → chunk≤%d chars",
+    LLM_CONTEXT_SIZE, LLM_PROMPT_OVERHEAD_TOKENS, _max_output_tokens,
+    LLM_CHARS_PER_TOKEN, LLM_INPUT_CHAR_BUDGET,
+)
+
+# Reference text (Exa results) injected into summary prompts is capped — too
+# much reference dilutes the transcript and wastes context.
+REFERENCE_CHAR_CAP = int(os.environ.get("REFERENCE_CHAR_CAP", "2000"))
+
+# ─── Vision-language fallback ─────────────────────────────────────────────────
+# For videos with little or no speech (music videos, silent gameplay, ASMR,
+# etc.), the bot can call the whisper service's /api/describe endpoint to
+# get timestamped frame descriptions and summarize those instead.
+#
+# Speech density (chars/sec of transcript per second of audio) decides the
+# routing:
+#   density >= SPEECH_DENSITY_SPARSE  → speech-only (current path, no VLM)
+#   SPEECH_DENSITY_SILENT <= density  → hybrid: speech + visual interleaved
+#                          < SPARSE
+#   density < SPEECH_DENSITY_SILENT   → visual-only (no usable speech)
+#
+# Normal English conversation is ~12 chars/sec. Default thresholds:
+#   8 chars/sec → sparse (mostly silent with occasional speech)
+#   2 chars/sec → effectively silent (music, ambient)
+VLM_ENABLED = os.environ.get("VLM_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+SPEECH_DENSITY_SILENT = float(os.environ.get("SPEECH_DENSITY_SILENT", "2.0"))
+SPEECH_DENSITY_SPARSE = float(os.environ.get("SPEECH_DENSITY_SPARSE", "8.0"))
+VLM_FPS_INTERVAL = float(os.environ.get("VLM_FPS_INTERVAL", "10"))
+VLM_MAX_FRAMES = int(os.environ.get("VLM_MAX_FRAMES", "60"))
+VLM_TIMEOUT = int(os.environ.get("VLM_TIMEOUT", "1800"))  # 30 min worst case for 60-frame video
+
+# ─── Exa search tuning ────────────────────────────────────────────────────────
+EXA_NUM_RESULTS = int(os.environ.get("EXA_NUM_RESULTS", "5"))
+EXA_MAX_CHARACTERS = int(os.environ.get("EXA_MAX_CHARACTERS", "5000"))
+# Default excludes YouTube only (avoiding circular refs to the same video's
+# transcripts/comments). Reddit, X, etc. left in by default — for many topics
+# they're the best source of canonical jargon. Override per deployment.
+EXA_EXCLUDE_DOMAINS = _csv_env_list("EXA_EXCLUDE_DOMAINS", "youtube.com")
 
 # Tail-coverage invariant: the final chapter must start within the last
 # CHAPTER_TAIL_FRACTION of the video. This is the only chapter-count constraint;
@@ -81,103 +180,41 @@ YT_PATTERN = re.compile(
     r"([\w-]{11})"
 )
 
-# Broader pattern: any URL from known video/audio platforms (yt-dlp handles the download)
-VIDEO_DOMAINS = {
-    "youtube.com", "youtu.be", "m.youtube.com", "music.youtube.com",
-    "twitch.tv", "clips.twitch.tv",
-    "vimeo.com", "player.vimeo.com",
-    "dailymotion.com", "dai.ly",
-    "tiktok.com",
-    "twitter.com", "x.com",
-    "instagram.com",
-    "reddit.com", "v.redd.it",
-    "rumble.com",
-    "odysee.com",
-    "kick.com",
-    "bilibili.com", "b23.tv",
-    "soundcloud.com",
-    "podcasts.apple.com",
-    "spotify.com",  # yt-dlp may not support, fails gracefully
-}
+# URL trigger: any link to one of these hosts in a Discord message kicks off
+# a transcription job. Configurable via VIDEO_DOMAINS env (CSV). Default
+# covers the platforms yt-dlp commonly supports — add/remove freely.
+VIDEO_DOMAINS = _csv_env(
+    "VIDEO_DOMAINS",
+    "youtube.com,youtu.be,m.youtube.com,music.youtube.com,"
+    "twitch.tv,clips.twitch.tv,"
+    "vimeo.com,player.vimeo.com,"
+    "dailymotion.com,dai.ly,"
+    "tiktok.com,"
+    "twitter.com,x.com,"
+    "instagram.com,"
+    "reddit.com,v.redd.it,"
+    "rumble.com,"
+    "odysee.com,"
+    "kick.com,"
+    "bilibili.com,b23.tv,"
+    "soundcloud.com,"
+    "podcasts.apple.com,"
+    "spotify.com",
+)
 
 VIDEO_URL_PATTERN = re.compile(
     r"(https?://(?:[\w-]+\.)*(" + "|".join(re.escape(d) for d in VIDEO_DOMAINS) + r")/\S+)"
 )
 
 # ─── Prompts ──────────────────────────────────────────────────────────────────
+# Templates live in bot/prompts.py — see that file for what each prompt does
+# and the map-reduce contract.
 
-
-
-_REF_RULES = """\
-STRICT RULES:
-- Summarize ONLY what the transcript states. Do NOT add facts, dates, numbers, \
-release dates, version numbers, or claims that are not in the transcript, \
-even if they appear in the reference material.
-- The reference material is for SPELLING and TERMINOLOGY ONLY (proper nouns, \
-product names, jargon). Never copy content from it into the summary."""
-
-
-PROMPT_BRIEF = f"""\
-Video title: {{title}}
-Video duration: {{duration}}
-
-{{reference_block}}\
-Summarize this video transcript in a single concise paragraph (3-5 sentences). \
-Capture the main thesis, key argument, and conclusion. No bullet points. \
-No timestamps. Plain language.
-
-{_REF_RULES}
-
-Transcript:
-{{transcript}}"""
-
-PROMPT_KEY_POINTS = f"""\
-Video title: {{title}}
-Video duration: {{duration}}
-
-{{reference_block}}\
-Summarize this video transcript as a structured list of key points.
-
-Format:
-- One-sentence overview at the top
-- A bulleted list of the most important ideas, arguments, and conclusions \
-(use as many bullets as the content warrants)
-- Note any calls-to-action or recommendations made
-- Keep each bullet to 1 sentence
-- No timestamps
-- Keep total output under {{char_cap}} characters
-
-{_REF_RULES}
-
-Transcript:
-{{transcript}}"""
-
-PROMPT_CHAPTERS = f"""\
-Video title: {{title}}
-Video duration: {{duration}}
-
-{{reference_block}}\
-Summarize this video transcript by dividing it into logical sections/chapters \
-based on semantic topic shifts. Choose the number of sections that best fits \
-the content — do not pad or compress.
-
-The transcript has timestamps in [MM:SS] or [H:MM:SS] format at the start of lines.
-
-Format:
-- Sections must span the ENTIRE video from start to finish
-- The first section MUST start at or near 0:00
-- The final section MUST start at or after {{tail_start}} (within the last \
-portion of the {{duration}} runtime). Do NOT stop summarizing before the end.
-- For each section, use the approximate start timestamp from the transcript
-- Give each section a short descriptive heading
-- Under each heading, write 1-2 sentences summarizing that section
-- Format: **[H:MM:SS] Section Title** followed by summary
-- Keep total output under {{char_cap}} characters
-
-{_REF_RULES}
-
-Transcript:
-{{transcript}}"""
+from prompts import (
+    PROMPT_BRIEF, PROMPT_KEY_POINTS, PROMPT_CHAPTERS,
+    REDUCE_BRIEF, REDUCE_KEY_POINTS,
+    CHUNK_PREAMBLE,
+)
 
 
 # ─── Data ─────────────────────────────────────────────────────────────────────
@@ -270,8 +307,40 @@ async def on_message(message: discord.Message):
 # ─── Worker ───────────────────────────────────────────────────────────────────
 
 
-MAX_RETRIES = 3
-RETRY_BACKOFF = [10, 30, 90]  # seconds
+class PermanentError(Exception):
+    """Errors that will fail identically on retry (4xx, oversized inputs, etc.)."""
+
+
+# Belt-and-suspenders: even if the whisper service misclassifies a yt-dlp
+# error as 5xx (e.g. older container that pre-dates the 422 classification),
+# the bot recognises these patterns in error bodies and refuses to retry.
+_PERMANENT_REMOTE_PATTERNS = (
+    "Sign in to confirm your age",
+    "Sign in to confirm you're not a bot",
+    "Private video",
+    "Video unavailable",
+    "This video is unavailable",
+    "Video is not available",
+    "members-only",
+    "This video has been removed",
+    "blocked it on copyright grounds",
+    "blocked it in your country",
+    "Premieres in",
+    "Join this channel to get access",
+    "exceed_context_size_error",   # LLM context overflow
+    "context_length_exceeded",
+)
+
+
+def _is_permanent_remote_error(text: str) -> bool:
+    return any(p in text for p in _PERMANENT_REMOTE_PATTERNS)
+
+
+
+
+
+# Reaction emoji used during processing — cleaned up on completion or failure
+PROCESSING_EMOJI = ("\u23f3", "\U0001f3a7", "\U0001f9e0")  # ⏳ 🎧 🧠
 
 
 async def worker():
@@ -288,15 +357,24 @@ async def worker():
                 await process(job)
                 last_error = None
                 break
+            except PermanentError as e:
+                last_error = e
+                log.error("[%s] Permanent failure (no retry): %s", job.video_id, e)
+                break
             except Exception as e:
                 last_error = e
                 log.warning("[%s] Attempt %d failed: %s", job.video_id, attempt + 1, e)
 
         if last_error:
-            log.error("[%s] All %d attempts failed", job.video_id, MAX_RETRIES + 1)
+            attempts = "permanent error" if isinstance(last_error, PermanentError) \
+                else f"after {MAX_RETRIES + 1} attempts"
+            log.error("[%s] Giving up — %s", job.video_id, attempts)
+            # Clean any in-progress reactions before marking failed
+            for emoji in PROCESSING_EMOJI:
+                await safe_remove_react(job.message, emoji)
             await safe_react(job.message, "\u274c")  # ❌
             await job.channel.send(
-                f"Failed to process `{job.video_id}` after {MAX_RETRIES + 1} attempts: "
+                f"Failed to process `{job.video_id}` ({attempts}): "
                 f"{type(last_error).__name__}: {last_error}",
                 reference=job.message,
             )
@@ -311,27 +389,47 @@ async def process(job: Job):
         if resp.status != 200:
             raise RuntimeError("Whisper service unavailable")
 
-    # 2. Download audio
-    log.info("[%s] Downloading...", job.video_id)
-    async with http.post(
-        f"{WHISPER_API}/api/yt-download",
-        json={"url": job.url},
-    ) as resp:
-        if resp.status != 200:
-            body = await resp.json()
-            raise RuntimeError(f"Download failed: {body.get('error', resp.status)}")
-        dl = await resp.json()
+    # 1a. Cache lookup — skip download+transcribe if we have a fresh transcript
+    cached = read_cache(job.video_id)
+    file_path = None
+    if cached is not None:
+        title, status, transcript, duration = cached
+        log.info("[%s] Cache hit (%d chars, '%s')", job.video_id, len(transcript), title)
+    else:
+        # 2. Download audio
+        log.info("[%s] Downloading...", job.video_id)
+        async with http.post(
+            f"{WHISPER_API}/api/yt-download",
+            json={"url": job.url},
+        ) as resp:
+            if resp.status != 200:
+                try:
+                    body = await resp.json()
+                except Exception:
+                    body = {"error": await resp.text()}
+                err = str(body.get("error", resp.status))
+                # Server marks 4xx as permanent; bot also matches known
+                # patterns in 5xx bodies so older servers that haven't been
+                # rebuilt with the classifier still fail fast here.
+                if (400 <= resp.status < 500) or body.get("permanent") \
+                        or _is_permanent_remote_error(err):
+                    raise PermanentError(f"Download failed ({resp.status}): {err}")
+                raise RuntimeError(f"Download failed: {err}")
+            dl = await resp.json()
 
-    title = dl.get("title", job.video_id)
-    duration = dl.get("duration", 0)
-    file_path = dl["filename"]
+        title = dl.get("title", job.video_id)
+        duration = dl.get("duration", 0)
+        file_path = dl["filename"]
 
-    if duration > MAX_DURATION:
-        raise RuntimeError(
-            f"Video too long ({duration}s > {MAX_DURATION}s limit)"
-        )
+        if MAX_DURATION > 0 and duration > MAX_DURATION:
+            raise PermanentError(
+                f"Video too long ({duration}s > {MAX_DURATION}s soft limit; "
+                f"set MAX_DURATION=0 to disable)"
+            )
+        transcript = ""
+        status = ""
 
-    # 3. Gather context for terminology accuracy
+    # 3. Gather context for terminology accuracy (cheap; do for both paths)
     description, web_context = await asyncio.gather(
         fetch_video_description(job.video_id),
         search_topic_context(title),
@@ -341,63 +439,139 @@ async def process(job: Job):
     if web_context:
         log.info("[%s] Got web context (%d chars)", job.video_id, len(web_context))
 
-    # 4. Build initial_prompt for whisper (proper-noun bias for the decoder).
-    # Note: we deliberately do NOT pass `hotwords` — initial_prompt and hotwords
-    # share whisper's 448-token prompt context, and passing both has caused
-    # "position >= 448" errors. initial_prompt alone covers terminology bias.
-    initial_prompt = build_initial_prompt(title, f"{description}\n{web_context}")
-    if initial_prompt:
-        log.info("[%s] Initial prompt (%d chars): %s...",
-                 job.video_id, len(initial_prompt), initial_prompt[:80])
+    # 4. Transcribe (cache miss only)
+    if cached is None:
+        # Build initial_prompt for whisper (proper-noun bias for the decoder).
+        # Note: we deliberately do NOT pass `hotwords` — initial_prompt and hotwords
+        # share whisper's 448-token prompt context, and passing both has caused
+        # "position >= 448" errors. initial_prompt alone covers terminology bias.
+        initial_prompt = build_initial_prompt(title, f"{description}\n{web_context}")
+        if initial_prompt:
+            log.info("[%s] Initial prompt (%d chars): %s...",
+                     job.video_id, len(initial_prompt), initial_prompt[:80])
 
-    log.info("[%s] Transcribing '%s' (%ds)...", job.video_id, title, duration)
-    await safe_react(job.message, "\U0001f3a7")  # 🎧
+        log.info("[%s] Transcribing '%s' (%ds)...", job.video_id, title, duration)
+        await safe_react(job.message, "\U0001f3a7")  # 🎧
 
-    transcribe_payload = {
-        "file_path": file_path,
-        "model": WHISPER_MODEL,
-        "cleanup": True,
-    }
-    if initial_prompt:
-        transcribe_payload["initial_prompt"] = initial_prompt
+        transcribe_payload = {
+            "file_path": file_path,
+            "model": WHISPER_MODEL,
+            # Don't cleanup yet — VLM fallback (below) may need the file.
+            "cleanup": False,
+            "return_file": False,  # bot uses transcript text directly
+        }
+        if initial_prompt:
+            transcribe_payload["initial_prompt"] = initial_prompt
 
-    async with http.post(
-        f"{WHISPER_API}/api/transcribe",
-        json=transcribe_payload,
-    ) as resp:
-        if resp.status == 409:
-            raise RuntimeError("Whisper busy — another transcription running")
-        if resp.status != 200:
-            body = await resp.json()
-            raise RuntimeError(f"Transcription failed: {body.get('error', resp.status)}")
-        result = await resp.json()
+        async with http.post(
+            f"{WHISPER_API}/api/transcribe",
+            json=transcribe_payload,
+        ) as resp:
+            if resp.status == 409:
+                raise RuntimeError("Whisper busy — another transcription running")
+            if resp.status != 200:
+                try:
+                    body = await resp.json()
+                except Exception:
+                    body = {"error": await resp.text()}
+                err = str(body.get("error", resp.status))
+                if (400 <= resp.status < 500) or body.get("permanent") \
+                        or _is_permanent_remote_error(err):
+                    # Cleanup the file ourselves since we asked /api/transcribe not to.
+                    await _cleanup_remote_file(file_path)
+                    raise PermanentError(f"Transcription rejected ({resp.status}): {err}")
+                await _cleanup_remote_file(file_path)
+                raise RuntimeError(f"Transcription failed: {err}")
+            result = await resp.json()
 
-    transcript = result["transcript"]
-    status = result.get("status", "")
-    log.info("[%s] Transcribed: %s", job.video_id, status)
+        transcript = result["transcript"]
+        status = result.get("status", "")
+        log.info("[%s] Transcribed: %s", job.video_id, status)
 
-    # Whisper sometimes returns a status like "Error: ..." with empty transcript
-    # (e.g. prompt-context overflow). Fail loudly so retry logic kicks in instead
-    # of summarising an empty string and posting blank embeds.
-    if not transcript.strip() or status.lower().startswith("error"):
-        raise RuntimeError(f"Transcription produced no usable text: {status or 'empty transcript'}")
+        # Whisper returned an "Error: ..." status (CUDA OOM, model load
+        # failure, prompt-context overflow). These CAN be transient → retry.
+        # Different from "Done -- 0 segments", which is silent video → VLM.
+        if status.lower().startswith("error"):
+            await _cleanup_remote_file(file_path)
+            raise RuntimeError(f"Transcription failed: {status}")
 
-    # Cache transcript to disk
-    cache_file = CACHE_DIR / f"{job.video_id}.txt"
-    cache_file.write_text(f"# {title}\n# {status}\n\n{transcript}")
+        # Speech density: how many chars of transcript per second of audio.
+        # Normal speech ~12 chars/sec. Below SPARSE → augment with visuals.
+        density = (len(transcript.strip()) / duration) if duration > 0 else 0.0
+        log.info("[%s] Speech density: %.1f chars/sec (silent<%.1f, sparse<%.1f)",
+                 job.video_id, density, SPEECH_DENSITY_SILENT, SPEECH_DENSITY_SPARSE)
 
-    # 4. Summarize in multiple styles (concurrent — model handles full context)
+        if VLM_ENABLED and density < SPEECH_DENSITY_SPARSE:
+            visual_only = density < SPEECH_DENSITY_SILENT
+            mode = "visual-only" if visual_only else "hybrid"
+            log.info("[%s] %s — calling /api/describe (frame-level VLM)",
+                     job.video_id, mode)
+            try:
+                desc_result = await _fetch_descriptions(file_path, cleanup=True)
+            except PermanentError as e:
+                log.error("[%s] VLM describe permanent error: %s", job.video_id, e)
+                await _cleanup_remote_file(file_path)
+                if visual_only:
+                    raise PermanentError(
+                        f"No speech detected and visual description failed: {e}"
+                    )
+                # Hybrid mode: VLM failed but we have a partial transcript;
+                # carry on with just the speech.
+                desc_result = None
+            except Exception as e:
+                log.warning("[%s] VLM describe transient error: %s", job.video_id, e)
+                # Cleanup even on failure (we'll fall through one way or another)
+                await _cleanup_remote_file(file_path)
+                if visual_only:
+                    raise  # let the worker retry
+                desc_result = None
+
+            if desc_result is not None:
+                visual_text = _format_descriptions(desc_result["descriptions"])
+                if visual_only:
+                    transcript = visual_text
+                    status = (status or "") + (
+                        f" | visual-only ({desc_result['frame_count']} frames "
+                        f"@ {desc_result['interval_seconds']:.0f}s)"
+                    )
+                else:
+                    # Hybrid: interleave speech and visual lines by timestamp.
+                    transcript = _interleave_by_timestamp(transcript, visual_text)
+                    status = (status or "") + (
+                        f" | hybrid (+{desc_result['frame_count']} visual frames)"
+                    )
+        else:
+            # Speech-heavy or VLM disabled: nothing more to do, clean up file.
+            await _cleanup_remote_file(file_path)
+
+        # Final empty-content guard — if we still have nothing after VLM,
+        # there's nothing for the LLM to summarize.
+        if not transcript.strip():
+            raise PermanentError(
+                "No speech detected and no visual content extracted — "
+                "nothing to summarize."
+            )
+
+        # Persist to cache (whatever combination of speech / visual we ended up with)
+        write_cache(job.video_id, title, status, transcript, duration)
+
+    # 5. Summarize in multiple styles (concurrent — model handles full context)
     log.info("[%s] Summarizing (%d chars)...", job.video_id, len(transcript))
     await safe_react(job.message, "\U0001f9e0")  # 🧠
 
-    # Build reference block for summary prompts (terminology/spelling ONLY)
+    # Build reference block for summary prompts (terminology/spelling ONLY).
+    # Wrapped in <reference>...</reference> so the LLM clearly sees this as
+    # data to consult for spelling, not instructions to follow. Combined with
+    # the SECURITY rules in REF_RULES.
     ref_block = ""
     if web_context:
         ref_block = (
             "Reference material — USE FOR SPELLING/TERMINOLOGY ONLY. "
             "Do NOT copy facts, dates, numbers, or claims from this into the summary. "
             "Summary content must come exclusively from the transcript below.\n"
-            f"{web_context[:2000]}\n\n"
+            "<reference>\n"
+            f"{web_context[:REFERENCE_CHAR_CAP]}\n"
+            "</reference>\n\n"
         )
 
     duration_str = format_duration(duration)
@@ -405,24 +579,34 @@ async def process(job: Job):
 
     brief, key_points, chapters_raw = await asyncio.gather(
         summarize(
-            transcript, PROMPT_BRIEF, 1024,
+            transcript, PROMPT_BRIEF, LLM_MAX_TOKENS_BRIEF,
+            reduce_template=REDUCE_BRIEF,
             title=title, duration=duration_str, reference_block=ref_block,
         ),
         summarize(
-            transcript, PROMPT_KEY_POINTS, 2048,
+            transcript, PROMPT_KEY_POINTS, LLM_MAX_TOKENS_KEY_POINTS,
+            reduce_template=REDUCE_KEY_POINTS,
             title=title, duration=duration_str, reference_block=ref_block,
             char_cap=SUMMARY_CHAR_CAP,
         ),
         summarize(
-            transcript, PROMPT_CHAPTERS, 3000,
+            transcript, PROMPT_CHAPTERS, LLM_MAX_TOKENS_CHAPTERS,
+            reduce_template=None,  # chapters are time-ordered; concat preserves chronology
             title=title, duration=duration_str, reference_block=ref_block,
             tail_start=tail_start, char_cap=SUMMARY_CHAR_CAP,
         ),
     )
+    # Sanitize LLM output before any further processing — strips
+    # untrusted links injected via prompt injection. linkify_timestamps
+    # adds youtube.com links AFTER sanitisation, which is fine because
+    # those URLs are bot-constructed and on the allowlist.
+    brief = sanitize_llm_output(brief)
+    key_points = sanitize_llm_output(key_points)
+    chapters_raw = sanitize_llm_output(chapters_raw)
+
     # Only linkify timestamps for YouTube videos (other platforms don't support ?t=)
     if "youtube.com" in job.url or "youtu.be" in job.url:
         chapters = linkify_timestamps(chapters_raw, job.video_id)
-
     else:
         chapters = chapters_raw
 
@@ -469,36 +653,281 @@ async def process(job: Job):
     await job.channel.send(embed=embed, reference=job.message)
 
     # Clean up reactions
-    await safe_remove_react(job.message, "\u23f3")
-    await safe_remove_react(job.message, "\U0001f3a7")
-    await safe_remove_react(job.message, "\U0001f9e0")
+    for emoji in PROCESSING_EMOJI:
+        await safe_remove_react(job.message, emoji)
     await safe_react(job.message, "\u2705")  # ✅
 
     log.info("[%s] Done — posted 3 embeds", job.video_id)
 
 
-async def summarize(transcript: str, prompt_template: str, max_tokens: int, **kwargs) -> str:
-    assert http
+async def _llm_call(prompt: str, max_tokens: int) -> str:
+    """One LLM chat-completion request.
 
+    Raises PermanentError on 4xx (won't recover on retry); RuntimeError on 5xx
+    or transport errors (worker will retry).
+    """
+    assert http
     payload = {
         "model": LLM_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt_template.format(transcript=transcript, **kwargs),
-            }
-        ],
-        "temperature": 0.3,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": LLM_TEMPERATURE,
         "max_tokens": max_tokens,
     }
-
     async with http.post(f"{LLM_API}/chat/completions", json=payload) as resp:
         if resp.status != 200:
             body = await resp.text()
+            # 4xx OR known-permanent error signature → no retry. Some
+            # OpenAI-compatible servers return 500 with `exceed_context_size_error`
+            # in the body — match the body too.
+            if (400 <= resp.status < 500) or _is_permanent_remote_error(body):
+                raise PermanentError(f"LLM rejected request ({resp.status}): {body[:300]}")
             raise RuntimeError(f"LLM failed ({resp.status}): {body[:200]}")
         data = await resp.json()
-
     return data["choices"][0]["message"]["content"]
+
+
+def _chunk_transcript(transcript: str, max_chars: int) -> list[str]:
+    """Split transcript on line boundaries, each chunk ≤ max_chars.
+
+    The transcript is line-oriented (`[MM:SS] text` per line); breaking on
+    `\\n` preserves segment integrity so the model never sees half a sentence.
+    """
+    if len(transcript) <= max_chars:
+        return [transcript]
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for line in transcript.split("\n"):
+        # +1 accounts for the "\n" that "\n".join will add back
+        ln = len(line) + 1
+        if cur_len + ln > max_chars and cur:
+            chunks.append("\n".join(cur))
+            cur = [line]
+            cur_len = ln
+        else:
+            cur.append(line)
+            cur_len += ln
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
+
+
+# Minimum chunk size when adaptive halving — below this, give up rather
+# than recurse forever. 4000 chars is ~2000 tokens which is small enough
+# that any sane model can handle it; if THAT fails, the model is broken.
+_MIN_CHUNK_CHARS = 4000
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    """True if the exception looks like an LLM context-size overflow."""
+    s = str(exc).lower()
+    return (
+        "exceed_context_size" in s
+        or "context_length_exceeded" in s
+        or "exceeds the available context" in s
+        or ("token" in s and ("ctx" in s or "context" in s) and "exceed" in s)
+    )
+
+
+async def summarize(
+    transcript: str,
+    prompt_template: str,
+    max_tokens: int,
+    *,
+    reduce_template: str | None = None,
+    _budget: int | None = None,
+    _preamble: str = "",
+    **kwargs,
+) -> str:
+    """Summarize a transcript, splitting + recombining if it exceeds budget.
+
+    - Single-call path when transcript fits in `_budget` (defaults to
+      `LLM_INPUT_CHAR_BUDGET`).
+    - Otherwise: map per-chunk with `prompt_template`, then either:
+        * reduce_template=None  → concatenate chunk summaries raw (use for
+          chronological output like chapters where order is meaningful).
+        * reduce_template=<str> → run a final pass to merge/dedupe partials.
+
+    Self-correcting on context overflow: if a single map call hits a
+    context-size error despite the calculated budget, the budget is halved
+    and the same call is re-attempted as a multi-chunk map-reduce. The
+    reduce step (when supplied) is preserved through the recursion so brief
+    and key_points still get a final coherent pass — only chapters skip it
+    by design.
+
+    Duration / content density don't matter: the LLM tells us when to split
+    smaller and we obey.
+    """
+    budget = _budget if _budget is not None else LLM_INPUT_CHAR_BUDGET
+    chunks = _chunk_transcript(transcript, budget)
+
+    if len(chunks) == 1:
+        # Single-call path. If the LLM rejects with context overflow, fall
+        # through to a smaller budget — this re-enters summarize() with a
+        # halved budget, which forces the multi-chunk path and preserves
+        # reduce_template handling.
+        prompt = _preamble + prompt_template.format(transcript=chunks[0], **kwargs)
+        try:
+            return await _llm_call(prompt, max_tokens)
+        except PermanentError as e:
+            if not _is_context_overflow(e):
+                raise
+            if budget <= _MIN_CHUNK_CHARS:
+                log.error(
+                    "Chunk at minimum size (%d chars) still overflows context "
+                    "— giving up",
+                    budget,
+                )
+                raise
+            new_budget = budget // 2
+            log.warning(
+                "Single-chunk call overflowed context; halving budget %d → %d "
+                "and re-entering map-reduce path",
+                budget, new_budget,
+            )
+            return await summarize(
+                transcript, prompt_template, max_tokens,
+                reduce_template=reduce_template,
+                _budget=new_budget, _preamble=_preamble, **kwargs,
+            )
+
+    log.info(
+        "LLM input %d chars > budget %d → splitting into %d chunks for map-reduce",
+        len(transcript), budget, len(chunks),
+    )
+
+    # Map: per-chunk summarization, sequential to avoid GPU thrash on a
+    # single-instance llm-compose backend. Each call recurses through
+    # summarize() with no reduce_template so an overflow on one chunk
+    # halves only that chunk, not the whole pipeline.
+    partials: list[str] = []
+    for i, chunk in enumerate(chunks, 1):
+        chunk_preamble = _preamble + CHUNK_PREAMBLE.format(n=i, total=len(chunks))
+        partial = await summarize(
+            chunk, prompt_template, max_tokens,
+            reduce_template=None,  # map step never reduces
+            _budget=budget, _preamble=chunk_preamble, **kwargs,
+        )
+        partials.append(partial)
+
+    combined = "\n\n---\n\n".join(partials)
+
+    if reduce_template is None:
+        # Caller wants raw concatenation (e.g. chronological chapters).
+        return combined
+
+    # Run the reduce step. If combined partials still exceed budget, recurse
+    # — same machinery handles it. Critical: pass reduce_template through so
+    # the deeper recursion still produces a coherent reduce, not concat.
+    return await summarize(
+        combined, reduce_template, max_tokens,
+        reduce_template=reduce_template if len(combined) > budget else None,
+        _budget=budget, **kwargs,
+    )
+
+
+# ─── Transcript cache ─────────────────────────────────────────────────────────
+
+# Cache file format (line-prefixed metadata + body):
+#   # title: <title>
+#   # status: <whisper status>
+#   # duration: <seconds>
+#   <blank line>
+#   <transcript body>
+
+
+def _cache_path(video_id: str) -> Path:
+    return CACHE_DIR / f"{video_id}.txt"
+
+
+def write_cache(video_id: str, title: str, status: str, transcript: str, duration: int) -> None:
+    """Persist transcript to disk for reuse across retries / future runs."""
+    try:
+        _cache_path(video_id).write_text(
+            f"# title: {title}\n"
+            f"# status: {status}\n"
+            f"# duration: {duration}\n"
+            f"\n"
+            f"{transcript}"
+        )
+    except OSError as e:
+        log.warning("[%s] Cache write failed: %s", video_id, e)
+
+
+def _derive_duration_from_transcript(transcript: str) -> int:
+    """Estimate duration in seconds from the last [H:MM:SS] / [MM:SS] timestamp
+    in the transcript. Used when the cache file pre-dates duration storage.
+    Returns 0 if no timestamps found.
+    """
+    # Match all [HH:MM:SS] or [MM:SS] anchored at line starts. The last such
+    # match is the start time of the last segment — close enough to total
+    # duration for display purposes (within ~1 segment of the true end).
+    matches = re.findall(r"^\[(\d{1,3}):(\d{2})(?::(\d{2}))?\]", transcript, re.MULTILINE)
+    if not matches:
+        return 0
+    h_or_m, m_or_s, maybe_s = matches[-1]
+    if maybe_s:
+        # [H:MM:SS]
+        return int(h_or_m) * 3600 + int(m_or_s) * 60 + int(maybe_s)
+    # [MM:SS]
+    return int(h_or_m) * 60 + int(m_or_s)
+
+
+def read_cache(video_id: str) -> tuple[str, str, str, int] | None:
+    """Read cached transcript if present and not expired.
+
+    Returns (title, status, transcript, duration) or None.
+    """
+    path = _cache_path(video_id)
+    if not path.exists():
+        return None
+    try:
+        if time.time() - path.stat().st_mtime > CACHE_TTL:
+            return None
+        text = path.read_text()
+    except OSError:
+        return None
+
+    title = ""
+    status = ""
+    duration = 0
+    body_start = 0
+    for i, line in enumerate(text.splitlines(keepends=True)):
+        if line.startswith("# title: "):
+            title = line[len("# title: "):].rstrip("\n")
+        elif line.startswith("# status: "):
+            status = line[len("# status: "):].rstrip("\n")
+        elif line.startswith("# duration: "):
+            try:
+                duration = int(line[len("# duration: "):].strip())
+            except ValueError:
+                duration = 0
+        elif line.strip() == "":
+            body_start = sum(len(l) for l in text.splitlines(keepends=True)[:i + 1])
+            break
+        else:
+            # Header parsing done at first non-comment line
+            break
+
+    transcript = text[body_start:] if body_start else text
+    if not transcript.strip():
+        return None
+    # Backward compat: older cache files used "# {title}\n# {status}\n\n..."
+    # without explicit keys. Fall back to those if the new keys weren't found.
+    if not title and text.startswith("# "):
+        lines = text.splitlines()
+        if len(lines) >= 2 and lines[0].startswith("# ") and lines[1].startswith("# "):
+            title = lines[0][2:]
+            status = lines[1][2:]
+            transcript = "\n".join(lines[3:]) if len(lines) > 3 else ""
+
+    # Duration fallback: if the cache file didn't record one (legacy format
+    # or just-missing key), derive it from the transcript's last timestamp.
+    # This keeps the embed footer accurate even for cache files written
+    # before the duration field existed.
+    if duration <= 0:
+        duration = _derive_duration_from_transcript(transcript)
+    return title, status, transcript, duration
 
 
 # ─── Video Context ────────────────────────────────────────────────────────────
@@ -560,19 +989,21 @@ async def search_topic_context(title: str, description: str = "") -> str:
     # Build a focused query using title + description context
     query = title
     if description:
-        # Add first sentence of description for topic specificity
-        first_sentence = description.split(".")[0] if "." in description else description[:100]
+        # First sentence of description for topic specificity. Require whitespace
+        # after the period so version numbers like "v1.5 release" don't truncate.
+        m = re.search(r"[.!?](\s|$)", description)
+        first_sentence = description[:m.start()] if m else description[:100]
         query = f"{title} — {first_sentence}"
 
     payload = {
         "query": query,
         "type": "auto",
-        "numResults": 5,
+        "numResults": EXA_NUM_RESULTS,
         "contents": {
             "highlights": True,
-            "text": {"maxCharacters": 5000},
+            "text": {"maxCharacters": EXA_MAX_CHARACTERS},
         },
-        "excludeDomains": ["youtube.com", "reddit.com"],
+        "excludeDomains": EXA_EXCLUDE_DOMAINS,
     }
 
     headers = {
@@ -639,35 +1070,75 @@ INITIAL_PROMPT_CHAR_CAP = 600
 
 
 def build_initial_prompt(title: str, web_context: str) -> str:
-    """Build a compact natural-language sentence with key proper nouns for Whisper's
-    initial_prompt. Hard-capped at INITIAL_PROMPT_CHAR_CAP chars to stay within
-    Whisper's 448-token prompt context (shared with hotwords)."""
+    """Build a compact natural-language sentence with key proper nouns for
+    Whisper's initial_prompt. Hard-capped at INITIAL_PROMPT_CHAR_CAP chars to
+    stay within Whisper's 448-token prompt context.
+
+    Term selection is content-agnostic: extract capitalised tokens and quoted
+    phrases from the reference text, then rank them by FREQUENCY in that
+    reference. The most-mentioned terms are the most likely to recur in the
+    video's audio and most worth seeding into the decoder. No hardcoded
+    stopword list — frequency naturally demotes generic words like "The",
+    "Players", "System" because the same generic word also gets matched in
+    every other paragraph and isn't actually domain-specific.
+
+    A token gets priority if it appears in the title (it's clearly central to
+    the video). Anything appearing only once in the reference is dropped as
+    noise. Works for any language using Latin-script capitalisation
+    conventions; non-capitalising scripts (CJK, Arabic, etc.) yield no
+    capitalised terms and we cleanly fall through to title-only.
+    """
     if not web_context:
         return ""
 
-    # Extract unique capitalized terms from web context (likely proper nouns)
-    terms = set()
-    terms.update(re.findall(r"\b[A-Z][a-zA-Z''-]{2,}(?:\s[A-Z][a-zA-Z''-]{2,})*\b", web_context))
-    terms.update(re.findall(r'"([^"]{2,30})"', web_context))
+    # Extract candidate spans: capitalised words/phrases and quoted strings.
+    # We keep multi-word capitalised phrases as units ("Path of Exile") so the
+    # decoder learns the joint sequence, not the individual words.
+    spans: list[str] = []
+    spans.extend(re.findall(r"\b[A-Z][a-zA-Z'-]{2,}(?:\s+[A-Z][a-zA-Z'-]{2,})*\b", web_context))
+    spans.extend(re.findall(r'"([^"]{3,40})"', web_context))
 
-    # Filter to unique, non-trivial terms (skip generic words)
-    generic = {"The", "This", "That", "New", "Each", "Some", "More", "Also",
-               "However", "Instead", "Players", "Content", "Update", "System"}
-    terms = sorted(t for t in terms if t not in generic and len(t) >= 3)
+    if not spans:
+        return title[:INITIAL_PROMPT_CHAR_CAP]
 
-    if not terms:
-        return ""
+    # Frequency rank — case-insensitive, but emit canonical (first-seen) form.
+    from collections import Counter
+    canonical: dict[str, str] = {}
+    for s in spans:
+        canonical.setdefault(s.lower(), s)
+    counts = Counter(s.lower() for s in spans)
 
-    # Greedily add terms until char cap hit (highest-value terms first by length)
-    base = f"This video is about {title}. Key terms: "
+    # Boost terms that appear in the title (they're central to the video).
+    title_lower = title.lower()
+
+    def _score(key: str) -> tuple[int, int]:
+        c = counts[key]
+        if key in title_lower:
+            c *= 3
+        # Primary: count, secondary: length (prefer longer phrases on tie).
+        return (c, len(key))
+
+    # Drop hapax legomena — single mentions in reference are noise, not
+    # entities the speaker is going to repeat throughout the video. The
+    # frequency-min-2 filter is the content-agnostic replacement for the
+    # old hardcoded English stopword list.
+    candidates = [k for k, n in counts.items() if n >= 2]
+    candidates.sort(key=_score, reverse=True)
+
+    # Use a language-agnostic format: title followed by a comma-separated
+    # term list, no English framing sentence. Whisper's `initial_prompt` is
+    # used to bias the decoder; a Spanish/Japanese/etc. video shouldn't be
+    # primed with English filler like "This video is about ...".
+    base = f"{title}. "
     suffix = "."
     budget = INITIAL_PROMPT_CHAR_CAP - len(base) - len(suffix)
-    if budget <= 0:
-        return base[:INITIAL_PROMPT_CHAR_CAP]
+    if budget <= 0 or not candidates:
+        return title[:INITIAL_PROMPT_CHAR_CAP]
 
     picked: list[str] = []
     used = 0
-    for term in terms:
+    for key in candidates:
+        term = canonical[key]
         addition = (", " if picked else "") + term
         if used + len(addition) > budget:
             break
@@ -677,24 +1148,6 @@ def build_initial_prompt(title: str, web_context: str) -> str:
     if not picked:
         return ""
     return base + ", ".join(picked) + suffix
-
-
-def extract_hotwords_from_context(text: str) -> str:
-    """Extract unique terms from reference text to use as whisper hotwords.
-    No language assumptions — just finds words that look distinctive."""
-    if not text:
-        return ""
-    # Extract all words 3+ chars that contain uppercase (proper nouns in any latin script)
-    # Plus any quoted terms, hyphenated terms, or terms with apostrophes
-    terms = set()
-    # Capitalized words/phrases
-    terms.update(re.findall(r"\b[A-Z][a-zA-Z''-]{2,}(?:\s[A-Z][a-zA-Z''-]{2,})*\b", text))
-    # Quoted terms
-    terms.update(re.findall(r'"([^"]{2,30})"', text))
-    # Terms with special characters (apostrophes, hyphens) likely proper nouns
-    terms.update(re.findall(r"\b[A-Za-z]+['''-][A-Za-z]+\b", text))
-    # Filter to unique, non-trivial terms
-    return ", ".join(sorted(t for t in terms if len(t) >= 3)[:150])
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -771,6 +1224,172 @@ def split_content(text: str, max_len: int) -> list[str]:
 
 def truncate(s: str, max_len: int) -> str:
     return s if len(s) <= max_len else s[: max_len - 1] + "\u2026"
+
+
+# ─── VLM frame description helpers ────────────────────────────────────────────
+
+
+async def _fetch_descriptions(file_path: str, cleanup: bool = True) -> dict:
+    """Call whisper service /api/describe and return parsed result.
+
+    Raises PermanentError on 4xx, RuntimeError on 5xx/timeout/network.
+    """
+    assert http
+    payload = {
+        "file_path": file_path,
+        "cleanup": cleanup,
+        "fps_interval": VLM_FPS_INTERVAL,
+        "max_frames": VLM_MAX_FRAMES,
+    }
+    async with http.post(
+        f"{WHISPER_API}/api/describe",
+        json=payload,
+        timeout=aiohttp.ClientTimeout(total=VLM_TIMEOUT),
+    ) as resp:
+        if resp.status != 200:
+            try:
+                body = await resp.json()
+            except Exception:
+                body = {"error": await resp.text()}
+            err = str(body.get("error", resp.status))
+            if (400 <= resp.status < 500) or _is_permanent_remote_error(err):
+                raise PermanentError(f"Describe rejected ({resp.status}): {err}")
+            raise RuntimeError(f"Describe failed: {err}")
+        return await resp.json()
+
+
+def _format_descriptions(descriptions: list[dict]) -> str:
+    """Render VLM frame descriptions as `[H:MM:SS] text` lines, matching the
+    whisper transcript format exactly so existing summary prompts work
+    unmodified."""
+    lines = []
+    for d in descriptions:
+        ts = format_duration(int(d.get("timestamp", 0)))
+        text = (d.get("text") or "").strip()
+        if not text or text == "[frame description unavailable]":
+            continue
+        lines.append(f"[{ts}] {text}")
+    return "\n".join(lines)
+
+
+# Match the leading [H:MM:SS] / [MM:SS] timestamp on a transcript line.
+_TS_LINE_RE = re.compile(r"^\[(\d{1,3}):(\d{2})(?::(\d{2}))?\]\s*(.*)$")
+
+
+def _parse_ts(line: str) -> tuple[int, str] | None:
+    """Return (seconds, rest_of_line) if line starts with a [H:MM:SS] / [MM:SS]
+    marker, else None.
+    """
+    m = _TS_LINE_RE.match(line)
+    if not m:
+        return None
+    a, b, c, _rest = m.groups()
+    if c is not None:
+        secs = int(a) * 3600 + int(b) * 60 + int(c)
+    else:
+        secs = int(a) * 60 + int(b)
+    return secs, line
+
+
+def _interleave_by_timestamp(speech_text: str, visual_text: str) -> str:
+    """Merge speech + visual transcripts by timestamp.
+
+    Both inputs are line-oriented `[H:MM:SS] text`. The merged output is
+    chronologically ordered. Speech wins on tie (same second) — visual
+    descriptions land between speech segments. Lines without parseable
+    timestamps are appended in order at the end (rare; safety net).
+    """
+    speech_lines = [_parse_ts(l) for l in speech_text.splitlines() if l.strip()]
+    visual_lines = [_parse_ts(l) for l in visual_text.splitlines() if l.strip()]
+    speech_pairs = [(s, l) for x in speech_lines for (s, l) in [x] if x is not None]
+    visual_pairs = [(s, l) for x in visual_lines for (s, l) in [x] if x is not None]
+    # speech tagged 0, visual tagged 1 → stable sort puts speech before visual on tie
+    merged = sorted(
+        [(s, 0, l) for s, l in speech_pairs] +
+        [(s, 1, l) for s, l in visual_pairs]
+    )
+    return "\n".join(line for (_s, _kind, line) in merged)
+
+
+async def _cleanup_remote_file(file_path: str) -> None:
+    """Best-effort cleanup of a file on the whisper container.
+
+    Used when we asked /api/transcribe with cleanup=False (so the VLM had a
+    chance to use the file) and now no longer need it. Idempotent on the
+    server side; swallows errors here since failure just leaves a temp file
+    that gets reaped at container restart.
+    """
+    if not file_path:
+        return
+    assert http
+    try:
+        async with http.post(
+            f"{WHISPER_API}/api/cleanup",
+            json={"file_path": file_path},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                log.warning("Remote cleanup non-200 for %s: %d %s",
+                            file_path, resp.status, body[:200])
+    except Exception as e:
+        log.warning("Remote cleanup failed for %s: %s", file_path, e)
+
+
+# ─── Output sanitization ──────────────────────────────────────────────────────
+
+# Domains we trust to link out to. Only these can appear in posted output.
+# Everything else gets stripped to prevent prompt-injection-driven phishing.
+# Configurable via ALLOWED_LINK_HOSTS env (CSV).
+_ALLOWED_LINK_HOSTS = _csv_env(
+    "ALLOWED_LINK_HOSTS",
+    "youtube.com,www.youtube.com,m.youtube.com,music.youtube.com,youtu.be,"
+    "twitch.tv,clips.twitch.tv,vimeo.com",
+)
+
+# Markdown link [text](url) and bare URL patterns
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+_BARE_URL_RE = re.compile(r"(?<![(\[])\bhttps?://[^\s)\]]+", re.IGNORECASE)
+
+
+def _is_allowed_link(url: str) -> bool:
+    """True if `url`'s host is in the allowlist."""
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        return host.lower() in _ALLOWED_LINK_HOSTS
+    except Exception:
+        return False
+
+
+def sanitize_llm_output(text: str) -> str:
+    """Strip untrusted links from LLM output.
+
+    Defense-in-depth against prompt-injection-driven phishing: an attacker who
+    convinces the LLM to inject `[click here](https://evil.com)` into a
+    summary would otherwise see Discord render it as a clickable link. We
+    keep markdown links only when their target is on `_ALLOWED_LINK_HOSTS`,
+    and demote bare URLs from non-allowed hosts to bracketed plain text.
+    """
+    def _replace_md(m: re.Match) -> str:
+        label, url = m.group(1), m.group(2)
+        if _is_allowed_link(url):
+            return m.group(0)
+        # Drop the link target; keep the visible text. If text is empty, fall
+        # back to a domain marker so it's clear something was elided.
+        return label or "[link removed]"
+
+    text = _MD_LINK_RE.sub(_replace_md, text)
+
+    def _replace_bare(m: re.Match) -> str:
+        url = m.group(0)
+        if _is_allowed_link(url):
+            return url
+        # Strip protocol so Discord doesn't auto-linkify; mark visibly.
+        return "[link removed]"
+
+    text = _BARE_URL_RE.sub(_replace_bare, text)
+    return text
 
 
 def format_duration(seconds: int) -> str:

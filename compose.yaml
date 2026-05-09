@@ -4,15 +4,50 @@ services:
     build: .
     pull_policy: missing
     environment:
-      - DEBUG_MODE=1  # Set to 0 for clean production logs
+      - DEBUG_MODE=1  # 0/false/no/off for clean production logs
       - HF_TOKEN=${HF_TOKEN}  # HuggingFace token for pyannote diarization
+      # Optional yt-dlp cookies (age-gated / bot-challenged videos).
+      # Leave unset to disable; see .env.example for the why and how.
+      - YT_DLP_COOKIES_FILE=${YT_DLP_COOKIES_FILE:-}
+      # VLM: /api/describe calls the llm-compose proxy on the external
+      # network. model_proxy is reachable by name when whisper joins the llm
+      # network (see networks: below).
+      - LLM_VISION_API_URL=${LLM_VISION_API_URL:-http://model_proxy:11434/v1}
+      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-Qwen2.5-VL-7B-Instruct}
     ports:
       - "7860:7860"
+    networks:
+      # default: same network the bot uses to reach whisper.
+      # llm: external llm-compose network — needed for VLM calls from
+      #      /api/describe to model_proxy.
+      - default
+      - llm
     volumes:
       - ./uploads:/data
-      - ./app.py:/app/app.py:ro
-      - model-cache:/root/.cache/huggingface
+      # NOTE: app.py is no longer bind-mounted by default. The image is the
+      # source of truth in production. For dev (live reload without rebuild),
+      # add `compose.dev.yaml` with the bind mount and run:
+      #   docker compose -f compose.yaml -f compose.dev.yaml up
+      #
+      # Container runs as non-root (uid 1000 / `ubuntu` user). The HF cache
+      # path moved from /root/.cache → /home/ubuntu/.cache. After rebuilding,
+      # if you have a pre-existing model-cache volume from older images, see
+      # the MIGRATION NOTE in Dockerfile (chown the volume or wipe it).
+      - model-cache:/home/ubuntu/.cache/huggingface
       - /mnt/d/Videos:/media:ro
+      # Mount a yt-dlp cookies.txt if you need it for age-restricted / bot-
+      # challenged videos. Place at ./cookies.txt and set
+      # YT_DLP_COOKIES_FILE=/secrets/cookies.txt in your .env.
+      # - ./cookies.txt:/secrets/cookies.txt:ro
+    healthcheck:
+      # Use python's stdlib instead of curl to avoid an extra apt install in
+      # the runtime layer.
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:7860/api/status',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s  # whisperx + first-time model download can be slow
     deploy:
       resources:
         reservations:
@@ -40,7 +75,8 @@ services:
       - default
       - llm
     depends_on:
-      - whisper
+      whisper:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

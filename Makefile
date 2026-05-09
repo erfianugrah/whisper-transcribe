@@ -12,6 +12,15 @@ BOT_IMAGE     := $(REGISTRY)/whisper-transcribe-bot
 COMPOSE       := docker compose
 GIT_SHA       := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 
+# Latest yt-dlp version from PyPI, fetched at make-invocation time. The
+# Dockerfile's volatile yt-dlp layer is keyed on this — when PyPI has a new
+# release the layer rebuilds (correct: we want the new version); when there's
+# no release the layer cache-hits (correct: nothing to do). Falls back to a
+# pinned floor if the network call fails so offline builds still work.
+YT_DLP_VERSION := $(shell curl -s --max-time 5 https://pypi.org/pypi/yt-dlp/json 2>/dev/null \
+	| python3 -c "import sys,json; print(json.load(sys.stdin)['info']['version'])" 2>/dev/null \
+	|| echo "2026.3.17")
+
 .DEFAULT_GOAL := help
 
 # ─── Help ─────────────────────────────────────────────────────────────────────
@@ -25,8 +34,9 @@ help: ## Show this help
 .PHONY: build build-whisper build-bot
 build: build-whisper build-bot ## Build both images
 
-build-whisper: ## Build whisper service image
-	$(COMPOSE) build whisper
+build-whisper: ## Build whisper service image (auto-bumps yt-dlp to latest PyPI release)
+	@echo "Building whisper with yt-dlp $(YT_DLP_VERSION)"
+	$(COMPOSE) build --build-arg YT_DLP_VERSION=$(YT_DLP_VERSION) whisper
 
 build-bot: ## Build bot image
 	$(COMPOSE) build bot
@@ -106,12 +116,79 @@ tag: ## Tag both images as VERSION=x.y.z (also pushes if PUSH=1)
 	  docker push $(BOT_IMAGE):$(VERSION); \
 	fi
 
+# ─── Release (lint → build → push → redeploy) ────────────────────────────────
+
+.PHONY: release ship redeploy
+release: lint build push ## Lint + build both + push both (no redeploy)
+	@echo ""
+	@echo "Released $(GIT_SHA): $(WHISPER_IMAGE) and $(BOT_IMAGE)"
+	@echo "Run 'make redeploy' to recreate local containers from the new images."
+
+ship: release redeploy ## Lint + build + push + recreate local containers (full cycle)
+
+redeploy: ## Recreate local containers from current :latest images
+	$(COMPOSE) up -d --force-recreate
+	@echo ""
+	@echo "Containers recreated. Tail logs with: make logs"
+
 # ─── Lint / verify ────────────────────────────────────────────────────────────
 
-.PHONY: lint
-lint: ## Syntax-check Python sources
-	python3 -c "import ast; ast.parse(open('app.py').read())" && echo "app.py OK"
-	python3 -c "import ast; ast.parse(open('bot/main.py').read())" && echo "bot/main.py OK"
+.PHONY: lint compile-check compose-check ruff bot-import-check
+lint: compile-check compose-check bot-import-check ## Run all static checks (no rebuild needed)
+
+compile-check: ## ast.parse + py_compile (catches syntax + bytecode errors)
+	@python3 -m py_compile app.py bot/main.py bot/prompts.py
+	@echo "  py_compile: app.py, bot/main.py, bot/prompts.py OK"
+	@python3 -c "import ast; [ast.parse(open(p).read()) for p in ['app.py','bot/main.py','bot/prompts.py']]"
+	@echo "  ast.parse OK"
+
+compose-check: ## Validate compose YAML (prod + dev overlay)
+	@$(COMPOSE) config -q && echo "  compose.yaml OK"
+	@$(COMPOSE) -f compose.yaml -f compose.dev.yaml config -q && echo "  compose.dev.yaml overlay OK"
+
+bot-import-check: ## Import bot main module under stubbed deps + verify exports
+	@python3 -c "$$BOT_IMPORT_CHECK"
+
+ruff: ## Optional: run ruff if installed (pip install ruff)
+	@command -v ruff >/dev/null 2>&1 && ruff check app.py bot/ || echo "  ruff not installed (pip install ruff)"
+
+# Inline import-check script. Stubs out aiohttp/discord so we can import the
+# bot module without network dependencies, then verifies the public symbols
+# exist and the dead code stays gone.
+define BOT_IMPORT_CHECK
+import os, sys, types, tempfile
+os.environ['DISCORD_TOKEN'] = 'lint-stub'
+os.environ['CACHE_DIR'] = tempfile.mkdtemp(prefix='lint-')
+sys.path.insert(0, 'bot')
+for name in ('aiohttp',):
+    sys.modules[name] = types.ModuleType(name)
+sys.modules['aiohttp'].ClientSession = object
+sys.modules['aiohttp'].ClientTimeout = lambda **k: None
+discord = types.ModuleType('discord')
+discord.Intents = type('I', (), {'default': staticmethod(lambda: types.SimpleNamespace(message_content=False))})
+discord.HTTPException = Exception
+for n in ('Embed', 'Message', 'TextChannel'): setattr(discord, n, object)
+sys.modules['discord'] = discord
+sys.modules['discord.ext'] = types.ModuleType('discord.ext')
+commands = types.ModuleType('discord.ext.commands')
+class B:
+    def __init__(s,*a,**k): pass
+    def event(s,fn): return fn
+commands.Bot = B
+sys.modules['discord.ext.commands'] = commands
+import main
+required = ('summarize', '_chunk_transcript', '_llm_call', 'PermanentError',
+            'PROCESSING_EMOJI', 'read_cache', 'write_cache',
+            'LLM_INPUT_CHAR_BUDGET', 'EMBED_SAFE_LIMIT',
+            '_is_permanent_remote_error', 'PROMPT_BRIEF', 'PROMPT_KEY_POINTS',
+            'PROMPT_CHAPTERS', 'REDUCE_BRIEF', 'REDUCE_KEY_POINTS',
+            'CHUNK_PREAMBLE')
+missing = [s for s in required if not hasattr(main, s)]
+assert not missing, f'missing exports: {missing}'
+assert not hasattr(main, 'extract_hotwords_from_context'), 'dead helper still present'
+print(f'  bot import + exports OK ({len(required)} symbols)')
+endef
+export BOT_IMPORT_CHECK
 
 # ─── Cleanup ──────────────────────────────────────────────────────────────────
 

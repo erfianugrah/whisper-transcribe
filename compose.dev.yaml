@@ -1,0 +1,18 @@
+# Dev overlay — bind-mounts app.py for live reload (skip Docker rebuild for
+# Python edits). Use:
+#
+#   docker compose -f compose.yaml -f compose.dev.yaml up -d
+#
+# After editing app.py:
+#
+#   docker compose restart whisper
+services:
+  whisper:
+    volumes:
+      - ./app.py:/app/app.py:ro
+      - ./whisper_app:/app/whisper_app:ro
+
+  bot:
+    volumes:
+      - ./bot/main.py:/app/main.py:ro
+      - ./bot/prompts.py:/app/prompts.py:ro

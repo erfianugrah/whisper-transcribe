@@ -10,10 +10,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # streams. Deno is yt-dlp's default supported runtime.
 COPY --from=deno /deno /usr/local/bin/deno
 
-# Install Python deps first (cached unless requirements.txt changes)
+# Reproducible pip installs:
+# - PIP_NO_COMPILE: don't write .pyc bytecode at install time. .pyc embeds
+#   build timestamps → different layer hash on every build → 4+ GB re-push
+#   to Docker Hub even when inputs didn't change.
+# - PYTHONDONTWRITEBYTECODE: no .pyc files written by Python at runtime
+#   either (bot/whisper containers don't need them).
+# - SOURCE_DATE_EPOCH: pip + setuptools respect this for normalising file
+#   mtimes inside installed packages. Pinned to 2024-01-01 (arbitrary fixed
+#   epoch). Combined with PIP_NO_COMPILE, the heavy install layer is fully
+#   content-addressable and Docker Hub's cache survives across rebuilds.
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_COMPILE=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    SOURCE_DATE_EPOCH=1704067200
+
+# ─── Heavy stable layer ──────────────────────────────────────────────────────
+# whisperx + gradio pull in torch + cuDNN + transformers (~4 GB on disk).
+# This layer is rebuilt only when requirements.txt changes; without
+# PIP_NO_COMPILE it changes on every build.
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt && \
-    pip install --no-cache-dir --break-system-packages yt-dlp
+RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
 
 # torchcodec is pulled in as a transitive dep but has a C++ ABI mismatch with
 # the installed PyTorch (undefined symbol). Neither whisperX nor our code uses
@@ -21,14 +38,59 @@ RUN pip install --no-cache-dir --break-system-packages -r /tmp/requirements.txt 
 # Removing it eliminates the noisy startup warning from pyannote.
 RUN pip uninstall -y torchcodec 2>/dev/null || true
 
+# ─── Volatile yt-dlp layer (small, frequent updates) ─────────────────────────
+# Kept separate from the heavy install above so a yt-dlp release doesn't
+# invalidate the multi-GB whisperx layer. Pinned in requirements.txt with
+# ARG override so a `--build-arg YT_DLP_VERSION=2026.5.1` rebuilds only this
+# layer.
+ARG YT_DLP_VERSION=2026.3.17
+RUN pip install --no-cache-dir --break-system-packages "yt-dlp>=${YT_DLP_VERSION}"
+
 # whisperX ships a Lightning v1.5.4 checkpoint that gets auto-upgraded at
-# runtime on every start. Run the upgrade once at build time.
-RUN python3 -m lightning.pytorch.utilities.upgrade_checkpoint \
-    /usr/local/lib/python3.12/dist-packages/whisperx/assets/pytorch_model.bin \
-    2>/dev/null || true
+# runtime on every start. We previously ran the upgrade utility at build
+# time to make this persistent; it's now disabled because the upgrade CLI
+# is broken on PyTorch ≥ 2.6:
+#   - PyTorch 2.6 flipped torch.load's `weights_only` default to True.
+#   - The whisperX checkpoint pickles `omegaconf.listconfig.ListConfig`
+#     which isn't in the safe-globals allowlist.
+#   - The CLI doesn't expose a way to pass weights_only=False.
+# Result: `python -m lightning.pytorch.utilities.upgrade_checkpoint` errors
+# out with `WeightsUnpickler error: Unsupported global ListConfig`.
+#
+# whisperX itself loads the checkpoint with weights_only=False at runtime,
+# so the in-memory upgrade still happens — only the persistence step is
+# missing. Cost: one extra INFO log line on first model load. Worth it
+# vs. shipping a custom wrapper that monkey-patches torch.load.
+#
+# Re-enable when Lightning either (a) adds an unsafe-load flag to the CLI
+# or (b) updates its safe-globals to include omegaconf types.
+
+# ─── Non-root user ────────────────────────────────────────────────────────────
+# ubuntu:24.04 ships a default `ubuntu` user at uid 1000. Reuse it instead of
+# creating a fresh user — fewer surprises with bind-mounted host paths.
+#
+# Caches and writable state live under /home/ubuntu so the named volume in
+# compose maps to the user's home directory and is correctly owned.
+#
+# MIGRATION NOTE: previous images stored the HF cache at /root/.cache. After
+# rebuilding, the volume `whisper-transcribe_model-cache` will mount empty
+# under the new path; either wipe it (`docker volume rm
+# whisper-transcribe_model-cache`, which re-downloads ~2 GB of models on
+# first start) or chown its contents on the host:
+#   docker run --rm -v whisper-transcribe_model-cache:/cache \
+#     alpine chown -R 1000:1000 /cache
+ENV HF_HOME=/home/ubuntu/.cache/huggingface \
+    XDG_CACHE_HOME=/home/ubuntu/.cache
+
+# Pre-create writable paths and own them by the runtime user.
+RUN install -d -o ubuntu -g ubuntu \
+        /app /data \
+        /home/ubuntu/.cache /home/ubuntu/.cache/huggingface
 
 WORKDIR /app
-COPY app.py .
+COPY --chown=ubuntu:ubuntu app.py .
+
+USER ubuntu
 
 EXPOSE 7860
 
