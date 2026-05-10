@@ -18,16 +18,23 @@ services:
       - LLM_VISION_API_URL=${LLM_VISION_API_URL:-http://model_proxy:11434/v1}
       - LLM_VISION_MODEL=${LLM_VISION_MODEL:-Qwen3-VL-2B-Instruct-Q8_0}
     networks:
-      - default
-      - llm
+      default:
+      # Pinned IPs >= .10 so we never collide with llm-compose's pinned
+      # containers (.2 llama-server, .4 model_proxy, .5/.6/.7 others).
+      # Without pinning, Docker auto-assigns sequentially from .2; the
+      # whisper container would grab the lowest free IP and collide with
+      # whichever llm-compose service starts last.
+      llm:
+        ipv4_address: 172.28.0.10
 
   bot:
     environment:
       - LLM_API_URL=${LLM_API_URL:-http://model_proxy:11434/v1}
       - LLM_MODEL=${LLM_MODEL:-Qwen3.5-4B-Q8_0}
     networks:
-      - default
-      - llm
+      default:
+      llm:
+        ipv4_address: 172.28.0.11
 
 networks:
   llm:
