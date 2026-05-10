@@ -157,6 +157,16 @@ directly — same surface area.
 | `YT_COMMENTS_MAX` | `100` | Cap on comments yt-dlp pulls per video (top + replies) |
 | `YT_COMMENT_MIN_CHARS` | `40` | Drop comments shorter than this as noise (lol, first, emoji-only) |
 | `YT_COMMENT_SUMMARY_TOP_N` | `30` | After filter+rank, top-N comments fed to the LLM |
+| `BRIEF_SENTENCES` | `3-5` | Length of the brief TL;DW paragraph (videos) |
+| `REDDIT_BRIEF_SENTENCES` | `4-6` | Length of the brief on Reddit/HN posts |
+| `WEB_BRIEF_SENTENCES` | `3-5` | Length of the brief on plain web articles |
+| `CHAPTERS_TARGET` | `4-10` | Target number of chapters per video |
+| `CHAPTERS_MAX` | `15` | Hard upper bound on chapter count (anti-overchaptering) |
+| `CHAPTERS_STATIC_TARGET` | `2-5` | Target chapters for static-shot content (music videos, ASMR) |
+| `CHAPTER_HEADING_WORDS` | `3-7` | Word count for chapter headings |
+| `CHAPTER_BODY_SENTENCES` | `1-2` | Sentence count per chapter body |
+| `YT_COMMENTS_SENTENCES` | `4-7` | Length of the Community Reaction summary |
+| `SECTIONS_BODY_SENTENCES` | `2-3` | Sentence count per section (web sections embed) |
 | `REDDIT_TOP_COMMENTS` | `10` | Top-N Reddit comments to summarise per post |
 | `REDDIT_REPLY_DEPTH` | `1` | Reddit reply tree depth |
 | `HN_TOP_COMMENTS` | `10` | Top-N HackerNews comments to summarise per post |

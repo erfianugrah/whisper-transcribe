@@ -901,6 +901,95 @@ def test_app_response_schema_backward_compatible():
     assert '"descriptions":' in body
 
 
+def test_chapters_prompt_warns_against_over_chaptering():
+    """Chapters prompt must instruct the LLM to GROUP many scenes into
+    fewer thematic chapters (real-world static-content videos produced
+    30+ headings before this prompt fix)."""
+    tmpl = p.PROMPT_CHAPTERS
+    assert "GROUP" in tmpl, "Must instruct LLM to group similar scenes"
+    assert "NEVER more than 15" in tmpl or "no more than 15" in tmpl.lower(), \
+        "Must give a hard upper bound on chapter count"
+    # Specific guidance for static content
+    assert "static-shot" in tmpl.lower() or "static content" in tmpl.lower()
+
+
+def test_chapters_token_budget_bumped():
+    """LLM_MAX_TOKENS_CHAPTERS must accommodate ~10 detailed chapters.
+    Was 3000, bumped to 5000 because static-content videos with many
+    scenes were truncating mid-output."""
+    assert bot.LLM_MAX_TOKENS_CHAPTERS >= 5000, (
+        f"Chapters max_tokens too low ({bot.LLM_MAX_TOKENS_CHAPTERS}) — "
+        f"static-content jobs will truncate"
+    )
+
+
+def test_prompt_tuning_constants_exist():
+    """All prompt magic-numbers are hoisted into module-level constants
+    so operators can tune output verbosity without editing prompt strings."""
+    for name in (
+        "BRIEF_SENTENCES", "WEB_BRIEF_SENTENCES", "REDDIT_BRIEF_SENTENCES",
+        "CHAPTERS_TARGET", "CHAPTERS_MAX", "CHAPTERS_STATIC_TARGET",
+        "CHAPTER_HEADING_WORDS", "CHAPTER_BODY_SENTENCES",
+        "YT_COMMENTS_SENTENCES", "SECTIONS_BODY_SENTENCES",
+        "REDDIT_ARTICLE_SUMMARY_SENTENCES", "REDDIT_OP_SENTENCES",
+        "REDDIT_REACTION_SENTENCES",
+    ):
+        assert hasattr(p, name), f"missing prompt tuning constant: {name}"
+
+
+def test_prompt_constants_env_overridable():
+    """All prompt tuning constants must read from os.environ at module
+    import so operators can override without forking prompts.py."""
+    src = open(p.__file__).read()
+    # Each constant should appear as `os.environ.get("NAME", default)`
+    for name in (
+        "BRIEF_SENTENCES", "CHAPTERS_TARGET", "CHAPTERS_MAX",
+        "CHAPTER_HEADING_WORDS", "YT_COMMENTS_SENTENCES",
+    ):
+        assert f'os.environ.get("{name}"' in src, (
+            f"{name} should be env-overridable: "
+            f"missing os.environ.get(\"{name}\", ...) in prompts.py"
+        )
+
+
+def test_prompt_constants_actually_baked_into_templates():
+    """Smoke test: the constants resolve at module load → prompt strings
+    contain the actual values, not literal `{BRIEF_SENTENCES}` etc."""
+    # No raw constant names should appear in compiled prompts
+    for tmpl_name in ("PROMPT_BRIEF", "PROMPT_CHAPTERS", "PROMPT_BRIEF_WEB",
+                      "PROMPT_BRIEF_REDDIT", "PROMPT_YT_COMMENTS",
+                      "REDUCE_YT_COMMENTS", "REDUCE_BRIEF", "REDUCE_BRIEF_WEB",
+                      "REDUCE_BRIEF_REDDIT", "PROMPT_SECTIONS",
+                      "PROMPT_SECTIONS_REDDIT"):
+        tmpl = getattr(p, tmpl_name)
+        for constant_name in (
+            "BRIEF_SENTENCES", "WEB_BRIEF_SENTENCES", "REDDIT_BRIEF_SENTENCES",
+            "CHAPTERS_TARGET", "CHAPTERS_MAX", "CHAPTERS_STATIC_TARGET",
+            "CHAPTER_HEADING_WORDS", "CHAPTER_BODY_SENTENCES",
+            "YT_COMMENTS_SENTENCES", "SECTIONS_BODY_SENTENCES",
+        ):
+            assert f"{{{constant_name}}}" not in tmpl, (
+                f"{tmpl_name} contains unfilled placeholder "
+                f"{{{constant_name}}} — f-string didn't bake it in"
+            )
+
+
+def test_app_cluster_threshold_aggressive_default():
+    """CLUSTER_SIMILARITY_THRESHOLD should be 0.25 (or lower) by
+    default so static-content paraphrases reliably merge."""
+    # Find the default value in app.py source
+    m = re.search(
+        r'CLUSTER_SIMILARITY_THRESHOLD = float\(\s*os\.environ\.get\(\s*"CLUSTER_SIMILARITY_THRESHOLD",\s*"([\d.]+)"\)',
+        APP_SRC,
+    )
+    assert m, "CLUSTER_SIMILARITY_THRESHOLD default not found"
+    default = float(m.group(1))
+    assert default <= 0.30, (
+        f"Cluster threshold {default} too high — static-content paraphrases "
+        f"won't merge. Lower toward 0.25."
+    )
+
+
 def test_chunk_preamble_anchors_timestamps():
     """Map preamble must instruct the LLM to keep timestamps verbatim
     (otherwise chunked chapters could renormalize relative to chunk start)."""

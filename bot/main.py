@@ -180,7 +180,7 @@ SUMMARY_CHAR_CAP = EMBED_DESC_LIMIT - 300  # asked of LLM (gives margin for over
 LLM_TEMPERATURE = float(os.environ.get("LLM_TEMPERATURE", "0.3"))
 LLM_MAX_TOKENS_BRIEF = int(os.environ.get("LLM_MAX_TOKENS_BRIEF", "1024"))
 LLM_MAX_TOKENS_KEY_POINTS = int(os.environ.get("LLM_MAX_TOKENS_KEY_POINTS", "2048"))
-LLM_MAX_TOKENS_CHAPTERS = int(os.environ.get("LLM_MAX_TOKENS_CHAPTERS", "3000"))
+LLM_MAX_TOKENS_CHAPTERS = int(os.environ.get("LLM_MAX_TOKENS_CHAPTERS", "5000"))
 
 # LLM input budget — derived from the model's context window so users can
 # point at a single knob (the model they're actually serving) and the chunk

@@ -2361,10 +2361,12 @@ SCENE_SAMPLES_LONG = 3
 # Cluster similarity threshold (Jaccard on word sets). Catches scenes that
 # scdet split mistakenly OR cases where VLM produced near-identical
 # descriptions for distinct frames (e.g. static dialogue scene + reverse
-# shot). Lower = more aggressive clustering. 0.35 is loose enough to merge
-# paraphrases ("woman holds recorder" / "person holding wind instrument").
+# shot, or "Nebula and X" / "Nebula and Y" on a static cosmic backdrop).
+# Lower = more aggressive clustering. 0.25 reliably merges paraphrased
+# descriptions of the same static scene; raise toward 0.5 if you find
+# distinct scenes are getting merged.
 CLUSTER_SIMILARITY_THRESHOLD = float(
-    os.environ.get("CLUSTER_SIMILARITY_THRESHOLD", "0.35")
+    os.environ.get("CLUSTER_SIMILARITY_THRESHOLD", "0.25")
 )
 
 _VLM_STOPWORDS = frozenset({
