@@ -20,13 +20,19 @@ Status legend:
 flow with explicit Discord slash commands. Cleaner UX, native arg validation,
 better discoverability.
 
-**Verified preconditions**:
-- `discord.py 2.7.1` is installed in the bot (`bot/requirements.txt`).
-- `discord.app_commands` and `discord.ui` modules are available
-  (verified via `docker exec ... python3 -c 'import discord; ...'`).
-- The Discord application needs the `applications.commands` scope. Have
-  to confirm that's already on the user's bot invite URL — if not, the
-  user has to re-invite the bot. **Open question.**
+**Verified preconditions** (re-checked 2026-05-10):
+- `discord.py 2.7.1` installed (`bot/requirements.txt:1`).
+- `discord.app_commands.CommandTree` available ✓
+- `discord.ui.{View, Button, Modal, TextInput, Select}` all available ✓
+- `intents.message_content=True` already set (existing message-listener
+  needs it); `intents.guilds=True` (default) — sufficient for slash
+  commands.
+- **NOT verifiable locally**: whether the bot's existing OAuth2 invite
+  URL included the `applications.commands` scope. If it didn't, slash
+  commands won't appear in Discord even after `tree.sync()` succeeds.
+  → User has to confirm this against the invite URL in the Discord
+  developer portal (Apps → your bot → OAuth2 → URL Generator).
+  Re-invite is non-destructive: the bot keeps existing permissions.
 
 **Design sketch**:
 ```
@@ -66,15 +72,16 @@ registration + arg parsing.
 **Goal**: When diarization is enabled, let users rename `SPEAKER_00 →
 Alice` from inside Discord and have the embed update.
 
-**Verified preconditions**:
-- Whisper service already supports diarization end-to-end
-  (`load_diarization()`, pyannote models, HF_TOKEN gate at
-  `app.py:106-108`). Already loaded; user has HF_TOKEN set per logs.
-- Whisper service exposes a Gradio rename UI for the same purpose
-  (`_apply_speaker_renames` in `app.py`); we can mirror that logic.
-- Bot does NOT currently send `diarize: true` to `/api/transcribe`
-  (see `transcribe_payload` in `bot/main.py:545`).
-- `discord.ui` (View / Button / Modal / Select) is available in 2.7.1.
+**Verified preconditions** (re-checked 2026-05-10):
+- Whisper diarization end-to-end:
+  `load_diarization()` (`app.py:223`), HF_TOKEN gate (`app.py:106-108`).
+  Logs confirm HF_TOKEN is set on the running container.
+- Existing rename logic to mirror: `_show_speaker_rename`
+  (`app.py:1633`) + `_apply_speaker_renames` (`app.py:1641`) +
+  `speaker_rename_input` Textbox (`app.py:1602`).
+- Bot's `transcribe_payload` (`bot/main.py:586-592`) confirmed: no
+  `diarize` key. Default false on the server side.
+- `discord.ui.{Modal, TextInput, View, Button, Select}` all importable.
 
 **Design sketch**:
 1. Add `DIARIZE` env (default off) and per-job opt-in via slash command
@@ -115,10 +122,11 @@ slash command makes the diarize opt-in obvious.
 swap counts. Enough signal to know "is the bot healthy?" without tailing
 logs.
 
-**Verified preconditions**:
+**Verified preconditions** (re-checked 2026-05-10):
 - **No existing observability stack on the host**. `docker ps` shows no
   grafana/prometheus/loki containers; `~/llm-compose` has none either.
-- `prometheus_client` is a small (~50 KB) stdlib-only-ish dep.
+- `prometheus-client==0.25.0` wheel is 62 KB; total package 146 KB
+  (verified via PyPI API). Pure-python, stdlib-only deps.
 
 **Why this is blocked**:
 The metrics endpoint itself is ~30 lines, but without a scraper +
@@ -158,10 +166,10 @@ volumes + alerting setup).
 `#serious-podcasts` uses gemma-4-31B for richer summaries; `#bot-spam`
 uses a 4B model.
 
-**Verified preconditions**:
-- Bot currently uses one global `LLM_MODEL` env var.
-- `bot-cache` named volume can hold a `channels.json` config file —
-  already writable as uid 1000.
+**Verified preconditions** (re-checked 2026-05-10):
+- Bot uses one global `LLM_MODEL` env var (set in `compose.yaml`).
+- `bot-cache:/app/cache` is writable from the running bot container
+  (verified via `docker exec ... touch /app/cache/test-write`).
 
 **Design sketch**:
 - New file `bot-cache/channels.json`:
@@ -197,9 +205,11 @@ documented and maintained.
 Each video download is ≤ 500 MB; without limits, malicious or bored
 users can chew bandwidth + GPU time.
 
-**Verified preconditions**:
-- Bot has no rate limiting today.
-- Worker queue is shared across all users (`asyncio.Queue`).
+**Verified preconditions** (re-checked 2026-05-10):
+- Bot has no rate limiting today (grep for `rate.*limit|deque|MAX_JOBS|
+  RateLimit` in `bot/main.py` returned 0 matches).
+- Worker queue is shared across all users (`asyncio.Queue` at
+  `bot/main.py:237`).
 
 **Design sketch**:
 - In-memory rate limit: `defaultdict[user_id, deque[timestamp]]`.
@@ -251,7 +261,8 @@ finding "that video about X we summarised three months ago".
 
 ## G. App.py monolith refactor  `[blocked]`
 
-**Goal**: Split `app.py` (currently ~2500 lines) into logical modules.
+**Goal**: Split `app.py` (currently 2583 lines) and possibly
+`bot/main.py` (1619 lines) into logical modules.
 
 **Status**: Deliberately deferred. Refactoring without a feature touching
 the affected code creates two-source-of-truth problems (we tried it once
