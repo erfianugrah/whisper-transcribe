@@ -332,6 +332,8 @@ from prompts import (
     PROMPT_BRIEF_REDDIT, PROMPT_KEY_POINTS_REDDIT, PROMPT_SECTIONS_REDDIT,
     REDUCE_BRIEF_REDDIT, REDUCE_KEY_POINTS_REDDIT, REDUCE_SECTIONS_REDDIT,
     PROMPT_YT_COMMENTS, REDUCE_YT_COMMENTS,
+    PROMPT_BRIEF_SILENT, PROMPT_KEY_POINTS_SILENT, PROMPT_CHAPTERS_SILENT,
+    REDUCE_BRIEF_SILENT, REDUCE_KEY_POINTS_SILENT,
     PROMPT_LITMUS,
     CHUNK_PREAMBLE,
 )
@@ -2248,6 +2250,28 @@ async def process(job: Job):
     duration_str = format_duration(duration)
     tail_start = format_duration(int(duration * (1 - CHAPTER_TAIL_FRACTION)))
 
+    # Pick prompt family based on transcript shape:
+    #   - Speech-heavy → standard PROMPT_BRIEF / KEY_POINTS / CHAPTERS
+    #   - Visual-heavy (VLM scene markers present) → SILENT variants that
+    #     LEAD with content identity (title + channel + OCR) and treat
+    #     visual descriptions as supporting context rather than the spine.
+    is_visual_heavy = _is_visual_heavy_transcript(transcript)
+    channel_name = await _fetch_channel_name(job.video_id) if is_visual_heavy else ""
+    if is_visual_heavy:
+        log.info("[%s] Visual-heavy transcript detected — using silent-video prompts",
+                 job.video_id)
+        prompt_brief = PROMPT_BRIEF_SILENT
+        prompt_key_points = PROMPT_KEY_POINTS_SILENT
+        prompt_chapters = PROMPT_CHAPTERS_SILENT
+        reduce_brief = REDUCE_BRIEF_SILENT
+        reduce_key_points = REDUCE_KEY_POINTS_SILENT
+    else:
+        prompt_brief = PROMPT_BRIEF
+        prompt_key_points = PROMPT_KEY_POINTS
+        prompt_chapters = PROMPT_CHAPTERS
+        reduce_brief = REDUCE_BRIEF
+        reduce_key_points = REDUCE_KEY_POINTS
+
     # Apply per-channel model override for the duration of this job's
     # summarize calls. ContextVar isolates per-task so concurrent jobs
     # don't trample each other.
@@ -2255,21 +2279,24 @@ async def process(job: Job):
     try:
         brief, key_points, chapters_raw = await asyncio.gather(
             summarize(
-                transcript, PROMPT_BRIEF, LLM_MAX_TOKENS_BRIEF,
-                reduce_template=REDUCE_BRIEF,
+                transcript, prompt_brief, LLM_MAX_TOKENS_BRIEF,
+                reduce_template=reduce_brief,
                 title=title, duration=duration_str, reference_block=ref_block,
+                channel=channel_name,
             ),
             summarize(
-                transcript, PROMPT_KEY_POINTS, LLM_MAX_TOKENS_KEY_POINTS,
-                reduce_template=REDUCE_KEY_POINTS,
+                transcript, prompt_key_points, LLM_MAX_TOKENS_KEY_POINTS,
+                reduce_template=reduce_key_points,
                 title=title, duration=duration_str, reference_block=ref_block,
                 char_cap=SUMMARY_CHAR_CAP,
+                channel=channel_name,
             ),
             summarize(
-                transcript, PROMPT_CHAPTERS, LLM_MAX_TOKENS_CHAPTERS,
+                transcript, prompt_chapters, LLM_MAX_TOKENS_CHAPTERS,
                 reduce_template=None,  # chapters are time-ordered; concat preserves chronology
                 title=title, duration=duration_str, reference_block=ref_block,
                 tail_start=tail_start, char_cap=SUMMARY_CHAR_CAP,
+                channel=channel_name,
             ),
         )
     finally:
@@ -3249,6 +3276,70 @@ def read_cache(video_id: str) -> tuple[str, str, str, int] | None:
 # ─── Video Context ────────────────────────────────────────────────────────────
 
 
+# Pattern that uniquely identifies VLM-scene-rendered transcript content.
+# _format_scenes emits `[t1-t2] (N frames) <desc>` for multi-frame scenes
+# and `[t] <desc> — text on screen: "..."` when OCR is present. Detecting
+# either marker tells us this transcript came from the visual pipeline,
+# not from whisper speech.
+_VISUAL_HEAVY_MARKER_RE = re.compile(
+    r"\[\d+:\d{2}-\d+:\d{2}\]"        # time-range marker (multi-frame scene)
+    r"|\(\d+ frames\)"                 # frame-count annotation
+    r"|text on screen:",               # OCR annotation
+)
+
+
+def _is_visual_heavy_transcript(text: str) -> bool:
+    """True iff transcript was generated primarily from VLM scene
+    descriptions (vs whisper speech). Used to switch to silent-video
+    prompts that lead with content identity instead of "main thesis".
+    Works on both fresh transcripts and cache hits (markers persist).
+    """
+    if not text:
+        return False
+    return bool(_VISUAL_HEAVY_MARKER_RE.search(text))
+
+
+_CHANNEL_NAME_RE = re.compile(
+    r'"ownerChannelName"\s*:\s*"([^"]+)"'
+    r'|<meta\s+itemprop="author"[^>]+content="([^"]+)"'
+    r'|<link\s+itemprop="name"\s+content="([^"]+)"',
+    re.IGNORECASE,
+)
+
+
+async def _fetch_channel_name(video_id: str) -> str:
+    """Pull the YouTube channel name for a video.
+
+    For silent-video summaries the channel name is high-signal — it
+    often tells you immediately what KIND of content the video is
+    (e.g. "Shittyflute" = comedy parody, "VEVO" = music video,
+    "ASMR Glow" = ASMR). The brief / key-points prompts use it as
+    grounding context the VLM can't provide on its own.
+
+    Returns empty string on any failure — silent-video prompts handle
+    missing channel gracefully.
+    """
+    if http is None or not video_id:
+        return ""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    try:
+        headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en"}
+        async with http.get(
+            url, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                return ""
+            page = await resp.text()
+    except (asyncio.TimeoutError, aiohttp.ClientError):
+        return ""
+    m = _CHANNEL_NAME_RE.search(page)
+    if not m:
+        return ""
+    # Three alternation groups; take the first non-None
+    return next((g for g in m.groups() if g), "").strip()[:120]
+
+
 async def fetch_video_description(video_id: str) -> str:
     """Fetch full YouTube video description from page JSON data."""
     if http is None: raise RuntimeError("HTTP session not initialised")
@@ -4108,6 +4199,11 @@ def _format_scenes(scenes: list[dict]) -> str:
     Single-frame scenes use `[H:MM:SS]` (point timestamp); multi-frame
     scenes use `[H:MM:SS-H:MM:SS]` (range). The downstream linkify
     timestamp regex picks up the starting timestamp from either form.
+
+    When the scene has OCR text (titles, credits, captions), it's
+    appended as `text on screen: "..."` so the summary LLM can ground
+    specific names / titles in the actual on-screen text rather than
+    the VLM's vague paraphrase.
     """
     lines = []
     for s in scenes:
@@ -4122,7 +4218,12 @@ def _format_scenes(scenes: list[dict]) -> str:
             ts = f"[{format_duration(int(start))}]"
         n = int(s.get("frame_count", 1))
         suffix = f" ({n} frames)" if n > 1 else ""
-        lines.append(f"{ts}{suffix} {text}")
+        ocr = (s.get("ocr") or "").strip()
+        # Truncate noisy OCR (e.g. wall of fast-changing captions)
+        if len(ocr) > 400:
+            ocr = ocr[:400] + "…"
+        ocr_suffix = f" — text on screen: \"{ocr}\"" if ocr else ""
+        lines.append(f"{ts}{suffix} {text}{ocr_suffix}")
     return "\n".join(lines)
 
 

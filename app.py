@@ -2599,32 +2599,67 @@ def _cluster_descriptions(descriptions: list[dict],
     return clusters
 
 
-def _synthesize_cluster(cluster: list[dict]) -> str:
+def _synthesize_cluster(cluster: list[dict]) -> tuple[str, str]:
     """Combine N frame descriptions from one scene into a single
-    1-2 sentence summary via the text LLM. Falls back to the longest
-    frame's description if the LLM call fails.
+    1-2 sentence summary via the text LLM, plus aggregate OCR text.
+
+    Returns (synthesized_description, deduped_ocr_text).
+
+    The OCR text from all frames in the cluster is deduped (since the
+    same on-screen text often appears across multiple frames of a static
+    shot) and returned alongside the description. The LLM synthesis is
+    given BOTH the descriptions AND the OCR so it can resolve VLM
+    vagueness against on-screen ground truth (e.g. VLM says "title card
+    with text" but OCR says "STAR WARS THEME - shitty flute version").
+
+    Falls back to the longest VLM description if the synthesis LLM call
+    fails.
     """
     if not cluster:
-        return ""
-    if len(cluster) == 1:
-        return (cluster[0].get("text") or "").strip()
+        return "", ""
+    # Aggregate OCR across all frames (dedup'd)
+    ocr_seen: set[str] = set()
+    ocr_parts: list[str] = []
+    for c in cluster:
+        ocr = (c.get("ocr") or "").strip()
+        if not ocr:
+            continue
+        # Split on " | " separator we used in _ocr_frame
+        for snippet in ocr.split(" | "):
+            s = snippet.strip()
+            if s and s.lower() not in ocr_seen:
+                ocr_seen.add(s.lower())
+                ocr_parts.append(s)
+    ocr_combined = " | ".join(ocr_parts)
 
     descriptions = [c.get("text", "").strip() for c in cluster if c.get("text")]
+    if len(cluster) == 1:
+        return descriptions[0] if descriptions else "", ocr_combined
+
     # Fallback: longest description (likely richest)
     fallback = max(descriptions, key=len, default="")
 
-    # Skip synthesis when descriptions are extremely similar (avoid cost)
-    if len(set(descriptions)) <= 1:
-        return fallback
+    # Skip synthesis when descriptions are extremely similar AND no OCR
+    # to integrate — the longest description already covers it.
+    if len(set(descriptions)) <= 1 and not ocr_combined:
+        return fallback, ocr_combined
+
+    ocr_section = (
+        f"\n\nOn-screen text detected via OCR (use these as ground truth — "
+        f"prefer OCR text over any text the descriptions guess at):\n"
+        f"{ocr_combined}"
+    ) if ocr_combined else ""
 
     prompt = (
         f"Below are {len(descriptions)} short descriptions of consecutive "
         f"frames from the SAME scene in a video. Synthesize them into ONE "
         f"coherent description (1-2 sentences) capturing what's in the "
         f"scene (people, objects, setting) and any notable change or "
-        f"action across the frames. Output ONLY the synthesized "
-        f"description — no preamble, no list, no markdown.\n\n"
+        f"action across the frames. Use the OCR text when present to "
+        f"anchor specific titles / names / captions. Output ONLY the "
+        f"synthesized description — no preamble, no list, no markdown.\n\n"
         + "\n".join(f"{i+1}. {d}" for i, d in enumerate(descriptions))
+        + ocr_section
     )
     import base64
     import urllib.request
@@ -2633,7 +2668,7 @@ def _synthesize_cluster(cluster: list[dict]) -> str:
         "model": LLM_SYNTHESIS_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.3,
-        "max_tokens": 200,
+        "max_tokens": 250,
     }
     req = urllib.request.Request(
         f"{LLM_TEXT_API_URL}/chat/completions",
@@ -2646,11 +2681,11 @@ def _synthesize_cluster(cluster: list[dict]) -> str:
             data = json.loads(resp.read().decode("utf-8"))
         text = data["choices"][0]["message"]["content"].strip()
         if text:
-            return text
+            return text, ocr_combined
     except (urllib.error.HTTPError, urllib.error.URLError,
             json.JSONDecodeError, KeyError, IndexError) as e:
         log.warning(f"[VLM] synthesis failed (using longest-frame fallback): {e}")
-    return fallback
+    return fallback, ocr_combined
 
 
 def _ffprobe_duration(file_path: str) -> float:
@@ -2728,6 +2763,86 @@ def _extract_frames(file_path: str, out_dir: str,
         if f.startswith("frame_") and f.endswith(".jpg")
     )
     return frames
+
+
+# ─── OCR (on-screen text extraction) ─────────────────────────────────────────
+# Catches text the VLM misses: titles, lyrics, credits, captions, brand
+# names. The VLM is asked to describe what it sees; it's terrible at
+# transcribing text faithfully. EasyOCR is purpose-built for this.
+#
+# Lazy-loaded — the model weights (~600 MB) only download on first call.
+# When VLM_OCR_ENABLED=0, this whole subsystem skips and frame descriptions
+# rely solely on the VLM (slightly faster, weaker for text-heavy content).
+
+VLM_OCR_ENABLED = os.environ.get("VLM_OCR_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+VLM_OCR_LANGUAGES = os.environ.get("VLM_OCR_LANGUAGES", "en").split(",")
+# Drop OCR snippets shorter than this — single-character noise / artifacts
+# pollute output without adding signal.
+VLM_OCR_MIN_CHARS = int(os.environ.get("VLM_OCR_MIN_CHARS", "3"))
+# Confidence floor (0-1). EasyOCR returns confidence per detection;
+# below this we discard.
+VLM_OCR_MIN_CONFIDENCE = float(os.environ.get("VLM_OCR_MIN_CONFIDENCE", "0.5"))
+
+_ocr_reader = None  # singleton; lazy-init on first call
+_ocr_reader_lock = threading.Lock()
+
+
+def _get_ocr_reader():
+    """Lazy-init EasyOCR reader. First call downloads model weights into
+    the HF cache (~600 MB); subsequent calls reuse the loaded model.
+    """
+    global _ocr_reader
+    if _ocr_reader is not None:
+        return _ocr_reader
+    with _ocr_reader_lock:
+        if _ocr_reader is None:
+            log.info("[OCR] initialising EasyOCR (langs=%s, gpu=%s)...",
+                     VLM_OCR_LANGUAGES, DEVICE == "cuda")
+            try:
+                import easyocr
+                _ocr_reader = easyocr.Reader(
+                    VLM_OCR_LANGUAGES,
+                    gpu=(DEVICE == "cuda"),
+                    verbose=False,
+                )
+                log.info("[OCR] ready")
+            except Exception as e:
+                log.warning(f"[OCR] init failed: {e}; OCR disabled for this run")
+                _ocr_reader = False  # sentinel: don't retry
+    return _ocr_reader
+
+
+def _ocr_frame(frame_path: str) -> str:
+    """Extract on-screen text from a single frame. Returns the joined
+    text (newline-separated) or empty string if OCR is disabled / no
+    text detected / OCR fails.
+
+    Filters:
+      - Confidence below VLM_OCR_MIN_CONFIDENCE (default 0.5)
+      - Text shorter than VLM_OCR_MIN_CHARS (default 3)
+    """
+    if not VLM_OCR_ENABLED:
+        return ""
+    reader = _get_ocr_reader()
+    if not reader:  # init failed
+        return ""
+    try:
+        # readtext returns list of (bbox, text, confidence)
+        results = reader.readtext(frame_path, detail=1, paragraph=False)
+    except Exception as e:
+        log.warning(f"[OCR] readtext failed for {frame_path}: {e}")
+        return ""
+    if not results:
+        return ""
+    snippets = []
+    for _bbox, text, conf in results:
+        text = (text or "").strip()
+        if not text or len(text) < VLM_OCR_MIN_CHARS:
+            continue
+        if conf < VLM_OCR_MIN_CONFIDENCE:
+            continue
+        snippets.append(text)
+    return " | ".join(snippets)
 
 
 def _describe_frame(frame_path: str, vlm_model: str, prompt: str) -> str:
@@ -2880,7 +2995,8 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
             nonlocal success_count, first_failure, not_configured_err
             if cancel.is_set():
                 results[i] = {"timestamp": timestamp,
-                              "text": "[frame description unavailable]"}
+                              "text": "[frame description unavailable]",
+                              "ocr": ""}
                 return
             try:
                 text = _describe_frame(fp, vlm_model, prompt)
@@ -2902,7 +3018,12 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
                         if first_failure is None:
                             first_failure = err
                     text = "[frame description unavailable]"
-            results[i] = {"timestamp": timestamp, "text": text}
+            # Run OCR in parallel with VLM where possible. EasyOCR isn't
+            # thread-safe across distinct readers but the singleton reader
+            # serialises internally; calling per-frame from multiple workers
+            # is safe-but-slow. Acceptable for our small batch sizes.
+            ocr = _ocr_frame(fp)
+            results[i] = {"timestamp": timestamp, "text": text, "ocr": ocr}
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [
@@ -2946,17 +3067,22 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
         else:
             log.info(f"[VLM] clustered {len(clean)} frames → {len(clusters)} scenes")
 
-        # 5. Synthesize each cluster (parallel; cheap text-only LLM calls)
+        # 5. Synthesize each cluster (parallel; cheap text-only LLM calls).
+        # _synthesize_cluster returns (description, ocr_text) — OCR is the
+        # cluster-aggregated, deduped on-screen text from all frames in
+        # the cluster, used by the bot to anchor specific names/titles
+        # the VLM couldn't read.
         scene_outputs: list[dict] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [ex.submit(_synthesize_cluster, c) for c in clusters]
             syntheses = [f.result() for f in futures]
-        for cluster, synth in zip(clusters, syntheses):
+        for cluster, (synth, ocr) in zip(clusters, syntheses):
             scene_outputs.append({
                 "start": cluster[0]["timestamp"],
                 "end": cluster[-1]["timestamp"],
                 "frame_count": len(cluster),
                 "description": synth,
+                "ocr": ocr,
             })
 
         return {

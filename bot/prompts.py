@@ -573,6 +573,142 @@ Distinguish article claims from commenter opinions. Plain prose only.
 </partials>"""
 
 
+# ─── Silent-video prompts (visual-only / heavy-VLM content) ──────────────────
+# When speech density is too low to drive a real summary, the bot used to
+# feed VLM frame descriptions to the standard PROMPT_BRIEF / KEY_POINTS /
+# CHAPTERS templates. Those prompts assume a transcript — they ask for
+# "main thesis, key argument, conclusion" which doesn't apply to a music
+# video or ASMR clip.
+#
+# These silent-video variants:
+#   - LEAD with content identity (title, channel, viewer reception)
+#   - Treat the visual transcript as supporting context, not the spine
+#   - Acknowledge VLM blind spots (no celebrity recognition, limited text
+#     reading) — prefer OCR-anchored details over VLM paraphrases when
+#     scenes contain `text on screen: "..."` markers
+
+PROMPT_BRIEF_SILENT = f"""\
+Video title: {{title}}
+Video duration: {{duration}}
+Channel: {{channel}}
+
+{{reference_block}}\
+This video has very little speech, so the input below is composed primarily \
+of visual scene descriptions (from a vision-language model) and on-screen \
+text (from OCR). The VLM cannot reliably identify specific people, brands, \
+or characters; trust OCR text and external context (title, channel name, \
+reference material) over VLM descriptions for specifics like names.
+
+Summarize this video in {BRIEF_SENTENCES} sentences. Lead with WHAT the video \
+is (based on title + channel + any OCR text), then describe what visually \
+happens. If the title or OCR tells you it's a parody/cover/music video of a \
+specific song or franchise, say so. Be concrete; don't write generic prose \
+like "the video features creative content".
+
+{REF_RULES}
+
+<visual_transcript>
+{{transcript}}
+</visual_transcript>"""
+
+
+PROMPT_KEY_POINTS_SILENT = f"""\
+Video title: {{title}}
+Video duration: {{duration}}
+Channel: {{channel}}
+
+{{reference_block}}\
+This video has very little speech. The input below is visual scene \
+descriptions (VLM) + on-screen text (OCR). VLM cannot identify specific \
+people or read text reliably — trust OCR and external context for \
+specifics; trust VLM only for general scene composition (setting, action, \
+mood).
+
+Summarize as a structured list:
+- One-sentence overview anchored on what the video IS (parody, music video, \
+ASMR, etc.) — based on title + channel + OCR, not VLM
+- Bulleted key points covering: what's depicted, any text/dialogue captured \
+via OCR (quote it verbatim if revealing), references to franchises / songs \
+/ creators visible
+- Note the channel's apparent style or running gag if applicable
+- 1 sentence per bullet
+- Keep total output under {{char_cap}} characters
+
+{REF_RULES}
+
+<visual_transcript>
+{{transcript}}
+</visual_transcript>"""
+
+
+PROMPT_CHAPTERS_SILENT = f"""\
+Video title: {{title}}
+Video duration: {{duration}}
+Channel: {{channel}}
+
+{{reference_block}}\
+This video has very little speech. Below are scene-clustered visual \
+descriptions and OCR-extracted on-screen text, time-anchored. The scenes \
+ARE the chapters — your job is to label them with meaningful headings \
+(grounded in OCR / title context, not generic VLM paraphrases like \
+"Cosmic scene") and write a short body.
+
+CHAPTER COUNT: {CHAPTERS_STATIC_TARGET} chapters for short static videos; \
+{CHAPTERS_TARGET} for longer / varied ones. NEVER more than {CHAPTERS_MAX}.
+
+Format:
+- One chapter per logical section in the video
+- Each chapter heading uses EXACTLY ONE timestamp in [MM:SS] or [H:MM:SS] \
+format at the start of the line
+- Heading text ({CHAPTER_HEADING_WORDS} words) should be specific to the \
+content (e.g. "Snoop Dogg cameo over star field" — combining VLM scene info \
++ external context). Not generic like "Cosmic visuals".
+- Under each heading, {CHAPTER_BODY_SENTENCES} sentences combining VLM \
+visual cue + OCR text + external context. Quote OCR text verbatim when it \
+adds signal.
+- Sections must cover the entire video; final section starts at or after \
+{{tail_start}}
+- Format: **[H:MM:SS] Chapter Title** followed by summary
+- Keep total output under {{char_cap}} characters
+
+{REF_RULES}
+
+<visual_transcript>
+{{transcript}}
+</visual_transcript>"""
+
+
+REDUCE_BRIEF_SILENT = f"""\
+Below are partial visual-only summaries of consecutive sections of a video \
+titled "{{title}}" ({{duration}}, channel: {{channel}}). The video has very \
+little speech — each partial is based on VLM frame descriptions + OCR \
+on-screen text.
+
+Combine into ONE paragraph ({BRIEF_SENTENCES} sentences) that LEADS with what \
+the video is (based on title + channel + OCR), then describes what visually \
+happens. Trust OCR-quoted text over VLM paraphrases.
+
+<partials>
+{{transcript}}
+</partials>"""
+
+
+REDUCE_KEY_POINTS_SILENT = f"""\
+Below are partial visual-only key-point summaries of consecutive sections \
+of a video titled "{{title}}" ({{duration}}, channel: {{channel}}). The \
+video has very little speech.
+
+Combine into a deduplicated bullet list:
+- One-sentence overview anchored on what the video IS
+- Bullets for visual content, OCR-captured text, references / cameos
+- 1 sentence per bullet
+- Keep total output under {{char_cap}} characters
+
+<partials>
+{{transcript}}
+</partials>"""
+
+
 REDUCE_KEY_POINTS_REDDIT = """\
 Below are partial bullet-point summaries of a discussion thread (Reddit / HackerNews / similar) titled "{title}" \
 (source: {source}). The thread combines a linked article and Reddit comment \

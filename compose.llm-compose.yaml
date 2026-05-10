@@ -16,7 +16,14 @@ services:
     environment:
       # Hop straight to model_proxy on the shared network.
       - LLM_VISION_API_URL=${LLM_VISION_API_URL:-http://model_proxy:11434/v1}
-      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-Qwen3-VL-2B-Instruct-Q8_0}
+      # Unified model: same as the bot's text summariser. Avoids cold-swap
+      # latency between vision and text calls (proxy auto-swaps on model
+      # mismatch otherwise — ~60s per swap). gemma-4-26B-A4B is MoE
+      # (3B active per token) so per-call throughput stays high.
+      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-gemma-4-26B-A4B-it-Q4_K_M}
+      # Same model for scene-cluster synthesis (server-side text LLM call).
+      - LLM_TEXT_API_URL=${LLM_TEXT_API_URL:-http://model_proxy:11434/v1}
+      - LLM_SYNTHESIS_MODEL=${LLM_SYNTHESIS_MODEL:-gemma-4-26B-A4B-it-Q4_K_M}
     networks:
       default:
       # Pinned IPs >= .10 so we never collide with llm-compose's pinned

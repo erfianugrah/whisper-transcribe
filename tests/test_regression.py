@@ -990,6 +990,32 @@ def test_app_cluster_threshold_aggressive_default():
     )
 
 
+def test_app_has_ocr_pipeline():
+    """OCR pass is wired into the server-side describe pipeline."""
+    for sym in ("VLM_OCR_ENABLED", "VLM_OCR_LANGUAGES", "_get_ocr_reader",
+                "_ocr_frame"):
+        assert sym in APP_SRC, f"missing OCR helper: {sym}"
+    # OCR runs per-frame inside the worker
+    worker_src = APP_SRC[APP_SRC.index("def _worker(i: int"):
+                           APP_SRC.index("with concurrent.futures.ThreadPoolExecutor",
+                                          APP_SRC.index("def _worker(i: int"))]
+    assert "_ocr_frame(fp)" in worker_src
+    # OCR text propagates into scene output
+    assert '"ocr": ocr' in APP_SRC
+
+
+def test_app_synthesis_uses_ocr_as_ground_truth():
+    """_synthesize_cluster must include OCR text in the prompt so the
+    LLM can resolve VLM vagueness against actual on-screen text."""
+    body = APP_SRC[APP_SRC.index("def _synthesize_cluster("):
+                    APP_SRC.index("def _ffprobe_duration(")]
+    assert "ocr" in body.lower()
+    assert "ground truth" in body.lower() or "prefer ocr" in body.lower()
+    # Returns tuple now (description, ocr) — not just description
+    assert "return fallback, ocr_combined" in body
+    assert "return text, ocr_combined" in body
+
+
 def test_app_scenes_cap_is_duration_aware():
     """Scene cap must scale with duration — short videos get few scenes,
     long videos get many. Not a fixed cap."""
@@ -1012,6 +1038,107 @@ def test_app_cap_scenes_has_tolerance():
     body = APP_SRC[APP_SRC.index("def _cap_scenes("):
                     APP_SRC.index("def _cluster_descriptions(")]
     assert "SCENES_CAP_TOLERANCE" in body
+
+
+# ─── Silent-video flow (visual-heavy content, content-metadata-first) ────────
+
+
+def test_visual_heavy_detector_matches_scene_markers():
+    """The transcript-shape detector fires on time-range markers,
+    frame-count annotations, and OCR markers — all signals that
+    content came from the visual pipeline."""
+    samples = [
+        "[0:00-1:30] A static-shot music video.",          # time range
+        "[0:30] (5 frames) something happens",              # frame count
+        '[1:00] A scene — text on screen: "STAR WARS"',    # OCR marker
+    ]
+    for s in samples:
+        assert bot._is_visual_heavy_transcript(s), f"should detect: {s!r}"
+
+
+def test_visual_heavy_detector_rejects_speech():
+    """A plain whisper transcript (no time-range / frame-count / OCR
+    markers) must NOT be flagged as visual-heavy."""
+    samples = [
+        "[0:00] We're going to talk about cosmic backgrounds today.",
+        "Hello and welcome to today's stream.\n[1:23] Let's begin.",
+        "",
+    ]
+    for s in samples:
+        assert not bot._is_visual_heavy_transcript(s), f"should reject: {s!r}"
+
+
+def test_silent_prompts_exist():
+    """All four silent-video prompt variants must be exported."""
+    for name in ("PROMPT_BRIEF_SILENT", "PROMPT_KEY_POINTS_SILENT",
+                 "PROMPT_CHAPTERS_SILENT",
+                 "REDUCE_BRIEF_SILENT", "REDUCE_KEY_POINTS_SILENT"):
+        assert hasattr(p, name), f"missing silent prompt: {name}"
+
+
+def test_silent_prompts_lead_with_identity():
+    """Silent prompts must instruct the LLM to LEAD with content identity
+    (title, channel, OCR), not generic 'main thesis' framing."""
+    for tmpl in (p.PROMPT_BRIEF_SILENT, p.PROMPT_KEY_POINTS_SILENT):
+        assert "title" in tmpl.lower()
+        assert "channel" in tmpl.lower()
+        assert "ocr" in tmpl.lower() or "on-screen text" in tmpl.lower()
+
+
+def test_silent_prompts_acknowledge_vlm_limits():
+    """Silent prompts must tell the LLM to TRUST OCR over VLM for
+    specifics — otherwise the LLM will repeat VLM's vague descriptions."""
+    for tmpl in (p.PROMPT_BRIEF_SILENT, p.PROMPT_KEY_POINTS_SILENT,
+                 p.PROMPT_CHAPTERS_SILENT):
+        # Explicit acknowledgement of VLM blind spots
+        tlow = tmpl.lower()
+        assert "vlm" in tlow or "vision-language" in tlow or \
+               "cannot identify" in tlow or "cannot reliably" in tlow
+        assert "ocr" in tlow or "on-screen text" in tlow
+
+
+def test_silent_prompts_use_channel_placeholder():
+    """Silent prompts must have {channel} for the YT channel name kwarg."""
+    for tmpl in (p.PROMPT_BRIEF_SILENT, p.PROMPT_KEY_POINTS_SILENT,
+                 p.PROMPT_CHAPTERS_SILENT):
+        assert "{channel}" in tmpl
+
+
+def test_process_switches_to_silent_prompts():
+    """process() detects visual-heavy transcripts and switches to silent
+    prompts. Source-level check."""
+    src = BOT_SRC
+    proc = src[src.index("async def process(job: Job):"):
+                src.index("async def process_url")]
+    assert "_is_visual_heavy_transcript" in proc
+    assert "PROMPT_BRIEF_SILENT" in proc
+    assert "PROMPT_KEY_POINTS_SILENT" in proc
+    assert "PROMPT_CHAPTERS_SILENT" in proc
+    assert "_fetch_channel_name" in proc
+
+
+def test_format_scenes_includes_ocr_when_present():
+    """_format_scenes must render OCR text alongside the scene description
+    so the summary LLM can ground specific names in actual on-screen text."""
+    scenes = [{
+        "start": 0.0, "end": 10.0, "frame_count": 5,
+        "description": "A title card appears with bold yellow text.",
+        "ocr": "STAR WARS THEME",
+    }]
+    out = bot._format_scenes(scenes)
+    assert "STAR WARS THEME" in out
+    assert "text on screen" in out.lower()
+
+
+def test_format_scenes_skips_empty_ocr():
+    """No OCR → no `text on screen:` annotation."""
+    scenes = [{
+        "start": 0.0, "end": 5.0, "frame_count": 1,
+        "description": "A scene description.",
+        "ocr": "",
+    }]
+    out = bot._format_scenes(scenes)
+    assert "text on screen" not in out.lower()
 
 
 def test_chunk_preamble_anchors_timestamps():
