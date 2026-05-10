@@ -193,6 +193,35 @@ print(f'  bot import + exports OK ({len(required)} symbols)')
 endef
 export BOT_IMPORT_CHECK
 
+# ─── Migration (one-shot, for upgrades from pre-non-root images) ─────────────
+
+.PHONY: migrate-from-root
+migrate-from-root: ## ONE-TIME: chown stale root-owned volumes after non-root switch
+	@echo "Stopping containers so we can mutate the volumes safely..."
+	@$(COMPOSE) stop || true
+	@echo ""
+	@echo "Chowning model-cache (HF models) to uid 1000..."
+	@docker volume inspect whisper-transcribe_model-cache >/dev/null 2>&1 && \
+	    docker run --rm -v whisper-transcribe_model-cache:/c alpine chown -R 1000:1000 /c \
+	    || echo "  (model-cache volume not found — skip)"
+	@echo "Chowning bot-cache (transcript cache) to uid 1000..."
+	@docker volume inspect whisper-transcribe_bot-cache >/dev/null 2>&1 && \
+	    docker run --rm -v whisper-transcribe_bot-cache:/c alpine chown -R 1000:1000 /c \
+	    || echo "  (bot-cache volume not found — skip)"
+	@echo "Importing legacy ./uploads/history.json into the uploads named volume (if present)..."
+	@if [ -f ./uploads/history.json ]; then \
+	    $(COMPOSE) up -d --no-recreate whisper >/dev/null 2>&1 || true; \
+	    docker compose cp ./uploads/history.json whisper:/data/history.json && \
+	        docker compose exec -u 0 whisper chown 1000:1000 /data/history.json && \
+	        echo "  imported ./uploads/history.json"; \
+	  else \
+	    echo "  (no legacy ./uploads/history.json — skip)"; \
+	  fi
+	@echo ""
+	@echo "Migration complete. Bring stack back up with: make up"
+	@echo "Fresh installs of this repo do NOT need this command — named volumes"
+	@echo "in compose.yaml are auto-initialised with the image's uid 1000 ownership."
+
 # ─── Cleanup ──────────────────────────────────────────────────────────────────
 
 .PHONY: clean clean-cache prune

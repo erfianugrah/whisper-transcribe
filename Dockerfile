@@ -69,24 +69,20 @@ RUN pip install --no-cache-dir --break-system-packages "yt-dlp>=${YT_DLP_VERSION
 # ubuntu:24.04 ships a default `ubuntu` user at uid 1000. Reuse it instead of
 # creating a fresh user — fewer surprises with bind-mounted host paths.
 #
-# Caches and writable state live under /home/ubuntu so the named volume in
-# compose maps to the user's home directory and is correctly owned.
+# All writable state lives under paths owned by uid 1000 in the image:
+#   /app                                 — code (chowned via COPY --chown)
+#   /data                                — runtime state (history.json etc.)
+#   /home/ubuntu/.cache/huggingface      — HF model downloads
+#   /home/ubuntu/.cache/torch            — torch.hub (wav2vec2 alignment)
 #
-# MIGRATION NOTE: previous images stored the HF cache at /root/.cache. After
-# rebuilding, the volume `whisper-transcribe_model-cache` will mount empty
-# under the new path; either wipe it (`docker volume rm
-# whisper-transcribe_model-cache`, which re-downloads ~2 GB of models on
-# first start) or chown its contents on the host:
-#   docker run --rm -v whisper-transcribe_model-cache:/cache \
-#     alpine chown -R 1000:1000 /cache
+# Compose maps each of these to a NAMED Docker volume. Docker initialises
+# new named volumes by copying the image-path's ownership and contents, so
+# a fresh `compose up` works on any host without manual chown — no host
+# uid mismatch risk because nothing writable is bind-mounted from the host.
 ENV HF_HOME=/home/ubuntu/.cache/huggingface \
     XDG_CACHE_HOME=/home/ubuntu/.cache \
     TORCH_HOME=/home/ubuntu/.cache/torch
 
-# Pre-create writable paths and own them by the runtime user.
-# /home/ubuntu/.cache/torch is for the wav2vec2 alignment models (lives in
-# torch.hub, NOT under HF cache — so it isn't shadowed by the named volume
-# mount and persists in the image after the warmup below).
 RUN install -d -o ubuntu -g ubuntu \
         /app /data \
         /home/ubuntu/.cache \

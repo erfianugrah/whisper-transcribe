@@ -23,17 +23,17 @@ services:
       - default
       - llm
     volumes:
-      - ./uploads:/data
+      # Writable state lives in named volumes — Docker initializes named
+      # volumes with the image-path's ownership (uid 1000 / ubuntu), so a
+      # fresh `make ship` works on any host regardless of host user uid
+      # without manual chown gymnastics. Inspect contents with e.g.
+      # `docker compose cp whisper:/data/history.json -` if needed.
+      - uploads:/data
+      - model-cache:/home/ubuntu/.cache/huggingface
       # NOTE: app.py is no longer bind-mounted by default. The image is the
       # source of truth in production. For dev (live reload without rebuild),
       # add `compose.dev.yaml` with the bind mount and run:
       #   docker compose -f compose.yaml -f compose.dev.yaml up
-      #
-      # Container runs as non-root (uid 1000 / `ubuntu` user). The HF cache
-      # path moved from /root/.cache → /home/ubuntu/.cache. After rebuilding,
-      # if you have a pre-existing model-cache volume from older images, see
-      # the MIGRATION NOTE in Dockerfile (chown the volume or wipe it).
-      - model-cache:/home/ubuntu/.cache/huggingface
       - /mnt/d/Videos:/media:ro
       # Mount a yt-dlp cookies.txt if you need it for age-restricted / bot-
       # challenged videos. Place at ./cookies.txt and set
@@ -80,8 +80,9 @@ services:
     restart: unless-stopped
 
 volumes:
-  model-cache:
-  bot-cache:
+  uploads:        # whisper /data — history.json, anything written by the service
+  model-cache:    # HuggingFace + torch.hub model downloads
+  bot-cache:      # bot's transcript cache
 
 networks:
   default:
