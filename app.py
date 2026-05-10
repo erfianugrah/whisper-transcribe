@@ -2369,6 +2369,41 @@ CLUSTER_SIMILARITY_THRESHOLD = float(
     os.environ.get("CLUSTER_SIMILARITY_THRESHOLD", "0.25")
 )
 
+# Duration-aware scene-count target. A 5-minute static music video and a
+# 3-hour podcast can't both target "10 scenes" — the music video deserves
+# 2-3, the podcast deserves 30+. Target scales with content length:
+#   ~1 scene per N seconds (SCENE_SECONDS_PER_TARGET, default 300 = 5min)
+#   bounded by SCENES_MIN (floor) and SCENES_MAX_ABSOLUTE (ceiling).
+#
+# Used as a SOFT cap: clusters within 1.5x target are left alone (content
+# was genuinely varied). Clusters above 1.5x are merged down to target
+# (likely paraphrased static-content micro-scenes that survived Jaccard).
+SCENE_SECONDS_PER_TARGET = float(
+    os.environ.get("SCENE_SECONDS_PER_TARGET", "300")
+)
+SCENES_MIN = int(os.environ.get("SCENES_MIN", "2"))
+SCENES_MAX_ABSOLUTE = int(os.environ.get("SCENES_MAX_ABSOLUTE", "60"))
+SCENES_CAP_TOLERANCE = float(os.environ.get("SCENES_CAP_TOLERANCE", "1.5"))
+
+
+def _target_scene_count(duration: float) -> int:
+    """Reasonable target scene count for a video of `duration` seconds.
+
+    Linear scaling at 1 scene per SCENE_SECONDS_PER_TARGET, clamped to
+    [SCENES_MIN, SCENES_MAX_ABSOLUTE]. Examples with defaults (300s,
+    min=2, ceiling=60):
+      30s    → 2  (floor)
+      5min   → 2  (floor; one scene per 5min == 1, clamped up)
+      15min  → 3
+      1hr    → 12
+      3hr    → 36
+      5hr+   → 60 (ceiling)
+    """
+    if duration <= 0:
+        return SCENES_MIN
+    raw = max(1, int(duration / SCENE_SECONDS_PER_TARGET))
+    return max(SCENES_MIN, min(raw, SCENES_MAX_ABSOLUTE))
+
 _VLM_STOPWORDS = frozenset({
     "the", "and", "for", "with", "that", "this", "are", "from", "have",
     "has", "was", "were", "been", "being", "into", "their", "they",
@@ -2492,6 +2527,45 @@ def _extract_frames_at_timestamps(
                 )
             log.warning(f"[VLM] frame extract failed at {ts}s: {stderr[:100]}")
     return out
+
+
+def _cap_scenes(clusters: list[list[dict]], duration: float) -> list[list[dict]]:
+    """Soft-cap cluster count using a duration-scaled target.
+
+    A 5-minute music video gets ~2-3 scenes; a 3-hour podcast gets
+    ~30+. The target comes from `_target_scene_count(duration)`.
+
+    Tolerance: clusters within `SCENES_CAP_TOLERANCE` × target are
+    left alone (content was genuinely varied — e.g. a trailer with
+    rapid cuts deserves its scenes). Above tolerance, greedy adjacent
+    merge until at target.
+
+    Preserves temporal order. Singletons / short scenes get absorbed
+    first.
+    """
+    target = _target_scene_count(duration)
+    if len(clusters) <= target * SCENES_CAP_TOLERANCE:
+        return clusters
+    result = [list(c) for c in clusters]
+    while len(result) > target:
+        # Find adjacent pair to merge: smallest combined size, then
+        # smallest combined time span. Singletons get absorbed first;
+        # short scenes get absorbed before long ones.
+        best_idx = 0
+        best_score = (
+            len(result[0]) + len(result[1]),
+            result[1][-1]["timestamp"] - result[0][0]["timestamp"],
+        )
+        for i in range(1, len(result) - 1):
+            size = len(result[i]) + len(result[i + 1])
+            span = result[i + 1][-1]["timestamp"] - result[i][0]["timestamp"]
+            score = (size, span)
+            if score < best_score:
+                best_score = score
+                best_idx = i
+        result[best_idx].extend(result[best_idx + 1])
+        del result[best_idx + 1]
+    return result
 
 
 def _cluster_descriptions(descriptions: list[dict],
@@ -2862,7 +2936,15 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
         clean = [d for d in descriptions
                  if d.get("text") and d["text"] != "[frame description unavailable]"]
         clusters = _cluster_descriptions(clean)
-        log.info(f"[VLM] clustered {len(clean)} frames → {len(clusters)} scenes")
+        pre_cap = len(clusters)
+        clusters = _cap_scenes(clusters, duration)
+        if len(clusters) != pre_cap:
+            log.info(f"[VLM] clustered {len(clean)} frames → {pre_cap} scenes "
+                     f"→ capped to {len(clusters)} "
+                     f"(target {_target_scene_count(duration)} "
+                     f"@ duration {duration:.0f}s)")
+        else:
+            log.info(f"[VLM] clustered {len(clean)} frames → {len(clusters)} scenes")
 
         # 5. Synthesize each cluster (parallel; cheap text-only LLM calls)
         scene_outputs: list[dict] = []

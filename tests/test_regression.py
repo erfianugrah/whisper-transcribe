@@ -990,6 +990,30 @@ def test_app_cluster_threshold_aggressive_default():
     )
 
 
+def test_app_scenes_cap_is_duration_aware():
+    """Scene cap must scale with duration — short videos get few scenes,
+    long videos get many. Not a fixed cap."""
+    assert "_target_scene_count" in APP_SRC
+    assert "SCENE_SECONDS_PER_TARGET" in APP_SRC
+    assert "SCENES_MIN" in APP_SRC
+    # No fixed flat cap masquerading as max
+    body = APP_SRC[APP_SRC.index("def _cap_scenes("):
+                    APP_SRC.index("def _cluster_descriptions(")]
+    # _cap_scenes uses duration, not a fixed number
+    assert "duration: float" in body
+    assert "_target_scene_count(duration)" in body
+
+
+def test_app_cap_scenes_has_tolerance():
+    """The cap is SOFT — content within tolerance of target is left alone
+    (a genuinely-varied trailer with rapid cuts deserves more scenes than
+    a static-shot music video of the same duration)."""
+    assert "SCENES_CAP_TOLERANCE" in APP_SRC
+    body = APP_SRC[APP_SRC.index("def _cap_scenes("):
+                    APP_SRC.index("def _cluster_descriptions(")]
+    assert "SCENES_CAP_TOLERANCE" in body
+
+
 def test_chunk_preamble_anchors_timestamps():
     """Map preamble must instruct the LLM to keep timestamps verbatim
     (otherwise chunked chapters could renormalize relative to chunk start)."""
