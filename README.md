@@ -4,7 +4,7 @@ GPU-accelerated transcription + Discord TL;DW bot. Four content flows:
 
 1. **Videos with speech** → whisperX (faster-whisper + wav2vec2 alignment + pyannote diarization) → LLM summary, plus a 4th *Community Reaction* embed pulling top YouTube comments
 2. **Videos without speech** (music videos, silent gameplay, ASMR) → frame extraction + VLM descriptions → LLM summary
-3. **Web articles** → Crawl4AI / FlareSolverr → LLM summary (triggered by replying `tldr` or `summarize` to a Discord message containing a URL). Reddit URLs get a structured fetch (post + linked article + top comments).
+3. **Web articles** → Crawl4AI / FlareSolverr → LLM summary (triggered by replying `tldr` or `summarize` to a Discord message containing a URL). Reddit + HackerNews URLs get a structured fetch (post + linked article + top comments).
 4. **AI litmus test** → regex stylistic scan + Wayback / AdSense / author-byline metadata + ambiguous-case LLM qualitative read → forensic signals report (no verdict). Triggered by replying `litmus` to a URL message.
 
 Gradio UI + HTTP API for the whisper service; Discord bot for hands-off summarisation.
@@ -69,7 +69,7 @@ llm-compose. Override anything you want in `.env`.
 ### Discord bot
 - **Auto-summarise videos** when their URL is posted (YouTube + 17 other platforms; URL-shape-aware so Reddit/Twitter text posts don't auto-trigger)
 - **YouTube comments** — top 100 fetched via yt-dlp, filtered (creator-hearted/pinned prioritised), summarised as a 4th "Community Reaction" embed
-- **`tldr` reply trigger** on web URLs → scrape + summarise (Reddit-aware: pulls linked article + OP body + top comments)
+- **`tldr` reply trigger** on web URLs → scrape + summarise. Reddit + HackerNews get structured fetches (linked article + OP body + top comments)
 - **`litmus` reply trigger** → AI-litmus forensic report (LLM-tic phrases, em-dash density, Wayback domain age, AdSense, author byline; LLM qualitative read on ambiguous middle range)
 - **Silent-video fallback** — VLM frame descriptions when speech density is low
 - **Slash commands**: `/summarize`, `/transcribe`, `/status`, `/find`, `/config`, `/serverconfig`
@@ -157,6 +157,10 @@ directly — same surface area.
 | `YT_COMMENTS_MAX` | `100` | Cap on comments yt-dlp pulls per video (top + replies) |
 | `YT_COMMENT_MIN_CHARS` | `40` | Drop comments shorter than this as noise (lol, first, emoji-only) |
 | `YT_COMMENT_SUMMARY_TOP_N` | `30` | After filter+rank, top-N comments fed to the LLM |
+| `REDDIT_TOP_COMMENTS` | `10` | Top-N Reddit comments to summarise per post |
+| `REDDIT_REPLY_DEPTH` | `1` | Reddit reply tree depth |
+| `HN_TOP_COMMENTS` | `10` | Top-N HackerNews comments to summarise per post |
+| `HN_REPLY_DEPTH` | `1` | HackerNews reply tree depth |
 | `LITMUS_SKIP_LLM_BELOW` | `2` | Litmus aggregate score below this skips the LLM qualitative read (clearly clean) |
 | `LITMUS_SKIP_LLM_ABOVE` | `8` | Above this skips the LLM (clearly LLM-style; signals already strong) |
 | `LITMUS_EXCERPT_CHARS` | `8000` | Hard cap on article excerpt sent to the litmus LLM call |

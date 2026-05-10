@@ -12,7 +12,7 @@ embeds.
 |---|---|
 | Paste any video URL in a watched channel | Transcribes + summarises automatically (3 embeds: brief, key points, chapters; 4th Community Reaction for YouTube). |
 | `<URL> describe what's on the slides` | Forces frame-level VLM enrichment + steers summary toward your ask. |
-| Reply `tldr` (or `summarize`) to a message containing a URL | **Web URL flow** — scrapes the article and posts brief + key points + sections. Works for any non-video URL. If the URL IS a video, falls through to the video pipeline. |
+| Reply `tldr` (or `summarize`) to a message containing a URL | **Web URL flow** — scrapes the article and posts brief + key points + sections. Works for any non-video URL. **Reddit + HackerNews** get a structured fetch (linked article + post + top comments). If the URL IS a video, falls through to the video pipeline. |
 | Reply `litmus` to a message containing a URL | **AI litmus test** — surfaces stylistic + metadata signals (LLM-tic phrases, em-dash density, hedge usage, generic buzzwords, listicle structure, domain age via Wayback, AdSense detection, author byline). Forensic report, no verdict. |
 | Reply `tldr litmus` (or any keyword combo) to a message | **Chained reply** — fires both flows in one go. Order in your reply preserves order of execution; duplicates dedupe; rate-limit charges per fired job. |
 | `/summarize url:<URL> prompt:<text>` | Slash equivalent of paste-with-text (cleaner UX, arg validation). |
@@ -182,7 +182,7 @@ Reply to a message containing any URL with **`litmus`** (or `litmus.` /
 
 What it does:
 1. Scrapes the article (same path as `tldr` — Crawl4AI / FlareSolverr,
-   Reddit-aware).
+   Reddit + HackerNews structured fetch).
 2. Runs a regex pre-pass over the text for stylistic markers — LLM-tic
    phrases (`delve into`, `tapestry of`, `navigate the landscape`, …),
    em-dash density (LLMs over-use them), hedge phrases (`it's worth

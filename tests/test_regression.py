@@ -1261,6 +1261,164 @@ def test_fetch_article_routes_reddit_url_first():
         "Reddit special-case must run before generic crawl4ai fallback"
 
 
+# ─── HackerNews scraper ──────────────────────────────────────────────────────
+
+
+def test_is_hn_post_url():
+    """Detects /item?id=<n> URLs from news.ycombinator.com."""
+    matches = [
+        "https://news.ycombinator.com/item?id=48082039",
+        "http://news.ycombinator.com/item?id=1",
+        "https://news.ycombinator.com/item?id=12345678&p=2",
+    ]
+    for url in matches:
+        assert bot._is_hn_post_url(url), f"should match: {url}"
+
+
+def test_is_hn_post_url_rejects():
+    rejects = [
+        "https://news.ycombinator.com/",
+        "https://news.ycombinator.com/newest",
+        "https://news.ycombinator.com/user?id=somebody",
+        "https://example.com/item?id=123",  # not HN host
+        "",
+    ]
+    for url in rejects:
+        assert not bot._is_hn_post_url(url), f"should NOT match: {url}"
+
+
+def test_format_hn_comment_basic():
+    c = {"by": "alice", "text": "<p>Hello world testing.</p>", "kids": []}
+    out = bot._format_hn_comment(c, depth=0)
+    assert "alice" in out
+    assert "Hello world testing." in out
+    # HTML stripped
+    assert "<p>" not in out
+
+
+def test_format_hn_comment_includes_replies():
+    c = {
+        "by": "a", "text": "parent comment text",
+        "kids": [
+            {"by": "b", "text": "child reply 1", "kids": []},
+            {"by": "c", "text": "child reply 2", "kids": []},
+        ],
+    }
+    out = bot._format_hn_comment(c, depth=0)
+    assert "parent comment text" in out
+    assert "child reply 1" in out
+    assert "child reply 2" in out
+    # Children are indented
+    assert "  - **b**:" in out
+
+
+def test_format_hn_comment_truncates_long_bodies():
+    long_body = "x" * 3000
+    c = {"by": "a", "text": long_body, "kids": []}
+    out = bot._format_hn_comment(c)
+    assert "x" * 2000 in out
+    assert "x" * 2001 not in out
+    assert "…" in out
+
+
+def test_build_hn_markdown_link_post():
+    """Link post (Show HN with URL) → Linked article + HN discussion + comments."""
+    post = {
+        "title": "Show HN: My new tool", "by": "submitter", "score": 200,
+        "descendants": 50, "url": "https://example.com/tool",
+        "type": "story", "kids": [],
+    }
+    article_md = "# My Tool\n\nIt does X with Y."
+    comments = [
+        {"by": "alice", "text": "Cool, I tried it", "kids": []},
+    ]
+    title, body = bot._build_hn_markdown(
+        post, comments, article_md, "https://example.com/tool", None,
+    )
+    assert title == "Show HN: My new tool"
+    assert "Linked article" in body
+    assert "example.com" in body
+    assert "My Tool" in body
+    assert "HackerNews discussion" in body
+    assert "submitter" in body
+    assert "200 pts, 50 comments" in body
+    assert "Top 1 comments" in body
+    assert "alice" in body
+
+
+def test_build_hn_markdown_ask_hn():
+    """Ask HN (no URL) → no Linked article section, but selftext present."""
+    post = {
+        "title": "Ask HN: Best stack for X?", "by": "asker", "score": 50,
+        "descendants": 10, "type": "ask",
+        "text": "<p>I'm building a new project and wondering...</p>",
+        "kids": [],
+    }
+    title, body = bot._build_hn_markdown(post, [], None, "", None)
+    assert "Linked article" not in body
+    assert "HackerNews discussion" in body
+    assert "Ask HN: Best stack for X?" in body
+    # HTML in selftext stripped
+    assert "<p>" not in body
+    assert "I'm building" in body
+
+
+def test_build_hn_markdown_link_post_with_article_error():
+    """Link post + article fetch failed → note in markdown, discussion still present."""
+    post = {
+        "title": "An article", "by": "submitter", "score": 10,
+        "descendants": 0, "url": "https://paywalled.example/article",
+        "type": "story", "kids": [],
+    }
+    title, body = bot._build_hn_markdown(
+        post, [], None, "https://paywalled.example/article",
+        "permanent: 403 Forbidden",
+    )
+    assert "Article unreachable" in body
+    assert "permanent: 403" in body
+    assert "HackerNews discussion" in body
+
+
+def test_fetch_article_routes_hn_url():
+    """fetch_article must check _is_hn_post_url and run HN before generic."""
+    import inspect
+    src = inspect.getsource(bot.fetch_article)
+    assert "_is_hn_post_url" in src
+    hn_pos = src.index("_is_hn_post_url")
+    crawl_pos = src.index("_fetch_via_crawl4ai")
+    assert hn_pos < crawl_pos, \
+        "HN special-case must run before generic crawl4ai fallback"
+
+
+def test_process_url_treats_hn_as_discussion():
+    """process_url's discussion detection must include HN URLs + body markers."""
+    import inspect
+    src = inspect.getsource(bot.process_url)
+    assert "_is_hn_post_url(job.url)" in src
+    assert "# HackerNews discussion" in src
+    # Discussion content uses the Reddit-flavoured prompts (renamed
+    # platform-neutral but file symbols stay PROMPT_*_REDDIT)
+    assert "PROMPT_BRIEF_REDDIT" in src
+
+
+def test_hn_constants_exist():
+    """HN config knobs exported."""
+    for name in ("HN_API_BASE", "HN_TOP_COMMENTS", "HN_REPLY_DEPTH",
+                 "HN_TIMEOUT", "_is_hn_post_url", "_fetch_hn_item",
+                 "_format_hn_comment", "_build_hn_markdown", "_fetch_hn"):
+        assert hasattr(bot, name), f"missing: {name}"
+
+
+def test_discussion_prompts_platform_agnostic():
+    """Prompts read for both Reddit AND HN — language is generic."""
+    for tmpl in (p.PROMPT_BRIEF_REDDIT, p.PROMPT_KEY_POINTS_REDDIT,
+                 p.PROMPT_SECTIONS_REDDIT):
+        # Generic phrasing
+        assert "discussion thread" in tmpl
+        # Should NOT say "the Reddit community" exclusively
+        assert "the Reddit community" not in tmpl
+
+
 # ─── Reddit-flavoured prompts ────────────────────────────────────────────────
 
 

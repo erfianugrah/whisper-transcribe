@@ -1506,12 +1506,226 @@ async def _fetch_reddit(url: str) -> tuple[str, str]:
     return title, body
 
 
+# ─── HackerNews-specific scraper ──────────────────────────────────────────────
+# Same shape as Reddit: structured fetch (post + linked article + comments)
+# via the public Firebase-backed API. Anonymous, no auth, no rate-limits worth
+# worrying about. Uses the same Reddit-style prompts in process_url since the
+# composed Markdown looks the same.
+
+_HN_POST_RE = re.compile(
+    r"https?://news\.ycombinator\.com/item\?id=(\d+)",
+    re.IGNORECASE,
+)
+HN_API_BASE = "https://hacker-news.firebaseio.com/v0"
+HN_TOP_COMMENTS = int(os.environ.get("HN_TOP_COMMENTS", "10"))
+HN_REPLY_DEPTH = int(os.environ.get("HN_REPLY_DEPTH", "1"))
+HN_TIMEOUT = int(os.environ.get("HN_TIMEOUT", "20"))
+
+
+def _is_hn_post_url(url: str) -> bool:
+    """True iff url is an HN /item?id=<n> URL."""
+    return bool(_HN_POST_RE.search(url or ""))
+
+
+async def _fetch_hn_item(item_id: int | str) -> dict | None:
+    """Fetch one HN item via the Firebase API. None on failure."""
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+    url = f"{HN_API_BASE}/item/{item_id}.json"
+    try:
+        async with http.get(
+            url, timeout=aiohttp.ClientTimeout(total=HN_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except (asyncio.TimeoutError, aiohttp.ClientError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+async def _fetch_hn_comments(kid_ids: list,
+                             max_count: int,
+                             max_depth: int,
+                             current_depth: int = 0) -> list[dict]:
+    """Recursively fetch HN comments up to max_depth + max_count.
+
+    HN returns kids in posting order; we don't have per-comment scores
+    (HN's API doesn't expose them) so we keep posting order for top-level
+    threads and trust HN's ranking.
+    """
+    if not kid_ids or current_depth > max_depth:
+        return []
+    # Cap how many siblings we even fetch at this level
+    ids = kid_ids[:max_count]
+    items = await asyncio.gather(*(_fetch_hn_item(k) for k in ids),
+                                 return_exceptions=False)
+    out: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # Skip dead / deleted comments
+        if item.get("dead") or item.get("deleted"):
+            continue
+        text = (item.get("text") or "").strip()
+        if not text:
+            continue
+        # Depth-1 children
+        children: list[dict] = []
+        if current_depth < max_depth and item.get("kids"):
+            # Fewer replies per comment than top-level cap
+            children = await _fetch_hn_comments(
+                item["kids"], max_count=5,
+                max_depth=max_depth, current_depth=current_depth + 1,
+            )
+        out.append({
+            "by": item.get("by") or "[deleted]",
+            "text": text,
+            "kids": children,
+        })
+    return out
+
+
+def _format_hn_comment(comment: dict, depth: int = 0) -> str:
+    """Render an HN comment + replies as Markdown bullets. HN comment
+    `text` is HTML (<p>, <i>, etc.) — strip to plain text.
+    """
+    body = _html_to_text(comment.get("text") or "")
+    if len(body) > 2000:
+        body = body[:2000] + "…"
+    indent = "  " * depth
+    lines = [f"{indent}- **{comment.get('by', '[deleted]')}**: {body}"]
+    for child in comment.get("kids", []):
+        rendered = _format_hn_comment(child, depth + 1)
+        if rendered:
+            lines.append(rendered)
+    return "\n".join(lines)
+
+
+def _build_hn_markdown(post: dict,
+                       comments: list[dict],
+                       article_md: str | None,
+                       article_url: str,
+                       article_error: str | None) -> tuple[str, str]:
+    """Compose HN post + linked article + comments into Markdown.
+
+    Mirrors `_build_reddit_markdown`'s shape so process_url's Reddit-aware
+    prompts work for HN content too (community discussion + linked article).
+    """
+    title = post.get("title") or "HackerNews post"
+    by = post.get("by") or "[deleted]"
+    score = post.get("score", 0)
+    descendants = post.get("descendants", 0)  # total comment count
+    selftext_html = post.get("text") or ""
+    selftext = _html_to_text(selftext_html) if selftext_html else ""
+    is_self = not article_url  # link posts have a non-self url
+
+    parts: list[str] = []
+
+    # Linked article section (Ask HN / Show HN with no URL skip this)
+    if article_url:
+        if article_md:
+            from urllib.parse import urlparse
+            host = urlparse(article_url).hostname or article_url
+            parts.append(f"# Linked article ({host})\n\n{article_md.strip()}")
+        elif article_error:
+            parts.append(
+                f"# Linked article: {article_url}\n\n"
+                f"*Article unreachable: {article_error}*"
+            )
+
+    # HN post section — use same heading shape as Reddit so the prompt's
+    # "Reddit discussion" instruction applies. The prompt is platform-
+    # agnostic about the discussion content; only the heading wording
+    # changes for clarity.
+    post_lines = [f"# HackerNews discussion (news.ycombinator.com)"]
+    post_lines.append(
+        f"**Submitted by {by}** ({score} pts, {descendants} comments): "
+        f"**{title}**"
+    )
+    if selftext:
+        post_lines.append("")
+        post_lines.append(selftext)
+    parts.append("\n".join(post_lines))
+
+    # Top comments
+    if comments:
+        comment_lines = [f"## Top {len(comments)} comments"]
+        for c in comments:
+            rendered = _format_hn_comment(c, depth=0)
+            if rendered:
+                comment_lines.append(rendered)
+                comment_lines.append("")
+        parts.append("\n".join(comment_lines).rstrip())
+
+    return title, "\n\n".join(parts)
+
+
+async def _fetch_hn(url: str) -> tuple[str, str]:
+    """HackerNews-specific path: post + linked article + top comments.
+
+    Raises RuntimeError on API failure so caller falls back to generic.
+    """
+    m = _HN_POST_RE.search(url)
+    if not m:
+        raise RuntimeError(f"Couldn't parse HN item id from {url}")
+    item_id = m.group(1)
+
+    post = await _fetch_hn_item(item_id)
+    if post is None:
+        raise RuntimeError(f"HN API returned nothing for item {item_id}")
+
+    if post.get("type") not in ("story", "ask", "show", "job"):
+        # Comment URL — fetch parent story instead
+        parent_id = post.get("parent")
+        if parent_id:
+            log.info("[hn] %s is a comment; fetching parent story %s",
+                     item_id, parent_id)
+            parent = await _fetch_hn_item(parent_id)
+            if parent:
+                post = parent
+
+    # Optional article fetch — `url` field present iff this is a link post
+    article_md: str | None = None
+    article_error: str | None = None
+    article_url = (post.get("url") or "").strip()
+    if article_url:
+        log.info("[hn] link post → fetching target: %s", article_url)
+        try:
+            article_md = await _fetch_via_crawl4ai(article_url)
+            if article_md is None:
+                article_md = await _fetch_via_flaresolverr(article_url)
+            if article_md is None:
+                article_error = "scraper returned empty / CF challenge"
+        except PermanentError as e:
+            article_error = f"permanent: {e}"[:200]
+        except Exception as e:
+            article_error = f"transient: {type(e).__name__}: {e}"[:200]
+        if article_md:
+            log.info("[hn] linked article scraped: %d chars", len(article_md))
+        else:
+            log.info("[hn] linked article unreachable: %s", article_error)
+
+    # Top-level comment ids (no per-comment score on HN; use HN's order)
+    kid_ids = post.get("kids") or []
+    comments = await _fetch_hn_comments(
+        kid_ids, max_count=HN_TOP_COMMENTS, max_depth=HN_REPLY_DEPTH,
+    )
+
+    title, body = _build_hn_markdown(
+        post, comments, article_md, article_url, article_error,
+    )
+    return title, body
+
+
 async def fetch_article(url: str) -> tuple[str, str]:
     """Scrape `url` and return (title, body_text).
 
     Routing:
       1. Reddit post URLs → JSON API + linked-article fetch + top comments.
-      2. Everything else → Crawl4AI; FlareSolverr on CF block / failure.
+      2. HackerNews post URLs → Firebase API + linked-article fetch +
+         top comments.
+      3. Everything else → Crawl4AI; FlareSolverr on CF block / failure.
 
     Raises PermanentError on 4xx (bad URL, scheme reject) — caller should NOT
     retry. Raises RuntimeError on total failure across both backends.
@@ -1526,6 +1740,14 @@ async def fetch_article(url: str) -> tuple[str, str]:
             # Fall through to generic Crawl4AI scrape so the user still gets
             # SOMETHING, even if it's just whatever readability extracts.
             log.warning("[scrape] reddit path failed (%s) — falling back to generic", e)
+
+    if _is_hn_post_url(url):
+        try:
+            title, body = await _fetch_hn(url)
+            log.info("[scrape] hn ok: %s (%d chars)", url, len(body))
+            return title, body[:SCRAPED_BODY_CHAR_CAP]
+        except RuntimeError as e:
+            log.warning("[scrape] hn path failed (%s) — falling back to generic", e)
 
     md = await _fetch_via_crawl4ai(url)
     if md is not None:
@@ -2226,18 +2448,20 @@ async def process_url(job: Job):
 
     # Reddit content has a multi-source structure (linked article + OP + top
     # comments) that the generic web prompts ignore — they treat the whole
-    # blob as one article and drop the comment discussion. Detect Reddit
-    # content (either by URL match or by structural markers in the body)
-    # and switch to Reddit-flavoured prompts that explicitly cover both the
-    # article AND community reaction.
-    is_reddit_content = (
+    # blob as one article and drop the comment discussion. Detect "discussion
+    # thread" content (Reddit OR HackerNews — both produce the same
+    # structural shape: linked article + post + top comments) and switch to
+    # discussion-aware prompts.
+    is_discussion_content = (
         _is_reddit_post_url(job.url)
+        or _is_hn_post_url(job.url)
         or "# Reddit discussion" in body
-        or "## Top " in body and " comments" in body
+        or "# HackerNews discussion" in body
+        or ("## Top " in body and " comments" in body)
     )
-    if is_reddit_content:
-        log.info("[%s] Reddit content detected — using Reddit-aware prompts",
-                 job.video_id)
+    if is_discussion_content:
+        log.info("[%s] Discussion-thread content detected — using "
+                 "discussion-aware prompts", job.video_id)
         prompt_brief = PROMPT_BRIEF_REDDIT
         prompt_key_points = PROMPT_KEY_POINTS_REDDIT
         prompt_sections = PROMPT_SECTIONS_REDDIT
