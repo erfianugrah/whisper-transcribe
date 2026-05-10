@@ -674,8 +674,13 @@ def _extract_user_prompt(message_content: str, urls: list[str]) -> str:
     pipeline takes its default automatic path.
     """
     text = message_content
-    for url in urls:
-        text = text.replace(url, " ")
+    # Strip any http(s):// URL whole — up to next whitespace. The `urls`
+    # list contains URLs as YT_PATTERN / VIDEO_URL_PATTERN matched them,
+    # which can stop short of the full URL (e.g. YT_PATTERN ends at the
+    # 11-char video ID, leaving query strings like `&pp=ygUJQXNt...` in
+    # the message). Without this whole-URL strip, those tails get treated
+    # as user prompts and pollute the VLM / summary prompts.
+    text = re.sub(r"https?://\S+", " ", text, flags=re.IGNORECASE)
     # Drop Discord mentions, channel refs, custom emoji shorthand
     text = re.sub(r"<[@#:][^>]+>", " ", text)
     # Collapse whitespace
@@ -2910,6 +2915,44 @@ def _chunk_transcript(transcript: str, max_chars: int) -> list[str]:
 _MIN_CHUNK_CHARS = 4000
 
 
+def _dedup_lines(text: str) -> str:
+    """Drop lines that exact-match a previously-seen line in the same output.
+
+    Local LLMs occasionally enter degenerate loops where they emit the
+    same sentence or bullet repeatedly (especially on repetitive input
+    like VLM-only transcripts of silent videos). Deterministic dedup is
+    a cheap safety net — strips clear duplicates so a looped output
+    doesn't blow out the Discord embed into 5 continuation cards.
+
+    Dedup key normalisation:
+      - Strip leading bullet markers (`- `, `* `, numbered lists)
+      - Strip surrounding whitespace
+      - Lowercase
+
+    Short lines (<20 chars after normalisation) and empty lines pass
+    through unchanged — they're typically section breaks, headers, or
+    timestamp markers that legitimately recur in some output shapes.
+    """
+    if not text:
+        return text
+    seen: set[str] = set()
+    out: list[str] = []
+    dropped = 0
+    for line in text.splitlines(keepends=False):
+        key = re.sub(r"^[\s\-\*\d.•]+", "", line.strip()).lower()
+        if not key or len(key) < 20:
+            out.append(line)
+            continue
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        out.append(line)
+    if dropped > 0:
+        log.info("Dedup: dropped %d duplicate lines from LLM output", dropped)
+    return "\n".join(out)
+
+
 def _is_context_overflow(exc: Exception) -> bool:
     """True if the exception looks like an LLM context-size overflow."""
     s = str(exc).lower()
@@ -2960,7 +3003,7 @@ async def summarize(
         # reduce_template handling.
         prompt = _preamble + prompt_template.format(transcript=chunks[0], **kwargs)
         try:
-            return await _llm_call(prompt, max_tokens)
+            return _dedup_lines(await _llm_call(prompt, max_tokens))
         except PermanentError as e:
             if not _is_context_overflow(e):
                 raise
@@ -3009,11 +3052,15 @@ async def summarize(
 
     if reduce_template is None:
         # Caller wants raw concatenation (e.g. chronological chapters).
-        return combined
+        # Dedup applies here too — chapters from neighbouring chunks
+        # sometimes generate the same heading at the boundary, and that
+        # dedups cleanly.
+        return _dedup_lines(combined)
 
     # Run the reduce step. If combined partials still exceed budget, recurse
     # — same machinery handles it. Critical: pass reduce_template through so
     # the deeper recursion still produces a coherent reduce, not concat.
+    # The recursive call's own return path is already deduped.
     return await summarize(
         combined, reduce_template, max_tokens,
         reduce_template=reduce_template if len(combined) > budget else None,

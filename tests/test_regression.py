@@ -633,6 +633,111 @@ def test_user_prompt_min_chars_constant():
     assert bot._extract_user_prompt("a https://youtu.be/x", ["https://youtu.be/x"]) == ""
 
 
+def test_user_prompt_strips_full_url_with_query_params():
+    """The bug: YT_PATTERN matches up to the 11-char video ID, leaving
+    query params like `&pp=ygUJQXNt` or `&list=RD...` in the message text
+    where `_extract_user_prompt` mistakes them for user steering.
+    """
+    # Real-world cases from production logs (ASMR + YOASOBI URLs)
+    cases = [
+        (
+            "https://m.youtube.com/watch?v=H8SNCx79M6o&pp=ygUJQXNtciB0aGFp",
+            ["https://m.youtube.com/watch?v=H8SNCx79M6o"],  # YT_PATTERN's truncated match
+        ),
+        (
+            "https://www.youtube.com/watch?v=u0wGWliC-I0&list=RDu0wGWliC-I0&start_radio=1&pp=oAcB",
+            ["https://www.youtube.com/watch?v=u0wGWliC-I0"],
+        ),
+    ]
+    for full_url, urls in cases:
+        prompt = bot._extract_user_prompt(full_url, urls)
+        assert prompt == "", (
+            f"URL query-param tail leaked as user prompt: {prompt!r} "
+            f"(full URL was {full_url!r})"
+        )
+
+
+def test_user_prompt_keeps_legit_steering_text():
+    """The fix must NOT strip legitimate user steering text alongside the URL."""
+    msg = "https://www.youtube.com/watch?v=abc123 describe what's on the slides"
+    prompt = bot._extract_user_prompt(msg, ["https://www.youtube.com/watch?v=abc123"])
+    assert "describe what's on the slides" in prompt
+
+
+# ─── LLM-loop dedup safety net ───────────────────────────────────────────────
+
+
+def test_dedup_drops_exact_duplicate_bullets():
+    """The exact case from the YOASOBI / ASMR jobs: same bullet repeated."""
+    looped = "\n".join([
+        "Overview: This is a music video.",
+        "- The video is a celebration of creativity in music.",
+        "- The video is a celebration of creativity in music.",
+        "- The video is a celebration of creativity in music.",
+        "- The video showcases YOASOBI's recorder performance.",
+        "- The video is a celebration of creativity in music.",
+    ])
+    out = bot._dedup_lines(looped)
+    lines = out.splitlines()
+    # The looping bullet appears exactly ONCE after dedup
+    assert sum(1 for l in lines if "celebration of creativity" in l) == 1
+    # The distinct bullet survives
+    assert any("YOASOBI's recorder" in l for l in lines)
+    # Overview survives
+    assert any("music video" in l for l in lines)
+
+
+def test_dedup_case_insensitive():
+    """`The video is X` and `THE VIDEO IS X` count as duplicates."""
+    text = "The video is a tribute to music.\nTHE VIDEO IS A TRIBUTE TO MUSIC."
+    out = bot._dedup_lines(text)
+    assert len(out.splitlines()) == 1
+
+
+def test_dedup_strips_bullet_markers_in_key():
+    """`- foo bar baz` and `* foo bar baz` should dedup against each other."""
+    text = "- this is a long enough line to count\n* this is a long enough line to count"
+    out = bot._dedup_lines(text)
+    assert len(out.splitlines()) == 1
+
+
+def test_dedup_preserves_short_section_markers():
+    """Lines <20 chars (timestamps, headers, separators) pass through
+    even if they recur — they're often legitimate structural markers."""
+    text = "**0:00**\nIntro section.\n**1:30**\nMain section.\n**0:00**"
+    out = bot._dedup_lines(text)
+    # The two `**0:00**` markers BOTH survive (each <20 chars after strip)
+    assert out.count("**0:00**") == 2
+
+
+def test_dedup_preserves_legitimate_distinct_content():
+    """A normal summary with no loops should pass through unchanged."""
+    text = "\n".join([
+        "Overview: A great article about technology.",
+        "- The author explains the new chip design from Apple.",
+        "- The chip achieves 30% better efficiency than predecessors.",
+        "- Industry analysts predict wide adoption by 2027.",
+        "- The article concludes with a comparison to NVIDIA's roadmap.",
+    ])
+    out = bot._dedup_lines(text)
+    assert out == text  # no dedup needed → unchanged
+
+
+def test_dedup_empty_input():
+    assert bot._dedup_lines("") == ""
+    assert bot._dedup_lines(None or "") == ""
+
+
+def test_dedup_wired_into_summarize_return_paths():
+    """summarize() must apply _dedup_lines on all return paths."""
+    import inspect
+    src = inspect.getsource(bot.summarize)
+    # Single-call return
+    assert "_dedup_lines(await _llm_call" in src
+    # Raw-concat return (chapters style)
+    assert "_dedup_lines(combined)" in src
+
+
 def test_chunk_preamble_anchors_timestamps():
     """Map preamble must instruct the LLM to keep timestamps verbatim
     (otherwise chunked chapters could renormalize relative to chunk start)."""
