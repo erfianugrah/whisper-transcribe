@@ -436,6 +436,82 @@ def set_channel_config(channel_id: int, **fields) -> dict:
     return entry
 
 
+# ─── Per-guild config (server-wide overrides) ────────────────────────────────
+
+
+# Same shape as channels.json but keyed by guild_id. Used for server-wide
+# settings that don't make sense at the channel level (e.g. a single
+# "summaries archive" channel for the whole server).
+GUILDS_CONFIG_PATH = CACHE_DIR / "guilds.json"
+_guilds_lock = threading.Lock()
+
+
+def _load_guilds_config() -> dict:
+    if not GUILDS_CONFIG_PATH.exists():
+        return {}
+    try:
+        return json_mod.loads(GUILDS_CONFIG_PATH.read_text())
+    except (OSError, json_mod.JSONDecodeError) as e:
+        log.warning("guilds.json read failed (%s) — treating as empty", e)
+        return {}
+
+
+def _save_guilds_config(cfg: dict) -> None:
+    with _guilds_lock:
+        try:
+            GUILDS_CONFIG_PATH.write_text(json_mod.dumps(cfg, indent=2, sort_keys=True))
+        except OSError as e:
+            log.error("guilds.json write failed: %s", e)
+
+
+def get_guild_config(guild_id: int) -> dict:
+    """Look up server-wide overrides. Returns {} if no entry."""
+    return _load_guilds_config().get(str(guild_id), {})
+
+
+def set_guild_config(guild_id: int, **fields) -> dict:
+    """Update a guild's config; returns the merged result. Pass field=None
+    to remove a key.
+    """
+    cfg = _load_guilds_config()
+    entry = dict(cfg.get(str(guild_id), {}))
+    for k, v in fields.items():
+        if v is None:
+            entry.pop(k, None)
+        else:
+            entry[k] = v
+    if entry:
+        cfg[str(guild_id)] = entry
+    else:
+        cfg.pop(str(guild_id), None)
+    _save_guilds_config(cfg)
+    return entry
+
+
+def resolve_summary_channel(job_channel: "discord.TextChannel") -> "discord.TextChannel":
+    """Pick the right channel for detail embeds (Key Points + Chapters).
+
+    Precedence (most specific → least):
+      1. Per-guild override (`guilds.json[<gid>].summary_channel`)
+      2. Global env (`SUMMARY_CHANNEL`)
+      3. Original channel where the request came in.
+    Falls back through if a configured channel is no longer reachable.
+    """
+    guild = getattr(job_channel, "guild", None)
+    if guild is not None:
+        guild_cfg = get_guild_config(guild.id)
+        sc_id = guild_cfg.get("summary_channel")
+        if sc_id:
+            ch = bot.get_channel(int(sc_id))
+            if ch is not None:
+                return ch
+    if SUMMARY_CHANNEL:
+        ch = bot.get_channel(SUMMARY_CHANNEL)
+        if ch is not None:
+            return ch
+    return job_channel
+
+
 # ─── Job-source helpers (message vs. interaction) ────────────────────────────
 # Jobs come from on_message reactions OR slash-command interactions. The
 # helpers below abstract over both so the worker doesn't need to care.
@@ -1007,10 +1083,7 @@ async def process(job: Job):
 
     # 5. Post results as embeds
     # Determine where detailed summaries go
-    detail_channel = job.channel
-    if SUMMARY_CHANNEL:
-        detail_channel = bot.get_channel(SUMMARY_CHANNEL) or job.channel
-
+    detail_channel = resolve_summary_channel(job.channel)
     use_split = detail_channel.id != job.channel.id
 
     # Post detailed summaries first (so we can link to them)
@@ -2230,6 +2303,85 @@ async def cmd_config(
     await interaction.response.send_message(txt, ephemeral=True)
     log.info("Channel %s config updated by %s: %s",
              interaction.channel.id, interaction.user, fields)
+
+
+@bot.tree.command(name="serverconfig", description="Configure server-wide bot defaults (admin)")
+@app_commands.describe(
+    summary_channel="Channel to receive Key Points + Chapters embeds for THIS server",
+    clear="Clear all server-wide overrides (revert to global defaults)",
+    show="Print current server config without changing anything",
+)
+async def cmd_serverconfig(
+    interaction: discord.Interaction,
+    summary_channel: discord.TextChannel | None = None,
+    clear: bool = False,
+    show: bool = False,
+) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "❌ This command must be used in a server, not a DM.",
+            ephemeral=True,
+        )
+        return
+    # Server-level permission gate. interaction.user inside a guild is a
+    # discord.Member; .guild_permissions reflects the user's effective
+    # role-based permissions.
+    perms = getattr(interaction.user, "guild_permissions", None)
+    if perms is None or not perms.manage_guild:
+        await interaction.response.send_message(
+            "❌ This command requires the **Manage Server** permission.",
+            ephemeral=True,
+        )
+        return
+
+    if show or (summary_channel is None and not clear):
+        cfg = get_guild_config(interaction.guild_id)
+        if not cfg:
+            txt = "No server-wide overrides — using global defaults."
+        else:
+            lines = ["Current server config:"]
+            for k, v in cfg.items():
+                if k.endswith("_channel"):
+                    lines.append(f"  **{k}**: <#{v}>")
+                else:
+                    lines.append(f"  **{k}**: `{v}`")
+            txt = "\n".join(lines)
+        await interaction.response.send_message(txt, ephemeral=True)
+        return
+
+    if clear:
+        # Wipe every key by passing None for known fields.
+        set_guild_config(interaction.guild_id, summary_channel=None)
+        await interaction.response.send_message(
+            "Server config cleared — using global defaults.", ephemeral=True
+        )
+        log.info("Guild %s config cleared by %s",
+                 interaction.guild_id, interaction.user)
+        return
+
+    # summary_channel is set — validate and save
+    if summary_channel.guild.id != interaction.guild_id:
+        await interaction.response.send_message(
+            "❌ Summary channel must be in this server.", ephemeral=True
+        )
+        return
+    me = summary_channel.guild.me
+    chan_perms = summary_channel.permissions_for(me)
+    if not (chan_perms.send_messages and chan_perms.embed_links):
+        await interaction.response.send_message(
+            f"❌ I don't have **Send Messages** + **Embed Links** in "
+            f"<#{summary_channel.id}>. Grant me access there first, then "
+            f"re-run this command.",
+            ephemeral=True,
+        )
+        return
+    set_guild_config(interaction.guild_id, summary_channel=summary_channel.id)
+    await interaction.response.send_message(
+        f"Updated: detail embeds will now post to <#{summary_channel.id}>.",
+        ephemeral=True,
+    )
+    log.info("Guild %s config updated by %s: summary_channel=%s",
+             interaction.guild_id, interaction.user, summary_channel.id)
 
 
 # Sync commands on startup. Called once after the worker is up.

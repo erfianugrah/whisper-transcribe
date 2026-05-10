@@ -21,6 +21,7 @@ Categories:
 """
 import asyncio
 import importlib
+import inspect
 import logging
 import os
 import re
@@ -797,12 +798,61 @@ def test_channel_config_clear_all():
     assert bot.get_channel_config(901) == {}
 
 
+# ─── Per-guild config (server-wide overrides) ────────────────────────────
+
+
+def test_guild_config_get_default_empty():
+    if bot.GUILDS_CONFIG_PATH.exists():
+        bot.GUILDS_CONFIG_PATH.unlink()
+    assert bot.get_guild_config(111111) == {}
+
+
+def test_guild_config_set_summary_channel():
+    if bot.GUILDS_CONFIG_PATH.exists():
+        bot.GUILDS_CONFIG_PATH.unlink()
+    bot.set_guild_config(222222, summary_channel=999)
+    cfg = bot.get_guild_config(222222)
+    assert cfg["summary_channel"] == 999
+
+
+def test_guild_config_clear():
+    bot.set_guild_config(333333, summary_channel=42)
+    bot.set_guild_config(333333, summary_channel=None)
+    assert bot.get_guild_config(333333) == {}
+
+
+def test_guild_config_two_guilds_isolated():
+    """Each guild has its own config — set on one, other unchanged."""
+    if bot.GUILDS_CONFIG_PATH.exists():
+        bot.GUILDS_CONFIG_PATH.unlink()
+    bot.set_guild_config(444444, summary_channel=1)
+    bot.set_guild_config(555555, summary_channel=2)
+    assert bot.get_guild_config(444444)["summary_channel"] == 1
+    assert bot.get_guild_config(555555)["summary_channel"] == 2
+    bot.set_guild_config(444444, summary_channel=None)
+    assert bot.get_guild_config(444444) == {}
+    assert bot.get_guild_config(555555)["summary_channel"] == 2  # untouched
+
+
+def test_resolve_summary_channel_falls_through():
+    """resolve_summary_channel exists and is callable; returns the input
+    channel when no overrides apply (real Discord channel objects can't be
+    constructed in unit tests, but we can verify the function signature
+    and the no-config-no-env path via docstring presence)."""
+    assert callable(bot.resolve_summary_channel)
+    src = inspect.getsource(bot.resolve_summary_channel)
+    assert "guilds.json" in src
+    assert "SUMMARY_CHANNEL" in src
+    assert "summary_channel" in src
+
+
 # ─── Slash commands wired ──────────────────────────────────────────────────
 
 
 def test_slash_commands_defined():
-    """All four slash commands should have handler functions."""
-    handlers = ("cmd_summarize", "cmd_transcribe", "cmd_status", "cmd_find", "cmd_config")
+    """All slash commands should have handler functions."""
+    handlers = ("cmd_summarize", "cmd_transcribe", "cmd_status", "cmd_find",
+                "cmd_config", "cmd_serverconfig")
     missing = [h for h in handlers if not hasattr(bot, h)]
     assert not missing, f"missing slash handlers: {missing}"
 

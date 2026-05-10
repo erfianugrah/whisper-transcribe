@@ -16,6 +16,8 @@ embeds.
 | `/transcribe url:<URL> diarize:true` | Adds speaker labels. Embed grows a 🏷️ Rename speakers button. |
 | `/find query:<keywords>` | Searches your past transcripts for matching content. |
 | `/status` | Shows queue depth, your rate-limit usage, whisper service health. |
+| `/config …` | Per-channel: model / VLM / diarize defaults (needs Manage Channel). |
+| `/serverconfig …` | Per-server: where Key Points + Chapters land (needs Manage Server). |
 
 ---
 
@@ -163,6 +165,40 @@ To clear an individual setting:
 
 ```
 /config model:                           # empty value clears the override
+```
+
+## Server-wide config
+
+Some settings only make sense at the server level — most importantly,
+where the detailed Key Points + Chapters embeds should land.
+
+```
+/serverconfig summary_channel:#bot-summaries   # detail embeds go here
+/serverconfig show:true                          # print current server config
+/serverconfig clear:true                         # revert to global defaults
+```
+
+`/serverconfig` requires the **Manage Server** permission. Settings
+persist across bot restarts (stored in `bot-cache/guilds.json`).
+
+When set, the bot keeps the brief TL;DW embed in the originating channel
+(with a "Full breakdown →" jump link) but posts Key Points and Chapters
+to the chosen summary channel. The bot must have **Send Messages** +
+**Embed Links** in that channel — `/serverconfig` checks before saving.
+
+**Precedence** (most specific wins):
+
+1. Per-guild `/serverconfig summary_channel` — server-wide.
+2. Global `SUMMARY_CHANNEL` env var — every server uses the same channel.
+3. None — Key Points / Chapters post in the same channel as the brief.
+
+Multi-server example: each server has its own summaries archive without
+leaking detail embeds across servers.
+
+```
+Server A:  /serverconfig summary_channel:#archive-A
+Server B:  /serverconfig summary_channel:#archive-B
+Server C:  (no command run — keeps everything in-channel)
 ```
 
 ---
