@@ -9,6 +9,7 @@ Posts three embeds per video:
 """
 
 import asyncio
+import threading
 import html as html_mod
 import json as json_mod
 import logging
@@ -71,12 +72,49 @@ _load_env_file(Path(__file__).parent / ".env")
 
 import aiohttp
 import discord
+from discord import app_commands
 from discord.ext import commands
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-)
+class _JsonFormatter(logging.Formatter):
+    """Single-line JSON per log record. Easy to grep, ship, or feed to a
+    real log aggregator later. Adds any `extra=` fields verbatim."""
+
+    _RESERVED = {
+        "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+        "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+        "created", "msecs", "relativeCreated", "thread", "threadName",
+        "processName", "process", "message", "asctime", "taskName",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json as _json
+        from datetime import datetime, timezone
+        payload = {
+            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc"] = self.formatException(record.exc_info)
+        for k, v in record.__dict__.items():
+            if k not in self._RESERVED and not k.startswith("_"):
+                payload[k] = v
+        return _json.dumps(payload, default=str, ensure_ascii=False)
+
+
+_LOG_JSON = os.environ.get("LOG_JSON", "0").strip().lower() in {"1", "true", "yes", "on"}
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+_root = logging.getLogger()
+_root.setLevel(_LOG_LEVEL)
+_handler = logging.StreamHandler()
+if _LOG_JSON:
+    _handler.setFormatter(_JsonFormatter())
+else:
+    _handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+    ))
+_root.handlers = [_handler]
 log = logging.getLogger("tldw")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -265,17 +303,16 @@ from prompts import (
 class Job:
     url: str
     video_id: str
-    message: discord.Message
-    channel: discord.TextChannel
-    # Optional user-supplied steering text from the Discord message. When
-    # present (non-empty), the bot:
-    #   1. Forces VLM enrichment regardless of speech density (the user
-    #      explicitly cares about visual content or wants targeted attention).
-    #   2. Passes the text as the per-frame prompt to /api/describe so the
-    #      VLM looks for what the user asked about.
-    #   3. Steers the summary LLM toward the user's request via a
-    #      "User asked:" block prepended to each summary prompt.
-    user_prompt: str = ""
+    channel: discord.TextChannel       # always present (where embeds post)
+    submitter_id: int                  # Discord user.id of the requester
+    submitter_name: str = ""           # for log lines / mentions
+    user_prompt: str = ""              # steering text (see process())
+    diarize: bool = False              # opt-in via /transcribe; default off
+    model_override: str | None = None  # per-channel config can override LLM_MODEL
+    # Source of the request. Exactly one of these is set; helpers in the
+    # `_ack_*` family branch on which is non-None.
+    message: discord.Message | None = None     # set when on_message-triggered
+    interaction: discord.Interaction | None = None  # set when slash-triggered
 
 
 # Maximum length of user-prompt text we'll honour (truncated above this).
@@ -283,6 +320,163 @@ class Job:
 # both VLM and summary calls. Picked to fit comfortably alongside the
 # transcript content within LLM_INPUT_CHAR_BUDGET.
 USER_PROMPT_MAX_CHARS = int(os.environ.get("USER_PROMPT_MAX_CHARS", "1500"))
+
+
+# ─── Rate limiting ────────────────────────────────────────────────────────────
+
+
+# Per-user sliding-window rate limit. Stored in-memory only — bot restart
+# resets counters. Acceptable because (a) the queue capacity already bounds
+# concurrent abuse, (b) restart-flooding is a different attack model that
+# would need persistent storage to defend against.
+MAX_JOBS_PER_USER_PER_HOUR = int(os.environ.get("MAX_JOBS_PER_USER_PER_HOUR", "5"))
+MAX_QUEUE_SIZE = int(os.environ.get("MAX_QUEUE_SIZE", "20"))
+# Discord user IDs (CSV) that bypass the per-user rate limit. Empty by default.
+RATE_LIMIT_BYPASS_USERS = {
+    int(x.strip()) for x in os.environ.get("RATE_LIMIT_BYPASS_USERS", "").split(",")
+    if x.strip().isdigit()
+}
+
+from collections import deque, defaultdict
+
+# Sliding-window store: deque per user. Single-threaded asyncio worker
+# accesses these; no lock needed (cooperative scheduling, no preemption).
+_user_jobs: dict[int, deque[float]] = defaultdict(deque)
+
+
+def _rate_limit_check(user_id: int) -> tuple[bool, str]:
+    """Returns (allowed, reason). `allowed=False` rejects with `reason`.
+
+    Two checks:
+      1. Total queue cap (independent of user) — protects against
+         collective overload.
+      2. Per-user sliding window (60 min) — protects against single-user
+         spam.
+    Bypass list (RATE_LIMIT_BYPASS_USERS) skips the per-user check but
+    still enforces the queue cap (so admins can't crash the bot either).
+    """
+    if queue.qsize() >= MAX_QUEUE_SIZE:
+        return False, (
+            f"Queue is full ({queue.qsize()}/{MAX_QUEUE_SIZE} jobs pending). "
+            f"Try again once existing jobs complete."
+        )
+    if user_id in RATE_LIMIT_BYPASS_USERS:
+        return True, ""
+    now = time.time()
+    cutoff = now - 3600
+    dq = _user_jobs[user_id]
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+    if len(dq) >= MAX_JOBS_PER_USER_PER_HOUR:
+        oldest_in_window = dq[0]
+        retry_in = int((oldest_in_window + 3600) - now)
+        mins = retry_in // 60
+        return False, (
+            f"Rate limit: {len(dq)}/{MAX_JOBS_PER_USER_PER_HOUR} jobs in the "
+            f"last hour. Try again in ~{mins} min."
+        )
+    return True, ""
+
+
+def _rate_limit_record(user_id: int) -> None:
+    """Record that a job was just queued for this user."""
+    _user_jobs[user_id].append(time.time())
+
+
+# ─── Per-channel config ───────────────────────────────────────────────────────
+
+
+# JSON config file kept in the bot-cache volume so it survives restarts.
+# Schema: {channel_id_str: {"model": str, "vlm_enabled": bool, "diarize": bool}}
+# Missing keys fall back to env defaults at job time.
+CHANNELS_CONFIG_PATH = CACHE_DIR / "channels.json"
+_channels_lock = threading.Lock()
+
+
+def _load_channels_config() -> dict:
+    """Read channels.json. Returns {} on missing/malformed file."""
+    if not CHANNELS_CONFIG_PATH.exists():
+        return {}
+    try:
+        return json_mod.loads(CHANNELS_CONFIG_PATH.read_text())
+    except (OSError, json_mod.JSONDecodeError) as e:
+        log.warning("channels.json read failed (%s) — treating as empty", e)
+        return {}
+
+
+def _save_channels_config(cfg: dict) -> None:
+    with _channels_lock:
+        try:
+            CHANNELS_CONFIG_PATH.write_text(json_mod.dumps(cfg, indent=2, sort_keys=True))
+        except OSError as e:
+            log.error("channels.json write failed: %s", e)
+
+
+def get_channel_config(channel_id: int) -> dict:
+    """Look up a channel's overrides. Returns {} if no entry."""
+    return _load_channels_config().get(str(channel_id), {})
+
+
+def set_channel_config(channel_id: int, **fields) -> dict:
+    """Update a channel's config; returns the merged result. Pass
+    `field=None` to remove a key, or omit to leave unchanged.
+    """
+    cfg = _load_channels_config()
+    entry = dict(cfg.get(str(channel_id), {}))
+    for k, v in fields.items():
+        if v is None:
+            entry.pop(k, None)
+        else:
+            entry[k] = v
+    if entry:
+        cfg[str(channel_id)] = entry
+    else:
+        cfg.pop(str(channel_id), None)
+    _save_channels_config(cfg)
+    return entry
+
+
+# ─── Job-source helpers (message vs. interaction) ────────────────────────────
+# Jobs come from on_message reactions OR slash-command interactions. The
+# helpers below abstract over both so the worker doesn't need to care.
+
+
+async def _ack_queued(job: Job, position: int) -> None:
+    """Acknowledge that a job has been queued."""
+    if job.message is not None:
+        await safe_react(job.message, "\u23f3")  # ⏳
+    elif job.interaction is not None:
+        try:
+            await job.interaction.followup.send(
+                f"Queued `{job.video_id}` (position {position} in queue).",
+                ephemeral=False,
+            )
+        except discord.HTTPException as e:
+            log.warning("Failed to send queue ack: %s", e)
+
+
+async def _job_react(job: Job, emoji: str) -> None:
+    if job.message is not None:
+        await safe_react(job.message, emoji)
+
+
+async def _job_remove_react(job: Job, emoji: str) -> None:
+    if job.message is not None:
+        await safe_remove_react(job.message, emoji)
+
+
+async def _job_reply(job: Job, text: str) -> None:
+    """Send a textual reply for failure / status messages."""
+    if job.message is not None:
+        try:
+            await job.channel.send(text, reference=job.message)
+        except discord.HTTPException as e:
+            log.warning("reply failed: %s", e)
+    elif job.interaction is not None:
+        try:
+            await job.interaction.followup.send(text)
+        except discord.HTTPException as e:
+            log.warning("interaction reply failed: %s", e)
 
 
 def _extract_user_prompt(message_content: str, urls: list[str]) -> str:
@@ -320,6 +514,12 @@ async def on_ready():
     http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=900))
     bot.loop.create_task(worker())
     bot.loop.create_task(cache_cleanup_loop())
+    try:
+        await _sync_slash_commands()
+    except Exception as e:
+        # Slash sync failure shouldn't prevent the legacy on_message
+        # path from working — log and continue.
+        log.error("Slash command sync failed: %s", e)
     log.info("Bot ready as %s — processing queue", bot.user)
 
 
@@ -349,9 +549,21 @@ async def on_message(message: discord.Message):
     seen = set()
     all_urls: list[str] = []  # for user-prompt extraction (strip URLs from text)
 
-    # YouTube URLs → extract video ID for timestamp linking. The pattern only
-    # captures the video id; rebuild the full URL for substitution out of the
-    # message text below.
+    # Per-channel config: model + diarize + vlm overrides
+    chan_cfg = get_channel_config(message.channel.id)
+
+    def _new_job(url, video_id):
+        return Job(
+            url=url, video_id=video_id,
+            channel=message.channel,
+            submitter_id=message.author.id,
+            submitter_name=str(message.author),
+            diarize=chan_cfg.get("diarize", False),
+            model_override=chan_cfg.get("model"),
+            message=message,
+        )
+
+    # YouTube URLs → extract video ID for timestamp linking.
     for m in YT_PATTERN.finditer(message.content):
         all_urls.append(m.group(0))
         video_id = m.group(1)
@@ -359,8 +571,7 @@ async def on_message(message: discord.Message):
             continue
         seen.add(video_id)
         url = f"https://www.youtube.com/watch?v={video_id}"
-        jobs_to_queue.append(Job(url=url, video_id=video_id, message=message,
-                                 channel=message.channel))
+        jobs_to_queue.append(_new_job(url, video_id))
 
     # Other video platform URLs
     for url_match in VIDEO_URL_PATTERN.finditer(message.content):
@@ -368,23 +579,18 @@ async def on_message(message: discord.Message):
         all_urls.append(url)
         if any(d in url for d in ("youtube.com", "youtu.be")):
             continue
-        # Use last non-empty path segment as ID for non-YouTube (filesystem-safe)
         path_parts = [p for p in url.rstrip("/").split("/")
                       if p and "." not in p and "//" not in p]
         vid = re.sub(r"[^\w-]", "", path_parts[-1])[:20] if path_parts else "unknown"
         if vid in seen:
             continue
         seen.add(vid)
-        jobs_to_queue.append(Job(url=url, video_id=vid, message=message,
-                                 channel=message.channel))
+        jobs_to_queue.append(_new_job(url, vid))
 
     if not jobs_to_queue:
         await bot.process_commands(message)
         return
 
-    # User-prompt: any non-trivial text remaining after stripping URLs.
-    # Applied to ALL jobs in this message (one prompt per message; if the
-    # user posts multiple URLs with steering, each gets the same instruction).
     user_prompt = _extract_user_prompt(message.content, all_urls)
     if user_prompt:
         for job in jobs_to_queue:
@@ -392,10 +598,26 @@ async def on_message(message: discord.Message):
         log.info("User prompt detected (%d chars): %s",
                  len(user_prompt), user_prompt[:80])
 
+    # Rate-limit check happens per-message — refuse the whole batch if
+    # the user has hit the cap, even if they posted multiple URLs at once.
+    ok, reason = _rate_limit_check(message.author.id)
+    if not ok:
+        await safe_react(message, "\U0001f6ab")  # 🚫
+        try:
+            await message.channel.send(
+                f"❌ {message.author.mention} {reason}",
+                reference=message, mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+
     for job in jobs_to_queue:
+        _rate_limit_record(job.submitter_id)
         await queue.put(job)
-        await message.add_reaction("\u23f3")  # ⏳
-        log.info("Queued %s from %s", job.video_id, message.author)
+        await _ack_queued(job, queue.qsize())
+        log.info("Queued %s from %s (channel=%s)",
+                 job.video_id, job.submitter_name, message.channel.id)
 
 
 # ─── Worker ───────────────────────────────────────────────────────────────────
@@ -496,14 +718,13 @@ async def worker():
             attempts = "permanent error" if isinstance(last_error, PermanentError) \
                 else f"after {MAX_RETRIES + 1} attempts"
             log.error("[%s] Giving up — %s", job.video_id, attempts)
-            # Clean any in-progress reactions before marking failed
             for emoji in PROCESSING_EMOJI:
-                await safe_remove_react(job.message, emoji)
-            await safe_react(job.message, "\u274c")  # ❌
-            await job.channel.send(
+                await _job_remove_react(job, emoji)
+            await _job_react(job, "\u274c")  # ❌
+            await _job_reply(
+                job,
                 f"Failed to process `{job.video_id}` ({attempts}): "
                 f"{type(last_error).__name__}: {last_error}",
-                reference=job.message,
             )
         queue.task_done()
 
@@ -581,7 +802,7 @@ async def process(job: Job):
                      job.video_id, len(initial_prompt), initial_prompt[:80])
 
         log.info("[%s] Transcribing '%s' (%ds)...", job.video_id, title, duration)
-        await safe_react(job.message, "\U0001f3a7")  # 🎧
+        await _job_react(job, "\U0001f3a7")  # 🎧
 
         transcribe_payload = {
             "file_path": file_path,
@@ -589,6 +810,7 @@ async def process(job: Job):
             # Don't cleanup yet — VLM fallback (below) may need the file.
             "cleanup": False,
             "return_file": False,  # bot uses transcript text directly
+            "diarize": job.diarize,
         }
         if initial_prompt:
             transcribe_payload["initial_prompt"] = initial_prompt
@@ -703,7 +925,7 @@ async def process(job: Job):
 
     # 5. Summarize in multiple styles (concurrent — model handles full context)
     log.info("[%s] Summarizing (%d chars)...", job.video_id, len(transcript))
-    await safe_react(job.message, "\U0001f9e0")  # 🧠
+    await _job_react(job, "\U0001f9e0")  # 🧠
 
     # Build reference block for summary prompts (terminology/spelling ONLY).
     # Wrapped in <reference>...</reference> so the LLM clearly sees this as
@@ -742,25 +964,33 @@ async def process(job: Job):
     duration_str = format_duration(duration)
     tail_start = format_duration(int(duration * (1 - CHAPTER_TAIL_FRACTION)))
 
-    brief, key_points, chapters_raw = await asyncio.gather(
-        summarize(
-            transcript, PROMPT_BRIEF, LLM_MAX_TOKENS_BRIEF,
-            reduce_template=REDUCE_BRIEF,
-            title=title, duration=duration_str, reference_block=ref_block,
-        ),
-        summarize(
-            transcript, PROMPT_KEY_POINTS, LLM_MAX_TOKENS_KEY_POINTS,
-            reduce_template=REDUCE_KEY_POINTS,
-            title=title, duration=duration_str, reference_block=ref_block,
-            char_cap=SUMMARY_CHAR_CAP,
-        ),
-        summarize(
-            transcript, PROMPT_CHAPTERS, LLM_MAX_TOKENS_CHAPTERS,
-            reduce_template=None,  # chapters are time-ordered; concat preserves chronology
-            title=title, duration=duration_str, reference_block=ref_block,
-            tail_start=tail_start, char_cap=SUMMARY_CHAR_CAP,
-        ),
-    )
+    # Apply per-channel model override for the duration of this job's
+    # summarize calls. ContextVar isolates per-task so concurrent jobs
+    # don't trample each other.
+    _token = _model_override.set(job.model_override) if job.model_override else None
+    try:
+        brief, key_points, chapters_raw = await asyncio.gather(
+            summarize(
+                transcript, PROMPT_BRIEF, LLM_MAX_TOKENS_BRIEF,
+                reduce_template=REDUCE_BRIEF,
+                title=title, duration=duration_str, reference_block=ref_block,
+            ),
+            summarize(
+                transcript, PROMPT_KEY_POINTS, LLM_MAX_TOKENS_KEY_POINTS,
+                reduce_template=REDUCE_KEY_POINTS,
+                title=title, duration=duration_str, reference_block=ref_block,
+                char_cap=SUMMARY_CHAR_CAP,
+            ),
+            summarize(
+                transcript, PROMPT_CHAPTERS, LLM_MAX_TOKENS_CHAPTERS,
+                reduce_template=None,  # chapters are time-ordered; concat preserves chronology
+                title=title, duration=duration_str, reference_block=ref_block,
+                tail_start=tail_start, char_cap=SUMMARY_CHAR_CAP,
+            ),
+        )
+    finally:
+        if _token is not None:
+            _model_override.reset(_token)
     # Sanitize LLM output before any further processing — strips
     # untrusted links injected via prompt injection. linkify_timestamps
     # adds youtube.com links AFTER sanitisation, which is fine because
@@ -786,10 +1016,17 @@ async def process(job: Job):
     # Post detailed summaries first (so we can link to them)
     detail_msg = None
     if use_split:
+        # Build the "Requested by …" line; works for both message + slash sources
+        if job.message is not None:
+            requester = job.message.author.mention
+        elif job.interaction is not None:
+            requester = job.interaction.user.mention
+        else:
+            requester = f"<@{job.submitter_id}>"
         header = discord.Embed(
             title=f"{truncate(title, 240)}",
             url=job.url,
-            description=f"Requested by {job.message.author.mention} in <#{job.channel.id}>",
+            description=f"Requested by {requester} in <#{job.channel.id}>",
             color=0xFF0000,
         )
         header.set_footer(text=format_duration(duration))
@@ -807,8 +1044,6 @@ async def process(job: Job):
     )
     embed.set_footer(text=f"{format_duration(duration)} | {status}")
 
-    # Show the user's steering request so the requester can see it was honoured
-    # and others in the channel understand why the summary leans a certain way.
     if job.user_prompt:
         embed.add_field(
             name="User request",
@@ -817,21 +1052,36 @@ async def process(job: Job):
         )
 
     if use_split and detail_msg:
-        jump_url = detail_msg.jump_url
         embed.add_field(
             name="",
-            value=f"[Full breakdown →]({jump_url})",
+            value=f"[Full breakdown →]({detail_msg.jump_url})",
             inline=False,
         )
 
-    await job.channel.send(embed=embed, reference=job.message)
+    # Attach a "Rename speakers" button when diarization labels are present.
+    view = None
+    if job.diarize and _has_speaker_labels(transcript):
+        view = SpeakerRenameView(job_video_id=job.video_id, channel_id=job.channel.id)
 
-    # Clean up reactions
+    if job.message is not None:
+        await job.channel.send(embed=embed, reference=job.message, view=view)
+    else:
+        await job.channel.send(embed=embed, view=view)
+
     for emoji in PROCESSING_EMOJI:
-        await safe_remove_react(job.message, emoji)
-    await safe_react(job.message, "\u2705")  # ✅
+        await _job_remove_react(job, emoji)
+    await _job_react(job, "\u2705")  # ✅
 
     log.info("[%s] Done — posted 3 embeds", job.video_id)
+
+
+# Per-task model override (set by process() per Job). Reads at _llm_call
+# time via .get(). ContextVar lets us override without threading a `model`
+# kwarg through every recursive summarize() call.
+import contextvars
+_model_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_model_override", default=None,
+)
 
 
 async def _llm_call(prompt: str, max_tokens: int) -> str:
@@ -842,7 +1092,7 @@ async def _llm_call(prompt: str, max_tokens: int) -> str:
     """
     assert http
     payload = {
-        "model": LLM_MODEL,
+        "model": _model_override.get() or LLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": LLM_TEMPERATURE,
         "max_tokens": max_tokens,
@@ -1611,6 +1861,389 @@ async def safe_remove_react(message: discord.Message, emoji: str):
         await message.remove_reaction(emoji, bot.user)
     except discord.HTTPException:
         pass
+
+
+# ─── Speaker rename UI (Button + Modal) ──────────────────────────────────────
+
+
+# Match `[SPEAKER_xx]` / `[F-SPEAKER_xx]` etc. labels in transcripts.
+_SPEAKER_TAG_RE = re.compile(r"\[([A-Z]?-?SPEAKER_\d{1,3})\]")
+
+
+def _has_speaker_labels(transcript: str) -> bool:
+    return bool(_SPEAKER_TAG_RE.search(transcript))
+
+
+def _extract_speaker_labels(transcript: str) -> list[str]:
+    """Return unique speaker tags in document order (max 5 — Modal cap)."""
+    seen: list[str] = []
+    for tag in _SPEAKER_TAG_RE.findall(transcript):
+        if tag not in seen:
+            seen.append(tag)
+        if len(seen) >= 5:  # Modal supports max 5 TextInputs
+            break
+    return seen
+
+
+class SpeakerRenameModal(discord.ui.Modal, title="Rename speakers"):
+    """Modal with one TextInput per speaker. Submitting kicks off a rerun."""
+
+    def __init__(self, video_id: str, channel_id: int, speakers: list[str]):
+        super().__init__(timeout=600)
+        self._video_id = video_id
+        self._channel_id = channel_id
+        self._speakers = speakers
+        self._inputs: list[discord.ui.TextInput] = []
+        for sp in speakers:
+            field = discord.ui.TextInput(
+                label=sp[:45],
+                placeholder=f"Real name for {sp}",
+                required=False,
+                max_length=64,
+            )
+            self.add_item(field)
+            self._inputs.append(field)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        renames = {
+            sp: inp.value.strip()
+            for sp, inp in zip(self._speakers, self._inputs)
+            if inp.value and inp.value.strip()
+        }
+        if not renames:
+            await interaction.response.send_message(
+                "No names entered — skipping rename.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await _apply_rename(interaction, self._video_id, self._channel_id, renames)
+        except Exception as e:
+            log.error("Rename apply failed: %s", e)
+            await interaction.followup.send(
+                f"Rename failed: {type(e).__name__}: {e}", ephemeral=True
+            )
+
+
+class SpeakerRenameView(discord.ui.View):
+    """Persistent View attached to a brief embed when diarize=True."""
+
+    def __init__(self, job_video_id: str, channel_id: int):
+        super().__init__(timeout=None)  # persistent until restart
+        self._video_id = job_video_id
+        self._channel_id = channel_id
+
+    @discord.ui.button(label="Rename speakers", style=discord.ButtonStyle.secondary, emoji="🏷️")
+    async def rename_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button,
+    ) -> None:
+        cached = read_cache(self._video_id)
+        if cached is None:
+            await interaction.response.send_message(
+                "Transcript no longer in cache — can't rename.", ephemeral=True
+            )
+            return
+        _, _, transcript, _ = cached
+        speakers = _extract_speaker_labels(transcript)
+        if not speakers:
+            await interaction.response.send_message(
+                "No speaker labels found in this transcript.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(
+            SpeakerRenameModal(self._video_id, self._channel_id, speakers)
+        )
+
+
+async def _apply_rename(
+    interaction: discord.Interaction,
+    video_id: str,
+    channel_id: int,
+    renames: dict,
+) -> None:
+    """Apply rename map to cached transcript + post a fresh brief embed.
+
+    Strategy: text-replace `[SPEAKER_xx]` → `[NewName]` in the cached
+    transcript, write back to cache, then re-summarize the brief only
+    (key_points/chapters keep their original labels — they'd require
+    re-summarisation on the LLM, costly).
+    """
+    cached = read_cache(video_id)
+    if cached is None:
+        await interaction.followup.send("Transcript expired.", ephemeral=True)
+        return
+    title, status, transcript, duration = cached
+
+    # Apply renames atomically (longest first to avoid prefix collisions).
+    for old, new in sorted(renames.items(), key=lambda kv: -len(kv[0])):
+        transcript = transcript.replace(f"[{old}]", f"[{new}]")
+    write_cache(video_id, title, status, transcript, duration)
+
+    # Re-summarize brief only (cheapest; gives users immediate feedback).
+    duration_str = format_duration(duration)
+    brief = await summarize(
+        transcript, PROMPT_BRIEF, LLM_MAX_TOKENS_BRIEF,
+        reduce_template=REDUCE_BRIEF,
+        title=title, duration=duration_str, reference_block="",
+    )
+    brief = sanitize_llm_output(brief)
+
+    embed = discord.Embed(
+        title=f"TL;DW (renamed): {truncate(title, 240)}",
+        description=truncate(brief, 4000),
+        color=0xFF0000,
+    )
+    embed.set_footer(text=f"{duration_str} | renamed: {', '.join(renames.keys())}")
+    channel = bot.get_channel(channel_id)
+    if channel is not None:
+        await channel.send(embed=embed)
+    await interaction.followup.send(
+        f"Renamed: {', '.join(f'{o}→{n}' for o, n in renames.items())}",
+        ephemeral=True,
+    )
+
+
+# ─── Slash commands ──────────────────────────────────────────────────────────
+
+
+# Optional guild-scoped sync (instant). Set DISCORD_GUILD_ID for fast
+# iteration during development; leave unset for global commands (1h
+# propagation, but works in DMs and across all servers).
+DISCORD_GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0"))
+
+
+def _job_from_interaction(
+    interaction: discord.Interaction,
+    url: str,
+    *,
+    user_prompt: str = "",
+    diarize: bool = False,
+    model_override: str | None = None,
+) -> Job | None:
+    """Build a Job from an interaction. Returns None on URL parse failure."""
+    # Try YouTube first for canonical video_id
+    m = YT_PATTERN.search(url)
+    if m:
+        video_id = m.group(1)
+        canonical = f"https://www.youtube.com/watch?v={video_id}"
+        return Job(
+            url=canonical, video_id=video_id,
+            channel=interaction.channel, submitter_id=interaction.user.id,
+            submitter_name=str(interaction.user),
+            user_prompt=user_prompt, diarize=diarize,
+            model_override=model_override, interaction=interaction,
+        )
+    # Fallback for other platforms
+    m = VIDEO_URL_PATTERN.search(url)
+    if not m:
+        return None
+    full_url = m.group(1)
+    path_parts = [p for p in full_url.rstrip("/").split("/")
+                  if p and "." not in p and "//" not in p]
+    vid = re.sub(r"[^\w-]", "", path_parts[-1])[:20] if path_parts else "unknown"
+    return Job(
+        url=full_url, video_id=vid,
+        channel=interaction.channel, submitter_id=interaction.user.id,
+        submitter_name=str(interaction.user),
+        user_prompt=user_prompt, diarize=diarize,
+        model_override=model_override, interaction=interaction,
+    )
+
+
+@bot.tree.command(name="summarize", description="Transcribe + summarise a video")
+@app_commands.describe(
+    url="Video URL (YouTube, Twitch, Vimeo, etc.)",
+    prompt="Optional steering: tell the bot what to focus on (forces VLM)",
+    model="Override LLM_MODEL for this run (advanced)",
+)
+async def cmd_summarize(
+    interaction: discord.Interaction,
+    url: str,
+    prompt: str | None = None,
+    model: str | None = None,
+) -> None:
+    await interaction.response.defer()
+    ok, reason = _rate_limit_check(interaction.user.id)
+    if not ok:
+        await interaction.followup.send(f"❌ {reason}", ephemeral=True)
+        return
+
+    chan_cfg = get_channel_config(interaction.channel.id)
+    effective_model = model or chan_cfg.get("model")
+    job = _job_from_interaction(
+        interaction, url,
+        user_prompt=(prompt or "").strip()[:USER_PROMPT_MAX_CHARS],
+        model_override=effective_model,
+    )
+    if job is None:
+        await interaction.followup.send(
+            f"❌ Couldn't parse a supported video URL from: {url}", ephemeral=True
+        )
+        return
+    _rate_limit_record(interaction.user.id)
+    await queue.put(job)
+    await _ack_queued(job, queue.qsize())
+    log.info("Slash /summarize queued %s from %s (model=%s, prompt=%s)",
+             job.video_id, job.submitter_name,
+             effective_model or "default", bool(job.user_prompt))
+
+
+@bot.tree.command(name="transcribe", description="Transcribe a video (no summary), with optional speaker diarization")
+@app_commands.describe(
+    url="Video URL",
+    diarize="Identify and label different speakers (slower; adds rename button)",
+)
+async def cmd_transcribe(
+    interaction: discord.Interaction,
+    url: str,
+    diarize: bool = False,
+) -> None:
+    # /transcribe is just /summarize with diarize on. We still produce
+    # the brief/key_points/chapters embeds — the diarize flag flows
+    # through to whisper for labelling.
+    await interaction.response.defer()
+    ok, reason = _rate_limit_check(interaction.user.id)
+    if not ok:
+        await interaction.followup.send(f"❌ {reason}", ephemeral=True)
+        return
+
+    chan_cfg = get_channel_config(interaction.channel.id)
+    job = _job_from_interaction(
+        interaction, url,
+        diarize=diarize or chan_cfg.get("diarize", False),
+        model_override=chan_cfg.get("model"),
+    )
+    if job is None:
+        await interaction.followup.send(
+            f"❌ Couldn't parse a supported video URL from: {url}", ephemeral=True
+        )
+        return
+    _rate_limit_record(interaction.user.id)
+    await queue.put(job)
+    await _ack_queued(job, queue.qsize())
+    log.info("Slash /transcribe queued %s from %s (diarize=%s)",
+             job.video_id, job.submitter_name, job.diarize)
+
+
+@bot.tree.command(name="status", description="Show queue + service health")
+async def cmd_status(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    assert http
+    try:
+        async with http.get(f"{WHISPER_API}/api/status",
+                            timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            wstatus = await resp.json() if resp.status == 200 else {"status": "down"}
+    except Exception as e:
+        wstatus = {"status": f"unreachable: {e}"}
+
+    user_dq = _user_jobs.get(interaction.user.id, deque())
+    msg = (
+        f"**Queue**: {queue.qsize()}/{MAX_QUEUE_SIZE} jobs\n"
+        f"**Your usage**: {len(user_dq)}/{MAX_JOBS_PER_USER_PER_HOUR} in the last hour\n"
+        f"**Whisper**: {wstatus.get('status', '?')} on {wstatus.get('device', '?')}\n"
+        f"**Vision**: {wstatus.get('vision', {}).get('model', 'unconfigured')}"
+    )
+    await interaction.followup.send(msg, ephemeral=True)
+
+
+@bot.tree.command(name="find", description="Search past summaries by keyword")
+@app_commands.describe(query="Keywords to search for (case-insensitive substring)")
+async def cmd_find(interaction: discord.Interaction, query: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    q = query.lower().strip()
+    if len(q) < 3:
+        await interaction.followup.send("Query must be ≥3 characters.", ephemeral=True)
+        return
+
+    matches = []
+    for f in CACHE_DIR.glob("*.txt"):
+        try:
+            text = f.read_text()
+        except OSError:
+            continue
+        if q in text.lower():
+            # Pull the title from header line: "# title: ..."
+            title = ""
+            for line in text.splitlines()[:5]:
+                if line.startswith("# title: "):
+                    title = line[len("# title: "):]
+                    break
+            video_id = f.stem
+            url = f"https://www.youtube.com/watch?v={video_id}"  # YT-style; non-YT works too
+            matches.append((video_id, title or video_id, url))
+            if len(matches) >= 10:
+                break
+
+    if not matches:
+        await interaction.followup.send(f"No matches for `{query}`.", ephemeral=True)
+        return
+
+    lines = [f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} for `{query}`:"]
+    for vid, title, url in matches:
+        lines.append(f"- [{truncate(title, 80)}]({url}) (`{vid}`)")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="config", description="Configure this channel's bot defaults (admin)")
+@app_commands.describe(
+    model="Default LLM model id for this channel (empty = clear override)",
+    vlm="Force VLM enrichment for every video in this channel",
+    diarize="Enable speaker diarization by default in this channel",
+    show="Just print the current config without changing it",
+)
+async def cmd_config(
+    interaction: discord.Interaction,
+    model: str | None = None,
+    vlm: bool | None = None,
+    diarize: bool | None = None,
+    show: bool = False,
+) -> None:
+    # Discord-side permission check: requires Manage Channel.
+    perms = interaction.channel.permissions_for(interaction.user)
+    if not perms.manage_channels:
+        await interaction.response.send_message(
+            "❌ This command requires the **Manage Channel** permission.",
+            ephemeral=True,
+        )
+        return
+    if show or (model is None and vlm is None and diarize is None):
+        cfg = get_channel_config(interaction.channel.id)
+        if not cfg:
+            txt = "No overrides for this channel — using global defaults."
+        else:
+            txt = "Current config:\n" + "\n".join(f"  **{k}**: `{v}`" for k, v in cfg.items())
+        await interaction.response.send_message(txt, ephemeral=True)
+        return
+
+    fields: dict = {}
+    if model is not None:
+        fields["model"] = model.strip() or None  # empty string clears
+    if vlm is not None:
+        fields["vlm_enabled"] = vlm
+    if diarize is not None:
+        fields["diarize"] = diarize
+    new_cfg = set_channel_config(interaction.channel.id, **fields)
+    if new_cfg:
+        txt = "Updated config:\n" + "\n".join(f"  **{k}**: `{v}`" for k, v in new_cfg.items())
+    else:
+        txt = "Config cleared — using global defaults."
+    await interaction.response.send_message(txt, ephemeral=True)
+    log.info("Channel %s config updated by %s: %s",
+             interaction.channel.id, interaction.user, fields)
+
+
+# Sync commands on startup. Called once after the worker is up.
+async def _sync_slash_commands():
+    if DISCORD_GUILD_ID:
+        guild = discord.Object(id=DISCORD_GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        log.info("Slash commands synced to guild %d (%d commands)",
+                 DISCORD_GUILD_ID, len(synced))
+    else:
+        synced = await bot.tree.sync()
+        log.info("Slash commands synced globally (%d commands; ~1 hour propagation)",
+                 len(synced))
 
 
 # ─── Entry ────────────────────────────────────────────────────────────────────

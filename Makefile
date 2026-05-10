@@ -170,12 +170,47 @@ sys.modules['aiohttp'].ClientTimeout = lambda **k: None
 discord = types.ModuleType('discord')
 discord.Intents = type('I', (), {'default': staticmethod(lambda: types.SimpleNamespace(message_content=False))})
 discord.HTTPException = Exception
+discord.Interaction = object
+discord.ButtonStyle = types.SimpleNamespace(secondary='secondary', primary='primary', danger='danger', success='success')
+discord.Object = lambda **k: None
 for n in ('Embed', 'Message', 'TextChannel'): setattr(discord, n, object)
 sys.modules['discord'] = discord
+# discord.app_commands stub
+app_commands = types.ModuleType('discord.app_commands')
+app_commands.CommandTree = type('CT', (), {'__init__': lambda s,*a,**k: None})
+def _passthrough_decorator(*a, **k):
+    def _wrap(fn): return fn
+    return _wrap
+app_commands.command = _passthrough_decorator
+app_commands.describe = _passthrough_decorator
+sys.modules['discord.app_commands'] = app_commands
+discord.app_commands = app_commands
+# discord.ui stub
+ui = types.ModuleType('discord.ui')
+ui.View = type('View', (), {'__init__': lambda s,*a,**k: None})
+ui.Modal = type('Modal', (), {
+    '__init__': lambda s,*a,**k: None,
+    '__init_subclass__': classmethod(lambda cls, **k: None),
+    'add_item': lambda s,i: None,
+})
+ui.Button = type('Button', (), {})
+ui.TextInput = type('TextInput', (), {'__init__': lambda s,*a,**k: None})
+ui.Select = type('Select', (), {})
+def _ui_button_decorator(*a, **k):
+    def _wrap(fn): return fn
+    return _wrap
+ui.button = _ui_button_decorator
+sys.modules['discord.ui'] = ui
+discord.ui = ui
 sys.modules['discord.ext'] = types.ModuleType('discord.ext')
 commands = types.ModuleType('discord.ext.commands')
 class B:
-    def __init__(s,*a,**k): pass
+    def __init__(s,*a,**k):
+        s.tree = types.SimpleNamespace(
+            command=_passthrough_decorator,
+            sync=lambda **kw: None,
+            copy_global_to=lambda **kw: None,
+        )
     def event(s,fn): return fn
 commands.Bot = B
 sys.modules['discord.ext.commands'] = commands

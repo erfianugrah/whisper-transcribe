@@ -21,10 +21,12 @@ Categories:
 """
 import asyncio
 import importlib
+import logging
 import os
 import re
 import sys
 import tempfile
+import time
 import types
 
 
@@ -49,14 +51,52 @@ def _setup_stubs():
     discord.Embed = object
     discord.Message = object
     discord.TextChannel = object
+    discord.Interaction = object
+    discord.ButtonStyle = types.SimpleNamespace(
+        secondary="secondary", primary="primary", danger="danger", success="success",
+    )
+    discord.Object = lambda **k: None
     sys.modules["discord"] = discord
-    sys.modules["discord.ext"] = types.ModuleType("discord.ext")
 
+    # discord.app_commands stub
+    app_commands = types.ModuleType("discord.app_commands")
+    def _passthrough_decorator(*a, **k):
+        def _wrap(fn): return fn
+        return _wrap
+    app_commands.command = _passthrough_decorator
+    app_commands.describe = _passthrough_decorator
+    app_commands.CommandTree = type("CT", (), {"__init__": lambda s, *a, **k: None})
+    sys.modules["discord.app_commands"] = app_commands
+    discord.app_commands = app_commands
+
+    # discord.ui stub
+    ui = types.ModuleType("discord.ui")
+    ui.View = type("View", (), {"__init__": lambda s, *a, **k: None})
+    ui.Modal = type("Modal", (), {
+        "__init__": lambda s, *a, **k: None,
+        "__init_subclass__": classmethod(lambda cls, **k: None),
+        "add_item": lambda s, i: None,
+    })
+    ui.Button = type("Button", (), {})
+    ui.TextInput = type("TextInput", (), {"__init__": lambda s, *a, **k: None})
+    ui.Select = type("Select", (), {})
+    def _ui_button_decorator(*a, **k):
+        def _wrap(fn): return fn
+        return _wrap
+    ui.button = _ui_button_decorator
+    sys.modules["discord.ui"] = ui
+    discord.ui = ui
+
+    sys.modules["discord.ext"] = types.ModuleType("discord.ext")
     commands = types.ModuleType("discord.ext.commands")
 
     class B:
         def __init__(self, *a, **k):
-            pass
+            self.tree = types.SimpleNamespace(
+                command=_passthrough_decorator,
+                sync=lambda **kw: None,
+                copy_global_to=lambda **kw: None,
+            )
 
         def event(self, fn):
             return fn
@@ -554,13 +594,18 @@ def test_extract_user_prompt_minimum_length():
     assert out == ""
 
 
-def test_job_dataclass_user_prompt_default():
-    """Job defaults user_prompt to empty string for backward compat."""
-    # Build a Job with mocked fields. Have to use object() since dataclass
-    # is frozen=False but we just need attribute access.
-    j = bot.Job(url="https://x", video_id="x", message=object(),
-                channel=object())
+def test_job_dataclass_defaults():
+    """Job constructs with required fields and sane defaults."""
+    j = bot.Job(
+        url="https://x", video_id="x",
+        channel=object(), submitter_id=42,
+    )
     assert j.user_prompt == ""
+    assert j.diarize is False
+    assert j.model_override is None
+    assert j.message is None
+    assert j.interaction is None
+    assert j.submitter_name == ""
 
 
 def test_build_vlm_prompt_includes_user_text():
@@ -673,6 +718,150 @@ def test_env_loader_does_not_override():
     assert os.environ["PREEXISTING"] == "fromenv"
     os.environ.pop("PREEXISTING", None)
     os.unlink(p.name)
+
+
+# ─── Rate limiting ─────────────────────────────────────────────────────────
+
+
+def test_rate_limit_initial_pass():
+    """Fresh user: first call passes."""
+    bot._user_jobs.clear()
+    ok, reason = bot._rate_limit_check(user_id=1001)
+    assert ok and reason == ""
+
+
+def test_rate_limit_blocks_after_cap():
+    """Per-user cap blocks the next request."""
+    bot._user_jobs.clear()
+    user = 1002
+    for _ in range(bot.MAX_JOBS_PER_USER_PER_HOUR):
+        bot._rate_limit_record(user)
+    ok, reason = bot._rate_limit_check(user)
+    assert not ok
+    assert "Rate limit" in reason
+
+
+def test_rate_limit_bypass_users():
+    """Admin bypass still respects total queue cap but skips per-user."""
+    bot._user_jobs.clear()
+    bot.RATE_LIMIT_BYPASS_USERS.add(9999)
+    for _ in range(bot.MAX_JOBS_PER_USER_PER_HOUR + 5):
+        bot._rate_limit_record(9999)
+    ok, _ = bot._rate_limit_check(9999)
+    assert ok, "bypass should still pass per-user check"
+    bot.RATE_LIMIT_BYPASS_USERS.discard(9999)
+
+
+def test_rate_limit_sliding_window():
+    """Old entries (>1h) get evicted on check."""
+    bot._user_jobs.clear()
+    user = 1003
+    # Backdate past entries
+    for _ in range(bot.MAX_JOBS_PER_USER_PER_HOUR):
+        bot._user_jobs[user].append(time.time() - 3700)  # 1h+ ago
+    ok, _ = bot._rate_limit_check(user)
+    assert ok, "old entries should be evicted, allowing new request"
+
+
+# ─── Per-channel config ────────────────────────────────────────────────────
+
+
+def test_channel_config_get_default_empty():
+    cfg_path = bot.CHANNELS_CONFIG_PATH
+    if cfg_path.exists():
+        cfg_path.unlink()
+    assert bot.get_channel_config(123) == {}
+
+
+def test_channel_config_set_and_get():
+    cfg_path = bot.CHANNELS_CONFIG_PATH
+    if cfg_path.exists():
+        cfg_path.unlink()
+    bot.set_channel_config(456, model="gemma-4-31B-it-Q4_K_M", vlm_enabled=True)
+    cfg = bot.get_channel_config(456)
+    assert cfg["model"] == "gemma-4-31B-it-Q4_K_M"
+    assert cfg["vlm_enabled"] is True
+
+
+def test_channel_config_clear_field():
+    bot.set_channel_config(789, model="X", diarize=True)
+    bot.set_channel_config(789, model=None)  # clear model only
+    cfg = bot.get_channel_config(789)
+    assert "model" not in cfg
+    assert cfg["diarize"] is True
+
+
+def test_channel_config_clear_all():
+    bot.set_channel_config(901, model="Y")
+    bot.set_channel_config(901, model=None)
+    assert bot.get_channel_config(901) == {}
+
+
+# ─── Slash commands wired ──────────────────────────────────────────────────
+
+
+def test_slash_commands_defined():
+    """All four slash commands should have handler functions."""
+    handlers = ("cmd_summarize", "cmd_transcribe", "cmd_status", "cmd_find", "cmd_config")
+    missing = [h for h in handlers if not hasattr(bot, h)]
+    assert not missing, f"missing slash handlers: {missing}"
+
+
+def test_sync_function_exists():
+    assert callable(bot._sync_slash_commands)
+
+
+# ─── Speaker rename helpers ────────────────────────────────────────────────
+
+
+def test_has_speaker_labels():
+    assert bot._has_speaker_labels("[0:05] [SPEAKER_00] hi")
+    assert bot._has_speaker_labels("[0:00] [F-SPEAKER_01] hello")
+    assert not bot._has_speaker_labels("[0:05] no speakers here")
+
+
+def test_extract_speaker_labels_dedup_and_cap():
+    transcript = "\n".join(f"[{i}:00] [SPEAKER_{i:02d}] line {i}" for i in range(8))
+    labels = bot._extract_speaker_labels(transcript)
+    assert len(labels) == 5  # capped at 5 (Modal limit)
+    assert labels[0] == "SPEAKER_00"
+    # Duplicates only counted once
+    transcript = "\n".join(f"[{i}:00] [SPEAKER_00] line {i}" for i in range(8))
+    labels = bot._extract_speaker_labels(transcript)
+    assert labels == ["SPEAKER_00"]
+
+
+# ─── JSON logger ───────────────────────────────────────────────────────────
+
+
+def test_json_logger_outputs_json():
+    """JSON formatter produces parseable JSON with required fields."""
+    fmt = bot._JsonFormatter()
+    rec = logging.makeLogRecord({
+        "name": "test", "levelname": "INFO", "msg": "hi %s", "args": ("world",),
+    })
+    out = fmt.format(rec)
+    import json as _json
+    parsed = _json.loads(out)
+    assert parsed["msg"] == "hi world"
+    assert parsed["level"] == "INFO"
+    assert parsed["logger"] == "test"
+    assert "ts" in parsed
+
+
+# ─── Job source helpers ────────────────────────────────────────────────────
+
+
+def test_job_with_message_only():
+    j = bot.Job(url="x", video_id="x", channel=object(), submitter_id=1,
+                message=object())
+    assert j.interaction is None
+
+
+def test_job_with_interaction_only():
+    j = bot.Job(url="x", video_id="x", channel=object(), submitter_id=1,
+                interaction=object())
+    assert j.message is None
 
 
 def test_process_routing_references_helpers():

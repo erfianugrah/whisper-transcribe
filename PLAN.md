@@ -14,7 +14,7 @@ Status legend:
 
 ---
 
-## A. Slash commands  `[verified]`
+## A. Slash commands  `[done]`
 
 **Goal**: Replace (or supplement) the current "watch every message for URLs"
 flow with explicit Discord slash commands. Cleaner UX, native arg validation,
@@ -67,7 +67,7 @@ registration + arg parsing.
 
 ---
 
-## B. Speaker rename UI  `[verified]`
+## B. Speaker rename UI  `[done]`
 
 **Goal**: When diarization is enabled, let users rename `SPEAKER_00 →
 Alice` from inside Discord and have the embed update.
@@ -116,7 +116,12 @@ slash command makes the diarize opt-in obvious.
 
 ---
 
-## C. Observability metrics  `[blocked]`
+## C. Observability metrics  `[partial]`
+
+C.1 (structured JSON logs) **done** — `LOG_JSON=1` in `bot/.env` flips
+the formatter to single-line JSON; all extra fields preserved. C.2
+(Prometheus + Grafana stack) deferred until there's signal that
+pull-based metrics + dashboards are needed.
 
 **Goal**: Job counts, latencies, retry rates, VLM-fallback rate, model
 swap counts. Enough signal to know "is the bot healthy?" without tailing
@@ -160,7 +165,7 @@ volumes + alerting setup).
 
 ---
 
-## D. Per-channel preset config  `[idea]`
+## D. Per-channel preset config  `[done]`
 
 **Goal**: Different Discord channels use different LLM presets. E.g.
 `#serious-podcasts` uses gemma-4-31B for richer summaries; `#bot-spam`
@@ -199,7 +204,7 @@ documented and maintained.
 
 ---
 
-## E. Per-user rate limiting  `[idea]`
+## E. Per-user rate limiting  `[done]`
 
 **Goal**: A single Discord user can't DoS the bot by spamming URLs.
 Each video download is ≤ 500 MB; without limits, malicious or bored
@@ -231,7 +236,12 @@ users can chew bandwidth + GPU time.
 
 ---
 
-## F. Web frontend for past summaries  `[idea]`
+## F. Web frontend for past summaries  `[partial]`
+
+F.1 (`/find` slash search) **done** — substring search across the bot's
+transcript cache, returns up to 10 hits with clickable links. F.2
+(static HTML index / dedicated frontend) deferred — `/find` covers the
+common "I want that summary from last month" need without extra infra.
 
 **Goal**: Browse past transcripts/summaries from a webpage. Useful for
 finding "that video about X we summarised three months ago".
@@ -280,15 +290,12 @@ that meaningfully changes one of these areas.
 
 ## Decision queue
 
-When picking next, walk this list top-down. The order reflects impact
-and unblocking order, not arbitrary priority.
+Done items have moved to `[done]` / `[partial]` above. Remaining open:
 
-1. **A. Slash commands** — unblocks B, D. Lowest risk per hour.
-2. **B. Speaker rename UI** — meaningful UX feature, depends on A.
-3. **D. Per-channel preset config** — useful when you have varied content
-   types in different channels. Depends on A.
-4. **E. Per-user rate limiting** — security; do once you have any
-   non-trusted users with bot access.
-5. **C. Observability** — only after the above generate enough volume
-   that "is it healthy?" stops being a tail-the-logs question.
-6. **F. Web frontend** — drop unless demand emerges.
+- **C.2** (Prometheus + Grafana) — if/when you want pull-based metrics +
+  dashboards. Open question: separate compose project (`~/observability/`)
+  for whisper-transcribe + lockstep + composer + llm-compose to share?
+- **F.2** (static HTML index) — drop unless `/find` proves insufficient.
+- **G** (app.py refactor) — won't redo without feature motivation.
+
+See `DISCORD_BOT_GUIDE.md` for end-user docs of the new commands.
