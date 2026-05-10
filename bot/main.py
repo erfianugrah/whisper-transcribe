@@ -314,20 +314,53 @@ class PermanentError(Exception):
 # Belt-and-suspenders: even if the whisper service misclassifies a yt-dlp
 # error as 5xx (e.g. older container that pre-dates the 422 classification),
 # the bot recognises these patterns in error bodies and refuses to retry.
+# Belt-and-suspenders pattern matcher for the bot. Mirrors the server's
+# `_PERMANENT_YT_DLP_PATTERNS` exactly (plus extras for whisper-side and
+# LLM-side errors that the bot sees but the server doesn't classify). When
+# the whisper service returns a misclassified 5xx (e.g. running an older
+# image without the latest server-side patterns), the bot still catches
+# known-permanent errors via these patterns and skips the retry loop.
+#
+# The server's list lives in app.py:_PERMANENT_YT_DLP_PATTERNS — keep both
+# in sync. Tooling: `make lint` exercises a pattern-drift check via the
+# regression test in tests/.
 _PERMANENT_REMOTE_PATTERNS = (
+    # ─── Mirrors app.py:_PERMANENT_YT_DLP_PATTERNS (yt-dlp errors) ──────────
     "Sign in to confirm your age",
-    "Sign in to confirm you're not a bot",
     "Private video",
     "Video unavailable",
     "This video is unavailable",
-    "Video is not available",
+    "members-only content",
+    "members only video",
     "members-only",
     "This video has been removed",
     "blocked it on copyright grounds",
     "blocked it in your country",
+    "country and is unavailable",
     "Premieres in",
+    "This live event will begin",
+    "Sign in to confirm you're not a bot",
     "Join this channel to get access",
-    "exceed_context_size_error",   # LLM context overflow
+    "Video is not available",
+    "No video could be found in this tweet",
+    "No video could be found in this",
+    "No video formats found",
+    "no video formats found",
+    "Unsupported URL",
+    "is not a valid URL",
+    "There's no video in this post",
+    "No media found",
+    "Post does not contain any media",
+    # ─── Bot-only additions ─────────────────────────────────────────────────
+    # Whisper-side: file-resolution / ffmpeg errors that propagate as 5xx
+    "file not found:",                 # /api/transcribe got bad path
+    "input file has no video stream",  # /api/describe ffmpeg
+    "no video streams",
+    "Output file does not contain any stream",
+    # LLM context overflow (OpenAI-compatible servers; classified locally
+    # in the bot since the LLM is reached over llm-compose proxy, not via
+    # whisper's yt-dlp pattern matcher).
+    "exceed_context_size_error",
     "context_length_exceeded",
 )
 

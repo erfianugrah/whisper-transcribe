@@ -133,8 +133,11 @@ redeploy: ## Recreate local containers from current :latest images
 
 # ─── Lint / verify ────────────────────────────────────────────────────────────
 
-.PHONY: lint compile-check compose-check ruff bot-import-check
+.PHONY: lint compile-check compose-check ruff bot-import-check test
 lint: compile-check compose-check bot-import-check ## Run all static checks (no rebuild needed)
+
+test: lint ## Lint + full E2E regression suite (no docker required)
+	@python3 tests/test_regression.py
 
 compile-check: ## ast.parse + py_compile (catches syntax + bytecode errors)
 	@python3 -m py_compile app.py bot/main.py bot/prompts.py
