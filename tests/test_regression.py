@@ -512,6 +512,91 @@ def test_speech_density_routing_constants():
     assert hasattr(bot, "VLM_ENABLED")
 
 
+# ─── User prompt feature ────────────────────────────────────────────────────
+
+
+def test_extract_user_prompt_strips_urls():
+    """URL-only message → empty user prompt; URL + text → text."""
+    urls = ["https://youtube.com/watch?v=abc123"]
+    msg = "https://youtube.com/watch?v=abc123"
+    assert bot._extract_user_prompt(msg, urls) == ""
+
+    msg = "https://youtube.com/watch?v=abc123 describe the slides shown"
+    out = bot._extract_user_prompt(msg, urls)
+    assert "describe the slides shown" in out
+    assert "youtube.com" not in out
+
+
+def test_extract_user_prompt_strips_mentions():
+    """Discord mentions/channel refs/emojis don't count as prompt text."""
+    urls = ["https://youtu.be/x"]
+    msg = "<@123456789> https://youtu.be/x <#987654> :emoji:"
+    out = bot._extract_user_prompt(msg, urls)
+    # After stripping URLs, mentions, channel refs → only ":emoji:" or
+    # similar fragment remains. May be empty or trivial.
+    assert "@123456789" not in out
+    assert "#987654" not in out
+
+
+def test_extract_user_prompt_respects_cap():
+    """Long user text gets truncated to USER_PROMPT_MAX_CHARS."""
+    urls = ["https://youtu.be/x"]
+    msg = "https://youtu.be/x " + ("describe this " * 500)
+    out = bot._extract_user_prompt(msg, urls)
+    assert len(out) <= bot.USER_PROMPT_MAX_CHARS
+
+
+def test_extract_user_prompt_minimum_length():
+    """Trivial trailing characters don't count as prompt."""
+    urls = ["https://youtu.be/x"]
+    msg = "https://youtu.be/x ?"
+    out = bot._extract_user_prompt(msg, urls)
+    assert out == ""
+
+
+def test_job_dataclass_user_prompt_default():
+    """Job defaults user_prompt to empty string for backward compat."""
+    # Build a Job with mocked fields. Have to use object() since dataclass
+    # is frozen=False but we just need attribute access.
+    j = bot.Job(url="https://x", video_id="x", message=object(),
+                channel=object())
+    assert j.user_prompt == ""
+
+
+def test_build_vlm_prompt_includes_user_text():
+    """User text appears in the VLM frame prompt as an explicit instruction."""
+    p = bot._build_vlm_prompt("focus on the code editor")
+    assert "focus on the code editor" in p
+    assert "1-2 sentences" in p  # length cap still enforced
+
+
+def test_fetch_descriptions_passes_prompt():
+    """When prompt is supplied, _fetch_descriptions includes it in payload."""
+    import inspect
+    sig = inspect.signature(bot._fetch_descriptions)
+    assert "prompt" in sig.parameters
+    src = inspect.getsource(bot._fetch_descriptions)
+    assert 'payload["prompt"] = prompt' in src
+
+
+def test_process_routes_user_forced_vlm():
+    """process() forces VLM when user_prompt is set, regardless of density."""
+    src = BOT_SRC
+    assert "user_forced_vlm = bool(job.user_prompt)" in src
+    assert "user-forced-enrich" in src or "user_forced_vlm" in src
+
+
+def test_summary_prompt_includes_user_steer_block():
+    """User prompt threads into the summary prompt via the ref_block."""
+    assert "<user_request>" in BOT_SRC
+    assert "user_steer_block" in BOT_SRC
+
+
+def test_embed_shows_user_request_field():
+    """The brief embed surfaces the user prompt as a field for visibility."""
+    assert 'name="User request"' in BOT_SRC
+
+
 def test_process_routing_references_helpers():
     """The speech-density dispatch in process() calls all VLM helpers."""
     assert "SPEECH_DENSITY_SILENT" in BOT_SRC

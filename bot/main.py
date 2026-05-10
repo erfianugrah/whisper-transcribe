@@ -226,6 +226,41 @@ class Job:
     video_id: str
     message: discord.Message
     channel: discord.TextChannel
+    # Optional user-supplied steering text from the Discord message. When
+    # present (non-empty), the bot:
+    #   1. Forces VLM enrichment regardless of speech density (the user
+    #      explicitly cares about visual content or wants targeted attention).
+    #   2. Passes the text as the per-frame prompt to /api/describe so the
+    #      VLM looks for what the user asked about.
+    #   3. Steers the summary LLM toward the user's request via a
+    #      "User asked:" block prepended to each summary prompt.
+    user_prompt: str = ""
+
+
+# Maximum length of user-prompt text we'll honour (truncated above this).
+# Keeps Discord-side lyrical messages from blowing the prompt budget on
+# both VLM and summary calls. Picked to fit comfortably alongside the
+# transcript content within LLM_INPUT_CHAR_BUDGET.
+USER_PROMPT_MAX_CHARS = int(os.environ.get("USER_PROMPT_MAX_CHARS", "1500"))
+
+
+def _extract_user_prompt(message_content: str, urls: list[str]) -> str:
+    """Strip the URLs out of the message and return whatever non-trivial
+    text remains. Used as user-supplied steering for VLM + summary.
+
+    Empty / whitespace-only / mention-only messages return "" and the
+    pipeline takes its default automatic path.
+    """
+    text = message_content
+    for url in urls:
+        text = text.replace(url, " ")
+    # Drop Discord mentions, channel refs, custom emoji shorthand
+    text = re.sub(r"<[@#:][^>]+>", " ", text)
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) < 3:
+        return ""
+    return text[:USER_PROMPT_MAX_CHARS]
 
 
 # ─── Bot ──────────────────────────────────────────────────────────────────────
@@ -271,32 +306,50 @@ async def on_message(message: discord.Message):
     # Collect video URLs — YouTube gets special handling (ID extraction for timestamps)
     jobs_to_queue = []
     seen = set()
+    all_urls: list[str] = []  # for user-prompt extraction (strip URLs from text)
 
-    # YouTube URLs → extract video ID for timestamp linking
-    for video_id in YT_PATTERN.findall(message.content):
+    # YouTube URLs → extract video ID for timestamp linking. The pattern only
+    # captures the video id; rebuild the full URL for substitution out of the
+    # message text below.
+    for m in YT_PATTERN.finditer(message.content):
+        all_urls.append(m.group(0))
+        video_id = m.group(1)
         if video_id in seen:
             continue
         seen.add(video_id)
         url = f"https://www.youtube.com/watch?v={video_id}"
-        jobs_to_queue.append(Job(url=url, video_id=video_id, message=message, channel=message.channel))
+        jobs_to_queue.append(Job(url=url, video_id=video_id, message=message,
+                                 channel=message.channel))
 
     # Other video platform URLs
     for url_match in VIDEO_URL_PATTERN.finditer(message.content):
         url = url_match.group(1)
-        # Skip if already handled as YouTube
+        all_urls.append(url)
         if any(d in url for d in ("youtube.com", "youtu.be")):
             continue
         # Use last non-empty path segment as ID for non-YouTube (filesystem-safe)
-        path_parts = [p for p in url.rstrip("/").split("/") if p and "." not in p and "//" not in p]
+        path_parts = [p for p in url.rstrip("/").split("/")
+                      if p and "." not in p and "//" not in p]
         vid = re.sub(r"[^\w-]", "", path_parts[-1])[:20] if path_parts else "unknown"
         if vid in seen:
             continue
         seen.add(vid)
-        jobs_to_queue.append(Job(url=url, video_id=vid, message=message, channel=message.channel))
+        jobs_to_queue.append(Job(url=url, video_id=vid, message=message,
+                                 channel=message.channel))
 
     if not jobs_to_queue:
         await bot.process_commands(message)
         return
+
+    # User-prompt: any non-trivial text remaining after stripping URLs.
+    # Applied to ALL jobs in this message (one prompt per message; if the
+    # user posts multiple URLs with steering, each gets the same instruction).
+    user_prompt = _extract_user_prompt(message.content, all_urls)
+    if user_prompt:
+        for job in jobs_to_queue:
+            job.user_prompt = user_prompt
+        log.info("User prompt detected (%d chars): %s",
+                 len(user_prompt), user_prompt[:80])
 
     for job in jobs_to_queue:
         await queue.put(job)
@@ -537,13 +590,30 @@ async def process(job: Job):
         log.info("[%s] Speech density: %.1f chars/sec (silent<%.1f, sparse<%.1f)",
                  job.video_id, density, SPEECH_DENSITY_SILENT, SPEECH_DENSITY_SPARSE)
 
-        if VLM_ENABLED and density < SPEECH_DENSITY_SPARSE:
-            visual_only = density < SPEECH_DENSITY_SILENT
-            mode = "visual-only" if visual_only else "hybrid"
-            log.info("[%s] %s — calling /api/describe (frame-level VLM)",
-                     job.video_id, mode)
+        # User-prompt forces VLM enrichment regardless of speech density —
+        # the user explicitly asked about visual content (or wants targeted
+        # attention to specific things on screen).
+        user_forced_vlm = bool(job.user_prompt)
+        run_vlm = VLM_ENABLED and (user_forced_vlm or density < SPEECH_DENSITY_SPARSE)
+
+        if run_vlm:
+            visual_only = density < SPEECH_DENSITY_SILENT and not user_forced_vlm
+            if user_forced_vlm and density >= SPEECH_DENSITY_SPARSE:
+                mode = "user-forced-enrich"
+            elif visual_only:
+                mode = "visual-only"
+            else:
+                mode = "hybrid"
+            log.info("[%s] %s — calling /api/describe (frame-level VLM)%s",
+                     job.video_id, mode,
+                     f", user steering: {job.user_prompt[:60]!r}" if user_forced_vlm else "")
             try:
-                desc_result = await _fetch_descriptions(file_path, cleanup=True)
+                # User-prompt becomes the per-frame description prompt so the
+                # VLM looks for what they asked about. Falls back to default.
+                desc_result = await _fetch_descriptions(
+                    file_path, cleanup=True,
+                    prompt=_build_vlm_prompt(job.user_prompt) if user_forced_vlm else None,
+                )
             except PermanentError as e:
                 log.error("[%s] VLM describe permanent error: %s", job.video_id, e)
                 await _cleanup_remote_file(file_path)
@@ -551,12 +621,10 @@ async def process(job: Job):
                     raise PermanentError(
                         f"No speech detected and visual description failed: {e}"
                     )
-                # Hybrid mode: VLM failed but we have a partial transcript;
-                # carry on with just the speech.
+                # Hybrid / user-forced: VLM failed but we still have transcript.
                 desc_result = None
             except Exception as e:
                 log.warning("[%s] VLM describe transient error: %s", job.video_id, e)
-                # Cleanup even on failure (we'll fall through one way or another)
                 await _cleanup_remote_file(file_path)
                 if visual_only:
                     raise  # let the worker retry
@@ -573,8 +641,9 @@ async def process(job: Job):
                 else:
                     # Hybrid: interleave speech and visual lines by timestamp.
                     transcript = _interleave_by_timestamp(transcript, visual_text)
+                    tag = "user-enriched" if user_forced_vlm else "hybrid"
                     status = (status or "") + (
-                        f" | hybrid (+{desc_result['frame_count']} visual frames)"
+                        f" | {tag} (+{desc_result['frame_count']} visual frames)"
                     )
         else:
             # Speech-heavy or VLM disabled: nothing more to do, clean up file.
@@ -609,6 +678,25 @@ async def process(job: Job):
             f"{web_context[:REFERENCE_CHAR_CAP]}\n"
             "</reference>\n\n"
         )
+
+    # User-prompt steering — prepended to each summary's prompt template.
+    # Wrapped in <user_request> so the LLM clearly distinguishes the user's
+    # ask from the transcript content. Empty when no user prompt was given.
+    user_steer_block = ""
+    if job.user_prompt:
+        user_steer_block = (
+            "The Discord user who requested this summary specifically asked: "
+            "<user_request>\n"
+            f"{job.user_prompt}\n"
+            "</user_request>\n"
+            "Honour that request when shaping your output — emphasise the "
+            "aspects they're interested in, while still covering the rest of "
+            "the video. The user_request is steering, not data to summarise.\n\n"
+        )
+        # Prepend steer block to the reference block so it appears at the
+        # top of the prompt (after the title/duration header). When there's
+        # no reference, the steer block goes directly there.
+        ref_block = user_steer_block + ref_block
 
     duration_str = format_duration(duration)
     tail_start = format_duration(int(duration * (1 - CHAPTER_TAIL_FRACTION)))
@@ -677,6 +765,15 @@ async def process(job: Job):
         color=0xFF0000,
     )
     embed.set_footer(text=f"{format_duration(duration)} | {status}")
+
+    # Show the user's steering request so the requester can see it was honoured
+    # and others in the channel understand why the summary leans a certain way.
+    if job.user_prompt:
+        embed.add_field(
+            name="User request",
+            value=truncate(job.user_prompt, 1000),
+            inline=False,
+        )
 
     if use_split and detail_msg:
         jump_url = detail_msg.jump_url
@@ -1265,8 +1362,31 @@ def truncate(s: str, max_len: int) -> str:
 # ─── VLM frame description helpers ────────────────────────────────────────────
 
 
-async def _fetch_descriptions(file_path: str, cleanup: bool = True) -> dict:
+def _build_vlm_prompt(user_text: str) -> str:
+    """Wrap a user's steering text into a per-frame VLM prompt.
+
+    The VLM receives one image per call and our prompt tells it what to
+    describe. Default (no user steering) is the generic VLM_FRAME_PROMPT
+    on the server. With user steering, we ask the VLM to focus on what
+    the user asked about, while still keeping the output concise enough
+    to fit alongside many frames in the eventual summary prompt.
+    """
+    return (
+        "Describe what is happening in this video frame, focusing on this "
+        f"user request: {user_text!r}. Keep your answer to 1-2 sentences. "
+        "Be factual; do not speculate about content not visible in the "
+        "frame. If the frame is unrelated to the user's request, say so "
+        "briefly."
+    )
+
+
+async def _fetch_descriptions(file_path: str, cleanup: bool = True,
+                              prompt: str | None = None) -> dict:
     """Call whisper service /api/describe and return parsed result.
+
+    `prompt` overrides the per-frame VLM prompt (default is the server's
+    VLM_FRAME_PROMPT). Used by the user-prompt path to steer the VLM
+    toward what the Discord user asked about.
 
     Raises PermanentError on 4xx, RuntimeError on 5xx/timeout/network.
     """
@@ -1277,6 +1397,8 @@ async def _fetch_descriptions(file_path: str, cleanup: bool = True) -> dict:
         "fps_interval": VLM_FPS_INTERVAL,
         "max_frames": VLM_MAX_FRAMES,
     }
+    if prompt:
+        payload["prompt"] = prompt
     async with http.post(
         f"{WHISPER_API}/api/describe",
         json=payload,

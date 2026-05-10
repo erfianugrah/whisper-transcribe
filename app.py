@@ -2333,6 +2333,31 @@ def _describe_frame(frame_path: str, vlm_model: str, prompt: str) -> str:
     return data["choices"][0]["message"]["content"].strip()
 
 
+class VLMNotConfiguredError(Exception):
+    """Raised when the LLM proxy is up but the model is missing vision
+    capability (e.g. llama-server loaded without mmproj). Surfaces as a
+    permanent 422 with an actionable error message — no amount of retries
+    will fix it; the operator has to configure the model differently."""
+
+
+# Patterns in VLM error responses that mean the deployed model can't accept
+# images. Per-frame retries can't help — we surface immediately.
+_VLM_NOT_CONFIGURED_PATTERNS = (
+    "image input is not supported",
+    "no mmproj",
+    "mmproj is required",
+    "vision is not enabled",
+    "model does not support vision",
+    "model does not support images",
+    "multimodal not enabled",
+)
+
+
+def _is_vlm_not_configured(err: str) -> bool:
+    err = (err or "").lower()
+    return any(p in err for p in _VLM_NOT_CONFIGURED_PATTERNS)
+
+
 def _describe_video(file_path: str, fps_interval: float, max_frames: int,
                     vlm_model: str, prompt: str) -> dict:
     """Extract frames and describe each via the VLM. Returns:
@@ -2343,6 +2368,13 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
         "model": str,
         "descriptions": [{"timestamp": float, "text": str}, ...],
     }
+
+    Raises:
+        VLMNotConfiguredError: when the deployed model rejects all images
+            (e.g. llama-server loaded without mmproj). Detected as soon as
+            the first frame fails with that pattern — we don't waste 60
+            calls just to see the same error 60 times.
+        NoVideoStreamError: input file has no video track.
     """
     duration = _ffprobe_duration(file_path)
     frames_dir = tempfile.mkdtemp(prefix="vlm-frames-")
@@ -2351,25 +2383,51 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
                                       max_frames, VLM_FRAME_WIDTH)
         if not frame_paths:
             raise RuntimeError("ffmpeg produced no frames")
-        # Effective interval after auto-stretch
         effective_interval = max(fps_interval, duration / max_frames) \
             if duration > 0 else fps_interval
 
         log.info(f"[VLM] {len(frame_paths)} frames at {effective_interval:.1f}s "
                  f"interval, model={vlm_model}")
         descriptions = []
+        success_count = 0
+        first_failure: str | None = None
         for i, fp in enumerate(frame_paths):
             timestamp = i * effective_interval
             try:
                 text = _describe_frame(fp, vlm_model, prompt)
+                success_count += 1
             except Exception as e:
-                log.warning(f"[VLM] Frame {i} ({timestamp:.0f}s) failed: {e}")
+                err = str(e)
+                # Bail out early on config errors — re-trying 59 more frames
+                # won't make the model gain vision capability.
+                if _is_vlm_not_configured(err):
+                    raise VLMNotConfiguredError(
+                        f"VLM model '{vlm_model}' on the LLM proxy rejected the "
+                        f"image input. Likely cause: the model is loaded "
+                        f"WITHOUT an mmproj (multimodal projector) file. "
+                        f"Fix: download the corresponding mmproj GGUF (same "
+                        f"HF repo as the main model) and pass it to "
+                        f"llama-server with --mmproj. Underlying error: {err[:200]}"
+                    )
+                log.warning(f"[VLM] Frame {i} ({timestamp:.0f}s) failed: {err}")
+                if first_failure is None:
+                    first_failure = err
                 text = "[frame description unavailable]"
             descriptions.append({"timestamp": timestamp, "text": text})
 
+        # If literally every frame failed (transient network, GPU OOM, etc.),
+        # raise so the bot doesn't try to summarise an empty transcript.
+        if success_count == 0 and frame_paths:
+            raise RuntimeError(
+                f"All {len(frame_paths)} frame descriptions failed. "
+                f"First error: {first_failure}"
+            )
+
+        log.info(f"[VLM] Described {success_count}/{len(frame_paths)} frames")
         return {
             "duration": duration,
             "frame_count": len(descriptions),
+            "successful_frames": success_count,
             "interval_seconds": effective_interval,
             "model": vlm_model,
             "descriptions": descriptions,
@@ -2421,6 +2479,14 @@ async def api_describe(request: Request):
         log.error(f"[API] describe permanent error: {e}")
         return JSONResponse(
             {"error": str(e), "permanent": True},
+            status_code=422,
+        )
+    except VLMNotConfiguredError as e:
+        # Permanent: the LLM proxy is up but the model can't accept images.
+        # Re-trying produces the same error every time.
+        log.error(f"[API] describe permanent error (VLM config): {e}")
+        return JSONResponse(
+            {"error": str(e), "permanent": True, "kind": "vlm_not_configured"},
             status_code=422,
         )
     except Exception as e:
