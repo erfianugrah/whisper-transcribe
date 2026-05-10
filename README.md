@@ -11,15 +11,48 @@ Gradio UI + HTTP API for the whisper service; Discord bot for hands-off summaris
 
 ## Quick Start
 
+### Prerequisites
+
+- **NVIDIA GPU** with current drivers + nvidia-container-toolkit (whisper service requires CUDA; CPU-only runs work but slowly)
+- **Docker Engine** with `docker compose` v2
+- **An OpenAI-compatible LLM endpoint**. The defaults assume **Ollama** running on the host (`ollama serve` + `ollama pull llama3.1` is enough). See `LLM_API_URL` below for alternatives.
+
+### Five-minute path (Ollama on host)
+
 ```bash
-# Requires: NVIDIA GPU, Docker with nvidia-container-toolkit
-cp .env.example .env       # Set HF_TOKEN for diarization
-cp bot/.env.example bot/.env  # Set DISCORD_TOKEN if running the bot
-make build                 # Build whisper + bot images
-make up                    # Start whisper + bot + crawl4ai + flaresolverr
-# Whisper UI: http://localhost:7860
-# Whisper API: http://localhost:7860/api/status
+git clone https://github.com/erfianugrah/whisper-transcribe.git
+cd whisper-transcribe
+
+# Optional: enable diarization (Discord bot still works without it)
+echo "HF_TOKEN=hf_..." > .env
+
+# Optional: enable the Discord bot (skip if you only want the whisper API/UI)
+cp bot/.env.example bot/.env
+$EDITOR bot/.env   # set DISCORD_TOKEN
+
+make build && make up
+# Whisper UI:        http://localhost:7860
+# Whisper API ping:  curl http://localhost:7860/api/status
 ```
+
+The bot defaults to `llama3.1` via Ollama on the host; change `LLM_MODEL` /
+`LLM_API_URL` in `bot/.env` to point at any OpenAI-compatible service
+(see `.env.example` for examples covering vLLM, llama.cpp server, OpenAI,
+and llm-compose).
+
+### Running alongside [llm-compose](https://github.com/erfianugrah/llm-compose)
+
+If you already run llm-compose on the same host (for hot-swapping local
+GGUFs), bring it up first, then layer in the overlay so this stack joins
+its `model_proxy`:
+
+```bash
+docker compose -f compose.yaml -f compose.llm-compose.yaml up -d
+```
+
+Defaults in the overlay point `LLM_API_URL` at `http://model_proxy:11434/v1`
+and pick reasonable `LLM_MODEL` / `LLM_VISION_MODEL` presets that exist in
+llm-compose. Override anything you want in `.env`.
 
 ## Features
 
@@ -77,19 +110,24 @@ Returns: `{"filename": "...", "title": "...", "duration": 123}`
 
 Returns: `{"status": "Done -- ...", "transcript": "...", "subtitle_file": "..."}`
 
-## MCP Server
+## MCP Server (optional)
 
-The companion MCP server lives at `~/llm-compose/mcp/whisper-server.py` and is registered globally in `~/.config/opencode/opencode.json`.
+The HTTP API is fully usable as-is. If you also want OpenCode (or any other
+MCP client) to call whisper directly via tools, the companion MCP server
+ships in [llm-compose](https://github.com/erfianugrah/llm-compose) at
+`mcp/whisper-server.py`. It's an OpenAI-tool-shape wrapper around the same
+`/api/*` endpoints; nothing whisper-specific lives in it.
 
-**Tools:**
+**Tools exposed:**
 - `whisper_status` — service health check
 - `yt_download` — download YouTube audio
 - `whisper_transcribe` — transcribe local file
 - `yt_transcribe` — download + transcribe (one-shot for summaries)
 - `yt_transcribe_playlist` — process entire playlists
 
-**Usage from OpenCode:**
-> "Transcribe and summarize this video: https://youtube.com/watch?v=..."
+To wire up: copy `whisper-server.py` from llm-compose into your MCP server
+directory and register it in your OpenCode config. Or call the HTTP API
+directly — same surface area.
 
 ## Environment Variables
 

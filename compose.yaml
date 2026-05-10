@@ -5,23 +5,31 @@ services:
     pull_policy: missing
     environment:
       - DEBUG_MODE=1  # 0/false/no/off for clean production logs
-      - HF_TOKEN=${HF_TOKEN}  # HuggingFace token for pyannote diarization
+      - HF_TOKEN=${HF_TOKEN:-}  # HuggingFace token for pyannote diarization (optional)
       # Optional yt-dlp cookies (age-gated / bot-challenged videos).
       # Leave unset to disable; see .env.example for the why and how.
       - YT_DLP_COOKIES_FILE=${YT_DLP_COOKIES_FILE:-}
-      # VLM: /api/describe calls the llm-compose proxy on the external
-      # network. model_proxy is reachable by name when whisper joins the llm
-      # network (see networks: below).
-      - LLM_VISION_API_URL=${LLM_VISION_API_URL:-http://model_proxy:11434/v1}
-      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-Qwen3-VL-2B-Instruct-Q8_0}
+      # VLM: silent-video frame description via OpenAI-compatible endpoint.
+      # Default points at host-side Ollama on the gateway IP (resolves from
+      # inside the container). Override with whatever serves vision models:
+      # llm-compose, vLLM, llama.cpp, hosted services (set LLM_VISION_API_URL
+      # to https://api.openai.com/v1 + your OPENAI_API_KEY equivalent).
+      - LLM_VISION_API_URL=${LLM_VISION_API_URL:-http://host.docker.internal:11434/v1}
+      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-llava}
     ports:
       - "7860:7860"
+    extra_hosts:
+      # Lets `host.docker.internal` resolve from Linux containers (Docker
+      # Desktop adds it automatically; Linux Engine doesn't). Used by the
+      # default LLM_VISION_API_URL so out-of-the-box hits a local Ollama
+      # running on the host.
+      - "host.docker.internal:host-gateway"
     networks:
-      # default: same network the bot uses to reach whisper.
-      # llm: external llm-compose network — needed for VLM calls from
-      #      /api/describe to model_proxy.
+      # In-stack network so bot ↔ whisper ↔ scrapers all see each other.
+      # To ALSO join an external llm-compose network, layer in
+      # `compose.llm-compose.yaml` with `docker compose -f compose.yaml -f
+      # compose.llm-compose.yaml up` (see that file).
       - default
-      - llm
     volumes:
       # Writable state lives in named volumes — Docker initializes named
       # volumes with the image-path's ownership (uid 1000 / ubuntu), so a
@@ -30,11 +38,11 @@ services:
       # `docker compose cp whisper:/data/history.json -` if needed.
       - uploads:/data
       - model-cache:/home/ubuntu/.cache/huggingface
-      # NOTE: app.py is no longer bind-mounted by default. The image is the
-      # source of truth in production. For dev (live reload without rebuild),
-      # add `compose.dev.yaml` with the bind mount and run:
-      #   docker compose -f compose.yaml -f compose.dev.yaml up
-      - /mnt/d/Videos:/media:ro
+      # Optional read-only media library mount. Lets the Gradio "Local file"
+      # tab list videos from your filesystem without re-uploading. Set
+      # MEDIA_LIBRARY_PATH in `.env` (default disables by pointing at /dev/null
+      # which mounts harmlessly empty).
+      - ${MEDIA_LIBRARY_PATH:-/dev/null}:/media:ro
       # Mount a yt-dlp cookies.txt if you need it for age-restricted / bot-
       # challenged videos. Place at ./cookies.txt and set
       # YT_DLP_COOKIES_FILE=/secrets/cookies.txt in your .env.
@@ -98,17 +106,26 @@ services:
     env_file:
       - ./bot/.env
     environment:
-      # Inside the compose network, services are reached by name.
+      # In-stack services reached by name.
       - WHISPER_API_URL=http://whisper:7860
       - SCRAPER_API_URL=http://crawl4ai:11235
       - FLARESOLVERR_API_URL=http://flaresolverr:8191/v1
-      # model_proxy lives on the external llm-compose_llm network.
-      - LLM_API_URL=http://model_proxy:11434/v1
+      # OpenAI-compatible endpoint for summaries. Default targets host-side
+      # Ollama (`ollama serve` on the host machine) — works out of the box
+      # on most hobbyist setups. Override to point at any compatible service:
+      #   - llm-compose:        http://model_proxy:11434/v1 (also needs the
+      #                         compose.llm-compose.yaml overlay)
+      #   - llama.cpp server:   http://<host>:8080/v1
+      #   - vLLM:               http://<host>:8000/v1
+      #   - OpenAI / Anthropic: https://api.openai.com/v1 with OPENAI_API_KEY
+      - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:11434/v1}
+      - LLM_MODEL=${LLM_MODEL:-llama3.1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - bot-cache:/app/cache
     networks:
       - default
-      - llm
     depends_on:
       whisper:
         condition: service_healthy
@@ -127,6 +144,3 @@ volumes:
 
 networks:
   default:
-  llm:
-    external: true
-    name: llm-compose_llm

@@ -1,0 +1,35 @@
+# Overlay for running whisper-transcribe alongside llm-compose
+# (https://github.com/erfianugrah/llm-compose) on the same host.
+#
+# When both stacks run together, the bot + whisper service can reach
+# llm-compose's `model_proxy` directly by container name instead of going
+# through the host gateway. Faster, no need for `host.docker.internal`.
+#
+# Use:
+#   docker compose -f compose.yaml -f compose.llm-compose.yaml up -d
+#
+# Prerequisite: bring up llm-compose first so its `llm-compose_llm` network
+# exists. Without it, this overlay errors out with "network ... not found".
+
+services:
+  whisper:
+    environment:
+      # Hop straight to model_proxy on the shared network.
+      - LLM_VISION_API_URL=${LLM_VISION_API_URL:-http://model_proxy:11434/v1}
+      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-Qwen3-VL-2B-Instruct-Q8_0}
+    networks:
+      - default
+      - llm
+
+  bot:
+    environment:
+      - LLM_API_URL=${LLM_API_URL:-http://model_proxy:11434/v1}
+      - LLM_MODEL=${LLM_MODEL:-Qwen3.5-4B-Q8_0}
+    networks:
+      - default
+      - llm
+
+networks:
+  llm:
+    external: true
+    name: llm-compose_llm

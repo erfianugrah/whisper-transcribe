@@ -9,8 +9,27 @@
 REGISTRY      := erfianugrah
 WHISPER_IMAGE := $(REGISTRY)/whisper-transcribe
 BOT_IMAGE     := $(REGISTRY)/whisper-transcribe-bot
-COMPOSE       := docker compose
 GIT_SHA       := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+
+# Two compose handles:
+#   $(COMPOSE_RUNTIME)         — base only. Used by validation (compose-check)
+#                        which exercises files individually.
+#   $(COMPOSE_RUNTIME) — base + auto-detected overlay. Used by
+#                        runtime targets (up, down, logs, ship, …).
+#                        The overlay auto-attaches when llm-compose's
+#                        external network is present so existing users
+#                        keep their model_proxy routing without manual
+#                        flag-passing; strangers without llm-compose
+#                        get the host-side Ollama default.
+COMPOSE := docker compose
+# COMPOSE_RUNTIME picks up the llm-compose overlay when its external network
+# exists. The `-f` flags must include BOTH base and overlay because once you
+# pass any `-f`, Compose stops auto-loading compose.yaml.
+ifeq ($(shell docker network inspect llm-compose_llm >/dev/null 2>&1 && echo yes),yes)
+COMPOSE_RUNTIME := docker compose -f compose.yaml -f compose.llm-compose.yaml
+else
+COMPOSE_RUNTIME := docker compose
+endif
 
 # Latest yt-dlp version from PyPI, fetched at make-invocation time. The
 # Dockerfile's volatile yt-dlp layer is keyed on this — when PyPI has a new
@@ -36,90 +55,90 @@ build: build-whisper build-bot ## Build both images
 
 build-whisper: ## Build whisper service image (auto-bumps yt-dlp to latest PyPI release)
 	@echo "Building whisper with yt-dlp $(YT_DLP_VERSION)"
-	$(COMPOSE) build --build-arg YT_DLP_VERSION=$(YT_DLP_VERSION) whisper
+	$(COMPOSE_RUNTIME) build --build-arg YT_DLP_VERSION=$(YT_DLP_VERSION) whisper
 
 build-bot: ## Build bot image
-	$(COMPOSE) build bot
+	$(COMPOSE_RUNTIME) build bot
 
 # ─── Lifecycle ────────────────────────────────────────────────────────────────
 
 .PHONY: up up-whisper up-bot down restart restart-whisper restart-bot
 up: ## Start whisper + bot (detached)
-	$(COMPOSE) up -d
+	$(COMPOSE_RUNTIME) up -d
 
 up-whisper: ## Start only whisper
-	$(COMPOSE) up -d whisper
+	$(COMPOSE_RUNTIME) up -d whisper
 
 up-bot: ## Start only bot
-	$(COMPOSE) up -d bot
+	$(COMPOSE_RUNTIME) up -d bot
 
 down: ## Stop and remove containers
-	$(COMPOSE) down
+	$(COMPOSE_RUNTIME) down
 
 restart: ## Restart all services
-	$(COMPOSE) restart
+	$(COMPOSE_RUNTIME) restart
 
 restart-whisper: ## Restart whisper only (picks up app.py changes via bind mount)
-	$(COMPOSE) restart whisper
+	$(COMPOSE_RUNTIME) restart whisper
 
 restart-bot: ## Restart bot only (in-place; does NOT re-read bot/.env — use recreate-bot for env changes)
-	$(COMPOSE) restart bot
+	$(COMPOSE_RUNTIME) restart bot
 
 restart-scraper: ## Restart crawl4ai + flaresolverr together (e.g. after a hung browser)
-	$(COMPOSE) restart crawl4ai flaresolverr
+	$(COMPOSE_RUNTIME) restart crawl4ai flaresolverr
 
 .PHONY: recreate-bot recreate-whisper recreate-scraper restart-scraper
 recreate-bot: ## Tear down + recreate bot container (re-reads bot/.env, refreshes image)
-	$(COMPOSE) up -d --force-recreate bot
+	$(COMPOSE_RUNTIME) up -d --force-recreate bot
 
 recreate-whisper: ## Tear down + recreate whisper container (re-reads .env)
-	$(COMPOSE) up -d --force-recreate whisper
+	$(COMPOSE_RUNTIME) up -d --force-recreate whisper
 
 recreate-scraper: ## Tear down + recreate scraper services (refreshes images, clears state)
-	$(COMPOSE) up -d --force-recreate crawl4ai flaresolverr
+	$(COMPOSE_RUNTIME) up -d --force-recreate crawl4ai flaresolverr
 
 # ─── Logs ─────────────────────────────────────────────────────────────────────
 
 .PHONY: logs logs-whisper logs-bot logs-crawl4ai logs-flaresolverr logs-scraper
 logs: ## Tail all logs (-f)
-	$(COMPOSE) logs -f --tail 50
+	$(COMPOSE_RUNTIME) logs -f --tail 50
 
 logs-whisper: ## Tail whisper logs
-	$(COMPOSE) logs -f --tail 50 whisper
+	$(COMPOSE_RUNTIME) logs -f --tail 50 whisper
 
 logs-bot: ## Tail bot logs
-	$(COMPOSE) logs -f --tail 50 bot
+	$(COMPOSE_RUNTIME) logs -f --tail 50 bot
 
 logs-crawl4ai: ## Tail crawl4ai (primary scraper) logs
-	$(COMPOSE) logs -f --tail 50 crawl4ai
+	$(COMPOSE_RUNTIME) logs -f --tail 50 crawl4ai
 
 logs-flaresolverr: ## Tail flaresolverr (CF-challenge fallback) logs
-	$(COMPOSE) logs -f --tail 50 flaresolverr
+	$(COMPOSE_RUNTIME) logs -f --tail 50 flaresolverr
 
 logs-scraper: ## Tail BOTH scraper services together
-	$(COMPOSE) logs -f --tail 50 crawl4ai flaresolverr
+	$(COMPOSE_RUNTIME) logs -f --tail 50 crawl4ai flaresolverr
 
 # ─── Shell / debug ────────────────────────────────────────────────────────────
 
 .PHONY: shell-whisper shell-bot status status-scraper ps
 shell-whisper: ## Exec bash in whisper container
-	$(COMPOSE) exec whisper bash
+	$(COMPOSE_RUNTIME) exec whisper bash
 
 shell-bot: ## Exec bash in bot container (sh — slim image has no bash)
-	$(COMPOSE) exec bot sh
+	$(COMPOSE_RUNTIME) exec bot sh
 
 status: ## Show whisper /api/status JSON
 	@curl -s http://localhost:7860/api/status | python3 -m json.tool
 
 status-scraper: ## Probe crawl4ai /health + flaresolverr / from inside the bot container
 	@echo "── crawl4ai ──"
-	@$(COMPOSE) exec -T bot python3 -c "import urllib.request,json; r=urllib.request.urlopen('http://crawl4ai:11235/health',timeout=3); print(json.dumps(json.loads(r.read()),indent=2))" || echo "crawl4ai: unreachable"
+	@$(COMPOSE_RUNTIME) exec -T bot python3 -c "import urllib.request,json; r=urllib.request.urlopen('http://crawl4ai:11235/health',timeout=3); print(json.dumps(json.loads(r.read()),indent=2))" || echo "crawl4ai: unreachable"
 	@echo ""
 	@echo "── flaresolverr ──"
-	@$(COMPOSE) exec -T bot python3 -c "import urllib.request,json; r=urllib.request.urlopen('http://flaresolverr:8191/',timeout=3); print(json.dumps(json.loads(r.read()),indent=2))" || echo "flaresolverr: unreachable"
+	@$(COMPOSE_RUNTIME) exec -T bot python3 -c "import urllib.request,json; r=urllib.request.urlopen('http://flaresolverr:8191/',timeout=3); print(json.dumps(json.loads(r.read()),indent=2))" || echo "flaresolverr: unreachable"
 
 ps: ## Show running containers
-	$(COMPOSE) ps
+	$(COMPOSE_RUNTIME) ps
 
 # ─── Push (Docker Hub) ────────────────────────────────────────────────────────
 
@@ -156,7 +175,7 @@ release: lint build push ## Lint + build both + push both (no redeploy)
 ship: release redeploy ## Lint + build + push + recreate local containers (full cycle)
 
 redeploy: ## Recreate local containers from current :latest images
-	$(COMPOSE) up -d --force-recreate
+	$(COMPOSE_RUNTIME) up -d --force-recreate
 	@echo ""
 	@echo "Containers recreated. Tail logs with: make logs"
 
@@ -174,9 +193,15 @@ compile-check: ## ast.parse + py_compile (catches syntax + bytecode errors)
 	@python3 -c "import ast; [ast.parse(open(p).read()) for p in ['app.py','bot/main.py','bot/prompts.py']]"
 	@echo "  ast.parse OK"
 
-compose-check: ## Validate compose YAML (prod + dev overlay)
+compose-check: ## Validate compose YAML (prod + dev + llm-compose overlays)
 	@$(COMPOSE) config -q && echo "  compose.yaml OK"
 	@$(COMPOSE) -f compose.yaml -f compose.dev.yaml config -q && echo "  compose.dev.yaml overlay OK"
+	@if docker network inspect llm-compose_llm >/dev/null 2>&1; then \
+	    $(COMPOSE) -f compose.yaml -f compose.llm-compose.yaml config -q && \
+	        echo "  compose.llm-compose.yaml overlay OK"; \
+	else \
+	    echo "  compose.llm-compose.yaml overlay skipped (llm-compose_llm network not present)"; \
+	fi
 
 bot-import-check: ## Import bot main module under stubbed deps + verify exports
 	@python3 -c "$$BOT_IMPORT_CHECK"
@@ -270,7 +295,7 @@ export BOT_IMPORT_CHECK
 .PHONY: migrate-from-root
 migrate-from-root: ## ONE-TIME: chown stale root-owned volumes after non-root switch
 	@echo "Stopping containers so we can mutate the volumes safely..."
-	@$(COMPOSE) stop || true
+	@$(COMPOSE_RUNTIME) stop || true
 	@echo ""
 	@echo "Chowning model-cache (HF models) to uid 1000..."
 	@docker volume inspect whisper-transcribe_model-cache >/dev/null 2>&1 && \
@@ -282,7 +307,7 @@ migrate-from-root: ## ONE-TIME: chown stale root-owned volumes after non-root sw
 	    || echo "  (bot-cache volume not found — skip)"
 	@echo "Importing legacy ./uploads/history.json into the uploads named volume (if present)..."
 	@if [ -f ./uploads/history.json ]; then \
-	    $(COMPOSE) up -d --no-recreate whisper >/dev/null 2>&1 || true; \
+	    $(COMPOSE_RUNTIME) up -d --no-recreate whisper >/dev/null 2>&1 || true; \
 	    docker compose cp ./uploads/history.json whisper:/data/history.json && \
 	        docker compose exec -u 0 whisper chown 1000:1000 /data/history.json && \
 	        echo "  imported ./uploads/history.json"; \
@@ -298,7 +323,7 @@ migrate-from-root: ## ONE-TIME: chown stale root-owned volumes after non-root sw
 
 .PHONY: clean clean-cache prune
 clean: ## Remove containers + named volumes (KEEPS images)
-	$(COMPOSE) down -v
+	$(COMPOSE_RUNTIME) down -v
 
 clean-cache: ## Clear bot transcript cache volume
 	docker volume rm -f whisper-transcribe_bot-cache
