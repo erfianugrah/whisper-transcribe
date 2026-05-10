@@ -10,13 +10,16 @@ embeds.
 
 | You do… | Bot does… |
 |---|---|
-| Paste any video URL in a watched channel | Transcribes + summarises automatically (3 embeds: brief, key points, chapters). |
+| Paste any video URL in a watched channel | Transcribes + summarises automatically (3 embeds: brief, key points, chapters; 4th Community Reaction for YouTube). |
 | `<URL> describe what's on the slides` | Forces frame-level VLM enrichment + steers summary toward your ask. |
-| `/summarize url:<URL> prompt:<text>` | Same as above via slash command (cleaner UX, arg validation). |
+| Reply `tldr` (or `summarize`) to a message containing a URL | **Web URL flow** — scrapes the article and posts brief + key points + sections. Works for any non-video URL. If the URL IS a video, falls through to the video pipeline. |
+| Reply `litmus` to a message containing a URL | **AI litmus test** — surfaces stylistic + metadata signals (LLM-tic phrases, em-dash density, hedge usage, generic buzzwords, listicle structure, domain age via Wayback, AdSense detection, author byline). Forensic report, no verdict. |
+| Reply `tldr litmus` (or any keyword combo) to a message | **Chained reply** — fires both flows in one go. Order in your reply preserves order of execution; duplicates dedupe; rate-limit charges per fired job. |
+| `/summarize url:<URL> prompt:<text>` | Slash equivalent of paste-with-text (cleaner UX, arg validation). |
 | `/transcribe url:<URL> diarize:true` | Adds speaker labels. Embed grows a 🏷️ Rename speakers button. |
 | `/find query:<keywords>` | Searches your past transcripts for matching content. |
 | `/status` | Shows queue depth, your rate-limit usage, whisper service health. |
-| `/config …` | Per-channel: model / VLM / diarize defaults (needs Manage Channel). |
+| `/config …` | Per-channel: model / VLM / diarize / yt_comments defaults (needs Manage Channel). |
 | `/serverconfig …` | Per-server: where Key Points + Chapters land (needs Manage Server). |
 
 ---
@@ -90,12 +93,27 @@ propagate to all your servers (Discord-side cache).
 ```
 @user: https://www.youtube.com/watch?v=abc123
 🤖    [reaction: ⏳ → 🎧 → 🧠 → ✅]
-🤖    [embed: TL;DW + Key Points + Chapters]
+🤖    [embed: TL;DW + Key Points + Chapters + Community Reaction]
 ```
 
-The bot watches every message in allowed channels. Anything yt-dlp
-supports (YouTube, Twitch, Vimeo, Twitter/X, Instagram, Reddit, Rumble,
-Odysee, Kick, Bilibili, SoundCloud, Dailymotion, …) triggers a job.
+For YouTube videos, a **4th embed (Community Reaction)** summarises top
+comments — what viewers broadly agree on, where they disagree, and which
+comments the creator engaged with (pinned / hearted / replied). On by
+default; channels can opt out with `/config yt_comments:false`. Comments
+are skipped on cache hits (the cache pre-dates the feature).
+
+The bot watches every message in allowed channels. **Auto-trigger only
+fires for URLs whose shape clearly identifies a video** — YouTube
+watch/shorts/live links, Twitch VODs and clips, Vimeo numeric IDs,
+TikTok video paths, v.redd.it, Dailymotion, Rumble, Odysee, Bilibili,
+SoundCloud, etc.
+
+Text posts on video-hosting domains (e.g. a Reddit text post, a
+non-video tweet, an Instagram profile page) **don't** auto-trigger,
+even though those domains are in `VIDEO_DOMAINS`. This avoids spamming
+the channel with "yt-dlp can't handle this URL" errors every time
+someone shares a Reddit article link. To get a summary of a text post,
+use Path C below (`tldr` reply).
 
 ### Path B — Paste a URL + steering text
 
@@ -109,7 +127,115 @@ Any non-trivial text alongside the URL forces VLM enrichment (the bot
 extracts video frames and asks a vision-language model to describe
 them) AND steers the summary LLM toward your request.
 
-### Path C — Slash commands (recommended for explicit options)
+### Path C — Web URL summary (`tldr` reply)
+
+Reply to a message containing any non-video URL with **`tldr`** or
+**`summarize`** (case-insensitive, optional trailing punctuation):
+
+```
+@user1: This article finally explains the new release: https://example.com/post
+@user2: tldr
+🤖    [reaction: ⏳ → 📰 → 🧠 → ✅ on @user2's "tldr" message]
+🤖    [embed: TL;DR + Key Points + Sections]
+```
+
+What counts as a trigger:
+- The reply body must be ONLY the keyword (`tldr`, `summarize`, `summarise`)
+  with optional trailing `.` or `!`. Sentences like "give me a tldr of this"
+  intentionally don't trigger.
+- The replied-to message must contain a URL. The bot picks the first one
+  and ignores Discord-internal links (channel/message links).
+
+What it does:
+- **Clear video URL** (YouTube watch link, Twitch VOD, Vimeo, etc.) →
+  routes through the existing video pipeline. Cache hit if already
+  summarised.
+- **Anything else** → routes to the web pipeline. Scrapes via Crawl4AI
+  (Playwright + readability), falls back to FlareSolverr if Cloudflare
+  blocks it. Output: brief paragraph, key-points list, sections list
+  (semantic headings, no timestamps). Hard CAPTCHA / Turnstile pages
+  still fail — the bot will say so.
+
+**Routing fallback** (the screenshot-in-the-bug-report case): if a URL
+got mis-classified as video and yt-dlp returns "Unsupported URL" or
+"No video found", the bot automatically retries as a web job. So a
+Reddit URL that turns out to be a link post to an article will end up
+summarised as the article. Genuine video failures (private, age-gated,
+geo-blocked) don't fall through — they fail cleanly because the
+article version would be just as restricted.
+
+Cache: scraped articles are cached by URL hash for 24h
+(`CACHE_TTL` default). Re-replying `tldr` to the same URL inside that
+window reuses the cached scrape and just regenerates summaries.
+
+### Path D — AI litmus test (`litmus` reply)
+
+Reply to a message containing any URL with **`litmus`** (or `litmus.` /
+`litmus?`):
+
+```
+@user1: this article smells like AI to me: https://example.com/post
+@user2: litmus
+🤖    [reaction: ⏳ → 📰 → 🧠 → ✅ on @user2's "litmus" message]
+🤖    [embed: 🔍 Litmus: <article title>]
+```
+
+What it does:
+1. Scrapes the article (same path as `tldr` — Crawl4AI / FlareSolverr,
+   Reddit-aware).
+2. Runs a regex pre-pass over the text for stylistic markers — LLM-tic
+   phrases (`delve into`, `tapestry of`, `navigate the landscape`, …),
+   em-dash density (LLMs over-use them), hedge phrases (`it's worth
+   noting`), generic buzzwords (`robust`, `seamless`, `cutting-edge`),
+   listicle structure (heading + bullet density), substance markers
+   (presence of quotes, named individuals, specific dates / numbers).
+3. Fetches metadata in parallel — domain age via the Wayback Machine
+   (recently-registered domains pumping out content are a strong
+   AI-content tell), author byline detection (`<meta name=author>`,
+   `rel=author`), AdSense / DoubleClick markers (cheap content-mill
+   signal).
+4. Aggregates signals into a severity score. **Skips the LLM call** if
+   the score is clearly clean OR clearly LLM-style — only the ambiguous
+   middle range gets a qualitative LLM read.
+5. Posts a forensic embed: signals list with severity dots
+   (🟢 typical-human / 🟡 elevated / 🔴 beyond typical-human), an
+   optional qualitative read, and an explicit caveat about detection
+   unreliability.
+
+**No verdict by design.** AI detection is fundamentally unreliable —
+false positives are common on careful technical writing, and lightly-
+edited LLM output evades easy classification. The bot describes what
+it sees and lets you decide.
+
+**Trigger requires the bare keyword** — `litmus`, `Litmus`, `litmus.`,
+`litmus?`, etc. Sentences like "give me a litmus test of this" don't
+trigger; that's by design (avoids accidental fires).
+
+### Chained reply (`tldr litmus` etc.)
+
+Reply with multiple keywords in any order to fire both flows from a
+single reply:
+
+```
+@user1: this looks AI-generated to me: https://example.com/article
+@user2: tldr litmus
+🤖    [⏳ → 📰 → 🧠 → ✅] (summary embeds)
+🤖    [⏳ → 📰 → 🧠 → ✅] (litmus embed)
+```
+
+Rules:
+- Body must be ENTIRELY composed of recognised keywords (any combination
+  of `tldr` / `summarize` / `summarise` / `litmus`) plus optional
+  punctuation. Any extra word — including `and` — disables the trigger.
+- Order preserves dispatch order. `tldr litmus` runs summary first;
+  `litmus tldr` runs litmus first. The second job waits in queue while
+  the first runs (single GPU, sequential worker).
+- Duplicates dedupe: `tldr tldr` and `tldr summarize` both fire one
+  summary job (the user gets charged for one slot, not two).
+- Rate-limit + queue-cap are checked atomically. If you have one slot
+  left and reply `tldr litmus`, both are rejected — no partial fires.
+
+### Path E — Slash commands (recommended for explicit options)
 
 ```
 /summarize url:<URL> prompt:<text> model:<override>
@@ -155,6 +281,7 @@ want to customise:
 /config model:gemma-4-31B-it-Q4_K_M     # use this preset for /summarize in this channel
 /config diarize:true                     # enable diarization by default here
 /config vlm:false                        # disable VLM fallback in this channel
+/config yt_comments:false                # skip the Community Reaction embed for YT videos
 /config show:true                        # print current config without changing it
 ```
 
@@ -233,11 +360,12 @@ right-click the user → **Copy User ID**.
 | Bot reaction | Means | What to do |
 |---|---|---|
 | ⏳ | Job queued, waiting for the worker. | Wait. |
-| 🎧 | Currently downloading audio + transcribing. | Wait (~10s for short videos, minutes for long). |
-| 🧠 | Transcribed, now summarising. | Wait. |
+| 🎧 | Downloading audio (video flow). | Wait (~10s for short videos, minutes for long). |
+| 📰 | Scraping article (web flow). | Wait (~5-30s; longer when FlareSolverr fallback kicks in). |
+| 🧠 | Content acquired, now summarising. | Wait. |
 | ✅ | Done — embed has been posted. | — |
 | 🚫 | Rate limit hit. | Wait the time the bot mentions, or ask an admin to add you to bypass. |
-| ❌ | Permanent failure — won't retry. | Check the failure message; usually it's content the bot can't process (private video, no media, geo-blocked, etc.). |
+| ❌ | Permanent failure — won't retry. | Check the failure message; usually it's content the bot can't process (private video, no media, geo-blocked, hard CAPTCHA, etc.). |
 
 For ages-restricted videos: see `bot/.env.example` →
 `YT_DLP_COOKIES_FILE`. You'll need a cookies.txt from a logged-in
@@ -252,7 +380,14 @@ YouTube account mounted into the whisper container.
 make logs-bot
 
 # Whisper service health (queue, GPU, vision model status)
+make status            # whisper /api/status
 curl -s http://localhost:7860/api/status | jq
+
+# Scraper services (web URL flow)
+make logs-scraper      # both crawl4ai + flaresolverr
+make logs-crawl4ai
+make logs-flaresolverr
+make status-scraper    # probe both /health endpoints from inside the bot
 
 # What slash commands are registered?
 # (Discord client → type / in any channel → bot picker shows them.
@@ -262,6 +397,9 @@ curl -s http://localhost:7860/api/status | jq
 # Force-resync slash commands (e.g. after editing definitions).
 # Slash commands sync at startup; restart the bot:
 make restart-bot
+
+# Recreate scraper containers (e.g. after a hung Chromium instance):
+make restart-scraper
 ```
 
 ---
@@ -294,12 +432,14 @@ object:
 |---|---|
 | Just pasted a video, want a summary | URL paste (Path A) |
 | Want the bot to focus on something specific | URL + text (Path B) or `/summarize prompt:` |
-| Want explicit control over args (model, diarize) | `/summarize`, `/transcribe` (Path C) |
+| Saw an interesting article someone posted | Reply `tldr` (Path C) |
+| Wondering if an article is AI-generated / AI-spam | Reply `litmus` (Path D) |
+| Want explicit control over args (model, diarize) | `/summarize`, `/transcribe` (Path E) |
 | Need to find a past summary | `/find` |
 | Channel has different needs from defaults | `/config` (one-time) |
 | Diarized output with renaming | `/transcribe diarize:true` then 🏷️ Rename speakers |
 
-The URL-listening path stays around indefinitely — slash commands
-don't replace it, they augment it. Casual users keep pasting; power
-users use slash. Both share the same job queue, rate limits, and
-caching.
+The auto-paste, reply-trigger, and slash paths all share the same job
+queue, rate limits, and cache. None of them replace each other — pick
+whichever matches your context. Casual users keep pasting and replying
+`tldr`; power users use slash for explicit control.

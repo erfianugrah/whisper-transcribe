@@ -1,2 +1,12 @@
+# Bot dependencies — kept as compatible-release ranges (NOT exact pins like
+# the whisper service's requirements.txt) on purpose. Reasoning:
+#   - Both libs ship security/protocol fixes regularly; an exact pin requires
+#     manual bump cadence we don't have.
+#   - Bot install layer is small (~30 MB); pip cache invalidation cost is
+#     negligible compared to the multi-GB whisperx layer where exact pinning
+#     is worth the trouble.
+#   - Range bounds the major version so breaking changes still gate.
+# Bump the floor (e.g. >=2.8) when you've verified a new major.minor; the
+# upper bound prevents a future major release from breaking unannounced.
 discord.py>=2.7,<3
 aiohttp>=3.13,<4

@@ -247,8 +247,13 @@ def test_app_yt_download_uses_directory_probe():
 
 
 def test_keep_video_request_format():
-    """Bot passes keep_video=VLM_ENABLED on every yt-download call."""
-    assert '"keep_video": VLM_ENABLED' in BOT_SRC
+    """Bot passes keep_video=job.vlm_enabled on every yt-download call.
+
+    Per-job vlm_enabled lets channel config override the global default; the
+    download must reflect the *effective* setting for this job, not the
+    module-level fallback.
+    """
+    assert '"keep_video": job.vlm_enabled' in BOT_SRC
 
 
 # ─── 3. Map-reduce chunking ──────────────────────────────────────────────────
@@ -543,6 +548,32 @@ def test_sanitize_preserves_twitch_vimeo():
         assert host in out, f"{host} should be allowed"
 
 
+def test_sanitize_no_preview_evil_url():
+    """`<https://evil.com>` must not leak a dangling `<` into output."""
+    out = bot.sanitize_llm_output("see <https://evil.com> now")
+    assert "evil.com" not in out
+    assert "<" not in out, f"dangling angle bracket in: {out!r}"
+    assert "[link removed]" in out
+
+
+def test_sanitize_no_preview_allowed_url_kept():
+    """`<https://youtube.com/...>` should keep both wrapper and URL."""
+    out = bot.sanitize_llm_output("see <https://www.youtube.com/watch?v=abc> now")
+    assert "https://www.youtube.com/watch?v=abc" in out
+    # Wrapper preserved (Discord renders this as no-preview link)
+    assert "<https://www.youtube.com/watch?v=abc>" in out
+
+
+def test_sanitize_bare_url_does_not_eat_closing_angle():
+    """The bare-URL exclude class must include `>` so adjacent `<...>` survives."""
+    # If the lookbehind missed `<` AND the exclude class missed `>`, a bare-
+    # URL match would consume `evil.com>` and leave `<[link removed]`.
+    out = bot.sanitize_llm_output("prefix <https://evil.com> suffix")
+    # No mangled angle brackets should remain
+    assert "<[link removed]" not in out
+    assert "[link removed]>" not in out
+
+
 # ─── 7. Speech density routing constants exist ──────────────────────────────
 
 
@@ -551,6 +582,1341 @@ def test_speech_density_routing_constants():
     assert hasattr(bot, "SPEECH_DENSITY_SPARSE")
     assert bot.SPEECH_DENSITY_SILENT < bot.SPEECH_DENSITY_SPARSE
     assert hasattr(bot, "VLM_ENABLED")
+
+
+def test_derive_video_id_youtube_id_like():
+    """Real-looking IDs (digits + adequate length) survive verbatim."""
+    assert bot._derive_video_id("https://twitter.com/user/status/12345678") == "12345678"
+    assert bot._derive_video_id("https://x.com/u/status/9876543210") == "9876543210"
+
+
+def test_derive_video_id_handle_collisions():
+    """Profile handles (no digits) get a hash, distinct per URL."""
+    a = bot._derive_video_id("https://x.com/elonmusk")
+    b = bot._derive_video_id("https://x.com/jack")
+    assert a != b
+    assert a.startswith("u") and b.startswith("u")
+    # Same URL → stable
+    assert a == bot._derive_video_id("https://x.com/elonmusk")
+
+
+def test_derive_video_id_empty_path():
+    """No path parts → still produces a non-empty stable id."""
+    out = bot._derive_video_id("https://example.com/")
+    assert out  # non-empty
+    assert len(out) >= 5
+
+
+def test_job_vlm_enabled_default():
+    """vlm_enabled defaults to True (matches default VLM_ENABLED env)."""
+    j = bot.Job(
+        url="https://x", video_id="x", channel=object(), submitter_id=1,
+        message=object(),
+    )
+    assert j.vlm_enabled is True
+
+
+def test_job_vlm_enabled_override():
+    """Channel config can disable VLM per-channel."""
+    j = bot.Job(
+        url="https://x", video_id="x", channel=object(), submitter_id=1,
+        vlm_enabled=False, message=object(),
+    )
+    assert j.vlm_enabled is False
+
+
+def test_user_prompt_min_chars_constant():
+    """The < 3 magic became a named constant."""
+    assert hasattr(bot, "USER_PROMPT_MIN_CHARS")
+    assert bot.USER_PROMPT_MIN_CHARS == 3
+    # Below threshold returns empty
+    assert bot._extract_user_prompt("a https://youtu.be/x", ["https://youtu.be/x"]) == ""
+
+
+def test_chunk_preamble_anchors_timestamps():
+    """Map preamble must instruct the LLM to keep timestamps verbatim
+    (otherwise chunked chapters could renormalize relative to chunk start)."""
+    assert "VERBATIM" in p.CHUNK_PREAMBLE
+    assert "absolute video times" in p.CHUNK_PREAMBLE
+
+
+def test_transcribe_call_has_explicit_timeout():
+    """/api/transcribe POST overrides the 900s session default — long videos
+    on slow models would otherwise time out before completing."""
+    assert "TRANSCRIBE_TIMEOUT" in BOT_SRC
+    # Verify the constant exists and is sane
+    assert hasattr(bot, "TRANSCRIBE_TIMEOUT")
+    assert bot.TRANSCRIBE_TIMEOUT >= 600
+    # And that the call site uses it
+    assert "ClientTimeout(total=TRANSCRIBE_TIMEOUT)" in BOT_SRC
+
+
+def test_send_long_embed_total_size_guard():
+    """send_long_embed respects 6000-char total embed payload limit."""
+    assert hasattr(bot, "EMBED_TOTAL_LIMIT")
+    assert bot.EMBED_TOTAL_LIMIT == 6000
+    assert hasattr(bot, "_safe_description_len")
+    # Long title eats into the description budget
+    long_title = "x" * 250
+    short_budget = bot._safe_description_len(long_title)
+    short_budget_no_title = bot._safe_description_len("")
+    assert short_budget < short_budget_no_title
+
+
+def test_chan_cfg_vlm_enabled_wired():
+    """Per-channel vlm_enabled override flows from chan_cfg into Job."""
+    # On-message path
+    assert 'chan_cfg.get("vlm_enabled", VLM_ENABLED)' in BOT_SRC
+    # Slash-command paths (cmd_summarize + cmd_transcribe)
+    occurrences = BOT_SRC.count('chan_cfg.get("vlm_enabled", VLM_ENABLED)')
+    assert occurrences >= 3, (
+        f"vlm_enabled must be passed in on_message + cmd_summarize + cmd_transcribe "
+        f"(found {occurrences})"
+    )
+    # process() reads job.vlm_enabled, not module-level VLM_ENABLED
+    assert "job.vlm_enabled and (user_forced_vlm" in BOT_SRC
+
+
+def test_no_assert_http():
+    """`assert http` strips under `python -O`. All call sites must use an
+    explicit raise instead."""
+    # Comment lines like "Replaces `assert http`" are fine; flag actual code.
+    lines = BOT_SRC.splitlines()
+    bad = [
+        i + 1 for i, line in enumerate(lines)
+        if line.strip() == "assert http"
+    ]
+    assert not bad, f"`assert http` survives at lines: {bad}"
+
+
+# ─── Web URL summary flow ────────────────────────────────────────────────────
+
+
+def test_reply_trigger_regex_matches_keywords():
+    """`tldr`, `summarize`, `summarise` (with optional punctuation) trigger."""
+    matches = [
+        "tldr", "TLDR", "tldr.", "tldr!", " tldr ", "Tldr",
+        "summarize", "Summarise", "summarise.",
+    ]
+    for s in matches:
+        assert bot.REPLY_TRIGGER_RE.match(s), f"should match: {s!r}"
+
+
+def test_reply_trigger_regex_rejects_sentences():
+    """A sentence containing the keyword must NOT trigger — only bare keyword."""
+    rejects = [
+        "give me a tldr of this",
+        "tldr please",
+        "I'll tldr it later",
+        "summarize this article",
+        "",
+        "lol",
+        "tldr;",  # semicolons aren't typical sentence punctuation here
+    ]
+    for s in rejects:
+        m = bot.REPLY_TRIGGER_RE.match(s)
+        # `tldr;` is the edge case: semicolon isn't in our class so it rejects
+        if s == "tldr;":
+            assert not m, f"should reject: {s!r}"
+        else:
+            assert not m, f"should reject: {s!r}"
+
+
+def test_extract_first_url_skips_discord_internal():
+    """Discord channel/message links should be ignored — they aren't articles."""
+    text = "see https://discord.com/channels/1/2/3 then https://example.com/x"
+    assert bot._extract_first_url(text) == "https://example.com/x"
+
+
+def test_extract_first_url_trims_trailing_punctuation():
+    text = "look at https://example.com/article."
+    assert bot._extract_first_url(text) == "https://example.com/article"
+
+
+def test_extract_first_url_returns_none_when_no_url():
+    assert bot._extract_first_url("just text, no link") is None
+    assert bot._extract_first_url("") is None
+    assert bot._extract_first_url(None) is None
+
+
+def test_hash_url_stable_and_distinct():
+    a = bot._hash_url("https://example.com/foo")
+    b = bot._hash_url("https://example.com/bar")
+    assert a == bot._hash_url("https://example.com/foo")  # stable
+    assert a != b
+    assert a.startswith("w") and len(a) == 11
+
+
+def test_is_video_url():
+    """Known video domains classify as video; arbitrary blogs do not."""
+    assert bot._is_video_url("https://www.youtube.com/watch?v=abc")
+    assert bot._is_video_url("https://twitch.tv/user")
+    assert not bot._is_video_url("https://news.example.com/article")
+    assert not bot._is_video_url("https://github.com/user/repo")
+
+
+def test_job_kind_dispatch():
+    """Job.kind defaults to 'video'; web jobs explicitly set kind='web'."""
+    j_default = bot.Job(
+        url="x", video_id="x", channel=object(), submitter_id=1,
+        message=object(),
+    )
+    assert j_default.kind == "video"
+    j_web = bot.Job(
+        url="x", video_id="x", channel=object(), submitter_id=1,
+        kind="web", message=object(),
+    )
+    assert j_web.kind == "web"
+    # Invalid kind rejected
+    try:
+        bot.Job(url="x", video_id="x", channel=object(), submitter_id=1,
+                kind="bogus", message=object())
+    except ValueError as e:
+        assert "kind" in str(e)
+    else:
+        raise AssertionError("invalid kind should raise")
+
+
+def test_looks_like_cf_challenge():
+    """Short text containing CF markers → True; long article → False."""
+    assert bot._looks_like_cf_challenge("Just a moment...\nChecking your browser.")
+    assert bot._looks_like_cf_challenge("ddos protection by cloudflare")
+    # Long article that mentions Cloudflare in passing — not a challenge
+    long_text = "Cloudflare announced new features. " + "x " * 1500
+    assert not bot._looks_like_cf_challenge(long_text)
+    assert not bot._looks_like_cf_challenge("")
+
+
+def test_html_to_text_strips_scripts_and_tags():
+    html = """
+    <html><head><title>x</title>
+    <script>evil();</script>
+    <style>body{display:none}</style>
+    </head>
+    <body><h1>Title</h1><p>Hello <b>world</b>.</p>
+    <script>more();</script></body></html>
+    """
+    out = bot._html_to_text(html)
+    assert "evil()" not in out
+    assert "display:none" not in out
+    assert "Title" in out
+    assert "Hello" in out and "world" in out
+
+
+def test_derive_title_from_markdown_uses_h1():
+    md = "# My Article\n\nLorem ipsum"
+    assert bot._derive_title_from_markdown(md, "https://x.com/p") == "My Article"
+
+
+def test_derive_title_from_markdown_falls_back_to_host():
+    md = "Just body text, no heading"
+    assert bot._derive_title_from_markdown(md, "https://news.example.com/p") == "news.example.com"
+
+
+def test_web_prompts_have_security_rules():
+    """Article prompts must inherit REF_RULES_WEB security/citation rules."""
+    for tmpl in (p.PROMPT_BRIEF_WEB, p.PROMPT_KEY_POINTS_WEB, p.PROMPT_SECTIONS):
+        assert "STRICT RULES" in tmpl
+        assert "<article>" in tmpl
+        assert "UNTRUSTED USER CONTENT" in tmpl
+
+
+def test_web_prompts_have_source_placeholder():
+    """Web prompts include {source} for the article's host (vs {duration} on video)."""
+    for tmpl in (p.PROMPT_BRIEF_WEB, p.PROMPT_KEY_POINTS_WEB, p.PROMPT_SECTIONS):
+        assert "{source}" in tmpl
+
+
+def test_sections_prompt_has_no_timestamp_instructions():
+    """PROMPT_SECTIONS is the chapters analogue without timestamps."""
+    assert "[H:MM:SS]" not in p.PROMPT_SECTIONS
+    assert "[MM:SS]" not in p.PROMPT_SECTIONS
+    assert "timestamp" in p.PROMPT_SECTIONS.lower()  # only as a NEGATIVE instruction
+    assert "No timestamps" in p.PROMPT_SECTIONS
+
+
+def test_worker_dispatches_on_kind():
+    """Worker picks process_litmus / process_url / process based on kind."""
+    src = BOT_SRC
+    # New three-way dispatch: litmus / web / default-video
+    assert 'if job.kind == "litmus":' in src
+    assert "handler = process_litmus" in src
+    assert 'elif job.kind == "web":' in src
+    assert "handler = process_url" in src
+    assert "handler = process" in src
+    assert "await handler(job)" in src
+
+
+def test_scraper_config_present():
+    """Bot exposes scraper config + functions."""
+    for name in ("SCRAPER_API", "FLARESOLVERR_API", "SCRAPER_TIMEOUT",
+                 "fetch_article", "_fetch_via_crawl4ai", "_fetch_via_flaresolverr",
+                 "process_url", "_handle_reply_trigger"):
+        assert hasattr(bot, name), f"missing: {name}"
+
+
+def test_process_url_uses_web_prompts_not_video():
+    """process_url() must use PROMPT_*_WEB and PROMPT_SECTIONS, not the
+    video templates (would emit timestamp instructions for an article)."""
+    import inspect
+    src = inspect.getsource(bot.process_url)
+    assert "PROMPT_BRIEF_WEB" in src
+    assert "PROMPT_KEY_POINTS_WEB" in src
+    assert "PROMPT_SECTIONS" in src
+    assert "PROMPT_CHAPTERS" not in src  # would inject timestamps
+
+
+# ─── URL routing (clear-video classifier + NotAVideoError fallback) ──────────
+
+
+def test_clearly_video_url_youtube():
+    """YouTube watch / shorts / live / youtu.be all classify as video."""
+    for url in (
+        "https://www.youtube.com/watch?v=abc123",
+        "https://m.youtube.com/watch?v=abc",
+        "https://music.youtube.com/watch?v=abc",
+        "https://youtube.com/shorts/xyz",
+        "https://www.youtube.com/live/abcdefg",
+        "https://youtu.be/abcdefghijk",
+    ):
+        assert bot._is_clearly_video_url(url), f"should be video: {url}"
+
+
+def test_clearly_video_url_twitch():
+    """Twitch VODs, clips, and live streams classify as video."""
+    for url in (
+        "https://clips.twitch.tv/SomeClip",
+        "https://www.twitch.tv/videos/12345",
+        "https://twitch.tv/streamer",
+        "https://twitch.tv/streamer/",
+    ):
+        assert bot._is_clearly_video_url(url), f"should be video: {url}"
+
+
+def test_clearly_video_url_other_platforms():
+    cases = [
+        "https://vimeo.com/123456",
+        "https://player.vimeo.com/video/123456",
+        "https://vimeo.com/channels/staffpicks/12345",
+        "https://www.tiktok.com/@user/video/12345",
+        "https://vm.tiktok.com/abc",
+        "https://v.redd.it/somevideoid",
+        "https://www.dailymotion.com/video/x123",
+        "https://dai.ly/x123",
+        "https://rumble.com/v123abc-some-title",
+        "https://www.bilibili.com/video/BV1xx411c7mD",
+        "https://b23.tv/abc",
+        "https://soundcloud.com/artist/track-name",
+    ]
+    for url in cases:
+        assert bot._is_clearly_video_url(url), f"should be video: {url}"
+
+
+def test_clearly_video_url_rejects_text_posts():
+    """The whole point of this classifier — text posts on video-hosting
+    domains must NOT classify as video. This is the bug the screenshot
+    shows: reddit.com text post URLs were being routed to yt-dlp.
+    """
+    cases = [
+        # The exact URL from the bug report
+        "https://www.reddit.com/r/television/comments/1t7sehx/karl_urban_is_officially_done_with_the_boys_but/",
+        # Other plain reddit URLs
+        "https://reddit.com/r/python",
+        "https://www.reddit.com/user/someone",
+        # Twitter / X text posts (no video)
+        "https://twitter.com/user/status/123",
+        "https://x.com/user/status/123",
+        # Instagram profile / posts (mixed; play it safe — web)
+        "https://instagram.com/user",
+        "https://www.instagram.com/p/ABC123/",
+        # Profile pages on video sites
+        "https://www.youtube.com/@channelname",
+        "https://www.youtube.com/c/ChannelName/about",
+        # Generic article URLs (the actual destination of the redirect chain)
+        "https://collider.com/karl-urban-the-boys-ending/",
+        "https://news.example.com/article",
+        "https://github.com/user/repo",
+        # Empty / nonsense
+        "",
+        "not a url",
+    ]
+    for url in cases:
+        assert not bot._is_clearly_video_url(url), \
+            f"should NOT be video: {url}"
+
+
+def test_not_a_video_error_class():
+    """NotAVideoError is a PermanentError subclass — skips transient retries."""
+    assert issubclass(bot.NotAVideoError, bot.PermanentError)
+
+
+def test_not_a_video_error_classification():
+    """'Unsupported URL' style errors classify as not-a-video."""
+    cases = [
+        "Unsupported URL: https://collider.com/article",
+        "ERROR: 'foo' is not a valid URL",
+        "No video could be found in this tweet",
+        "There's no video in this post",
+        "No media found",
+        "No video formats found",
+    ]
+    for s in cases:
+        assert bot._is_not_a_video_error(s), f"should classify: {s!r}"
+
+
+def test_not_a_video_error_excludes_gating_failures():
+    """Private / members-only / geo-blocked errors must NOT classify as
+    not-a-video — falling through to the article URL would fail the same
+    way (paywalled content, etc.) so we want a clean PermanentError."""
+    cases = [
+        "Sign in to confirm your age",
+        "Private video",
+        "members-only content",
+        "blocked it on copyright grounds",
+        "blocked it in your country",
+        "Premieres in 2 days",
+        "This live event will begin",
+    ]
+    for s in cases:
+        assert not bot._is_not_a_video_error(s), \
+            f"should NOT classify as not-a-video: {s!r}"
+
+
+def test_reply_trigger_routes_reddit_text_to_web():
+    """Bug from screenshot: tldr reply to reddit text post URL was sent
+    to video pipeline. Now it must route to web."""
+    url = "https://www.reddit.com/r/x/comments/abc/title/"
+    # The classifier is the only routing decision in _handle_reply_trigger
+    # for kind. Verify the source uses _is_clearly_video_url.
+    src = BOT_SRC
+    # Reply-trigger handler should use _is_clearly_video_url, not _is_video_url
+    handler_src = src[src.index("async def _handle_reply_trigger"):
+                       src.index("# ─── Web scraper client")]
+    assert "_is_clearly_video_url(url)" in handler_src
+    assert "_is_video_url(url)" not in handler_src
+    # Sanity: that classifier returns False for the reddit URL
+    assert not bot._is_clearly_video_url(url)
+
+
+def test_on_message_uses_clear_video_classifier():
+    """Auto-paste should NOT trigger on text-post URLs from video-hosting
+    domains. on_message must filter VIDEO_URL_PATTERN matches through
+    _is_clearly_video_url before queueing."""
+    src = BOT_SRC
+    on_msg = src[src.index("async def on_message"):
+                  src.index("# ─── Reply-trigger handler")]
+    assert "_is_clearly_video_url(url)" in on_msg
+
+
+def test_explicit_request_field():
+    """Job.explicit_request defaults False — auto-paste; reply-trigger and
+    slash sites set True."""
+    j = bot.Job(url="x", video_id="x", channel=object(), submitter_id=1,
+                message=object())
+    assert j.explicit_request is False
+    j2 = bot.Job(url="x", video_id="x", channel=object(), submitter_id=1,
+                 explicit_request=True, message=object())
+    assert j2.explicit_request is True
+
+
+def test_worker_handles_not_a_video_error():
+    """Worker source must contain the NotAVideoError handling branch
+    that falls through to web for explicit jobs and silent-drops for
+    auto-paste."""
+    src = BOT_SRC
+    worker_src = src[src.index("async def worker"):
+                      src.index("async def process(job: Job)")]
+    assert "except NotAVideoError" in worker_src
+    assert "job.explicit_request" in worker_src
+    assert 'job.kind = "web"' in worker_src
+    assert "silent_drop" in worker_src
+
+
+def test_video_path_raises_not_a_video_on_unsupported():
+    """process() must distinguish NotAVideoError from generic PermanentError
+    so the worker can route correctly."""
+    src = BOT_SRC
+    process_src = src[src.index("async def process(job: Job):"):
+                       src.index("async def process_url")]
+    assert "NotAVideoError" in process_src
+    assert "_is_not_a_video_error(err)" in process_src
+
+
+def test_processing_emoji_distinguishes_video_and_web():
+    """🎧 (audio download) vs 📰 (article scrape) — users see at a glance
+    what the bot is doing."""
+    assert hasattr(bot, "PROCESSING_EMOJI_VIDEO")
+    assert hasattr(bot, "PROCESSING_EMOJI_WEB")
+    assert bot.PROCESSING_EMOJI_VIDEO == "\U0001f3a7"  # 🎧
+    assert bot.PROCESSING_EMOJI_WEB == "\U0001f4f0"    # 📰
+    assert bot.PROCESSING_EMOJI_VIDEO != bot.PROCESSING_EMOJI_WEB
+    # Cleanup tuple covers BOTH so a kind-switch leaves no stale reaction
+    assert bot.PROCESSING_EMOJI_VIDEO in bot.PROCESSING_EMOJI
+    assert bot.PROCESSING_EMOJI_WEB in bot.PROCESSING_EMOJI
+
+
+def test_video_path_uses_video_emoji():
+    """process() must react with the video emoji, not the web one."""
+    src = BOT_SRC
+    process_src = src[src.index("async def process(job: Job):"):
+                       src.index("async def process_url")]
+    assert "PROCESSING_EMOJI_VIDEO" in process_src
+    assert "PROCESSING_EMOJI_WEB" not in process_src
+
+
+def test_web_path_uses_web_emoji():
+    """process_url() must react with the web emoji, not the video one."""
+    src = BOT_SRC
+    web_src = src[src.index("async def process_url"):
+                   src.index("# Per-task model override")]
+    assert "PROCESSING_EMOJI_WEB" in web_src
+    assert "PROCESSING_EMOJI_VIDEO" not in web_src
+
+
+# ─── Reddit-specific scraper ─────────────────────────────────────────────────
+
+
+def test_is_reddit_post_url():
+    """Detects /r/<sub>/comments/<id>/... across www/old/np/sh subdomains."""
+    matches = [
+        "https://www.reddit.com/r/television/comments/1t7sehx/karl_urban_/",
+        "https://reddit.com/r/python/comments/abc123/title/",
+        "https://old.reddit.com/r/news/comments/xyz/title/",
+        "https://np.reddit.com/r/x/comments/aaa/y/",
+        "https://sh.reddit.com/r/x/comments/aaa/y/",
+    ]
+    for url in matches:
+        assert bot._is_reddit_post_url(url), f"should match: {url}"
+
+
+def test_is_reddit_post_url_rejects_non_post():
+    """Subreddit listings, user pages, /comments/ root etc. don't match."""
+    rejects = [
+        "https://reddit.com/r/python",
+        "https://www.reddit.com/r/python/hot",
+        "https://www.reddit.com/user/someone",
+        "https://www.reddit.com/comments",
+        "https://www.reddit.com/",
+        "https://example.com/r/foo/comments/1/x/",
+    ]
+    for url in rejects:
+        assert not bot._is_reddit_post_url(url), f"should NOT match: {url}"
+
+
+def test_format_reddit_comment_basic():
+    node = {
+        "kind": "t1",
+        "data": {"author": "alice", "score": 42, "body": "Hello world.", "replies": ""},
+    }
+    out = bot._format_reddit_comment(node, depth=0, max_depth=1)
+    assert "u/alice" in out
+    assert "42 pts" in out
+    assert "Hello world." in out
+
+
+def test_format_reddit_comment_skips_deleted():
+    for body in ("[deleted]", "[removed]", ""):
+        node = {"kind": "t1", "data": {"author": "x", "score": 1, "body": body}}
+        assert bot._format_reddit_comment(node, 0, 1) == ""
+
+
+def test_format_reddit_comment_includes_replies_to_depth():
+    node = {
+        "kind": "t1",
+        "data": {
+            "author": "a", "score": 10, "body": "parent",
+            "replies": {
+                "data": {
+                    "children": [
+                        {"kind": "t1", "data": {
+                            "author": "b", "score": 5, "body": "child1",
+                            "replies": "",
+                        }},
+                        {"kind": "t1", "data": {
+                            "author": "c", "score": 3, "body": "child2",
+                            "replies": "",
+                        }},
+                    ]
+                }
+            },
+        },
+    }
+    out = bot._format_reddit_comment(node, 0, max_depth=1)
+    assert "parent" in out
+    assert "child1" in out and "child2" in out
+    # depth-2 grandchildren would NOT appear if max_depth=1
+    out_depth0 = bot._format_reddit_comment(node, 0, max_depth=0)
+    assert "parent" in out_depth0
+    assert "child1" not in out_depth0
+
+
+def test_format_reddit_comment_truncates_long_bodies():
+    long_body = "x" * 3000
+    node = {"kind": "t1", "data": {"author": "a", "score": 1, "body": long_body}}
+    out = bot._format_reddit_comment(node, 0, 1)
+    # Cap is 2000 chars + ellipsis
+    assert "x" * 2000 in out
+    assert "x" * 2001 not in out
+    assert "…" in out
+
+
+def test_build_reddit_markdown_self_post():
+    """Self-post (no link) — no 'Linked article' section."""
+    post = {
+        "title": "How do I X?", "subreddit": "python", "author": "alice",
+        "selftext": "I'm trying to do X but Y happens.",
+        "is_self": True, "score": 42, "num_comments": 5,
+        "url": "https://www.reddit.com/r/python/comments/abc/how_do_i_x/",
+    }
+    comments = [{"kind": "t1", "data": {
+        "author": "bob", "score": 100, "body": "Use Z.", "replies": "",
+    }}]
+    title, body = bot._build_reddit_markdown(post, comments, None, "", None)
+    assert title == "How do I X?"
+    assert "Linked article" not in body
+    assert "r/python" in body
+    assert "u/alice" in body and "I'm trying to do X" in body
+    assert "Top 1 comments" in body
+    assert "u/bob" in body and "Use Z." in body
+
+
+def test_build_reddit_markdown_link_post_with_article():
+    """Link post + article scraped → article section + reddit section."""
+    post = {
+        "title": "Karl Urban interview", "subreddit": "television",
+        "author": "DaddyCool", "selftext": "", "is_self": False,
+        "score": 500, "num_comments": 50,
+        "url": "https://collider.com/karl-urban-interview/",
+    }
+    article_md = "# Karl Urban Is Done\n\nKarl Urban said in an interview..."
+    title, body = bot._build_reddit_markdown(
+        post, [], article_md,
+        "https://collider.com/karl-urban-interview/", None,
+    )
+    assert "Linked article" in body
+    assert "collider.com" in body
+    assert "Karl Urban Is Done" in body
+    assert "r/television" in body
+    assert "DaddyCool" in body
+
+
+def test_build_reddit_markdown_link_post_with_article_error():
+    """Link post + article fetch failed → note in markdown, reddit content still present."""
+    post = {
+        "title": "Big news", "subreddit": "news", "author": "u1",
+        "selftext": "", "is_self": False, "score": 10, "num_comments": 2,
+        "url": "https://paywalled.example/article",
+    }
+    title, body = bot._build_reddit_markdown(
+        post, [], None, "https://paywalled.example/article",
+        "permanent: 403 Forbidden",
+    )
+    assert "Article unreachable" in body
+    assert "permanent: 403" in body
+    assert "r/news" in body  # discussion section still present
+
+
+def test_build_reddit_markdown_orders_comments_by_score():
+    """Top N comments must be sorted by score, descending."""
+    post = {"title": "T", "subreddit": "x", "author": "u", "selftext": "",
+            "is_self": True, "score": 1, "num_comments": 3,
+            "url": "https://reddit.com/r/x/comments/a/t/"}
+    comments = [
+        {"kind": "t1", "data": {"author": "low", "score": 1, "body": "low", "replies": ""}},
+        {"kind": "t1", "data": {"author": "high", "score": 100, "body": "high", "replies": ""}},
+        {"kind": "t1", "data": {"author": "mid", "score": 50, "body": "mid", "replies": ""}},
+    ]
+    _, body = bot._build_reddit_markdown(post, comments, None, "", None)
+    # high should appear before mid which should appear before low
+    high_pos = body.index("high")
+    mid_pos = body.index("mid")
+    low_pos = body.index("low")
+    assert high_pos < mid_pos < low_pos
+
+
+def test_build_reddit_markdown_skips_deleted_comments():
+    post = {"title": "T", "subreddit": "x", "author": "u", "selftext": "",
+            "is_self": True, "score": 1, "num_comments": 0,
+            "url": "https://reddit.com/r/x/comments/a/t/"}
+    comments = [
+        {"kind": "t1", "data": {"author": "x", "score": 100, "body": "[deleted]", "replies": ""}},
+        {"kind": "t1", "data": {"author": "y", "score": 50, "body": "[removed]", "replies": ""}},
+        {"kind": "t1", "data": {"author": "z", "score": 1, "body": "real", "replies": ""}},
+    ]
+    _, body = bot._build_reddit_markdown(post, comments, None, "", None)
+    assert "[deleted]" not in body
+    assert "[removed]" not in body
+    assert "real" in body
+    assert "Top 1 comments" in body
+
+
+def test_fetch_article_routes_reddit_url_first():
+    """fetch_article must check _is_reddit_post_url before generic Crawl4AI."""
+    import inspect
+    src = inspect.getsource(bot.fetch_article)
+    # Reddit branch should appear before the generic Crawl4AI call
+    reddit_pos = src.index("_is_reddit_post_url")
+    crawl_pos = src.index("_fetch_via_crawl4ai")
+    assert reddit_pos < crawl_pos, \
+        "Reddit special-case must run before generic crawl4ai fallback"
+
+
+# ─── Reddit-flavoured prompts ────────────────────────────────────────────────
+
+
+def test_reddit_prompts_exist():
+    """All six Reddit prompt variants are exported from bot.prompts."""
+    for name in (
+        "PROMPT_BRIEF_REDDIT", "PROMPT_KEY_POINTS_REDDIT", "PROMPT_SECTIONS_REDDIT",
+        "REDUCE_BRIEF_REDDIT", "REDUCE_KEY_POINTS_REDDIT", "REDUCE_SECTIONS_REDDIT",
+    ):
+        assert hasattr(p, name), f"missing prompt: {name}"
+
+
+def test_reddit_prompts_mention_comments():
+    """The whole point — Reddit prompts must explicitly tell the LLM to
+    surface comment perspectives, not just the article."""
+    for tmpl in (p.PROMPT_BRIEF_REDDIT, p.PROMPT_KEY_POINTS_REDDIT,
+                 p.PROMPT_SECTIONS_REDDIT):
+        lower = tmpl.lower()
+        assert "comment" in lower, "prompt must mention comments"
+        # Must instruct the model that this is a multi-source document
+        assert ("reddit" in lower) or ("community" in lower) or ("commenters" in lower)
+
+
+def test_reddit_key_points_has_two_section_structure():
+    """key_points Reddit prompt requires two clearly-marked sections so the
+    bot's output explicitly separates article from reaction."""
+    tmpl = p.PROMPT_KEY_POINTS_REDDIT
+    assert "About the article" in tmpl or "About the article / post" in tmpl
+    assert "Community reaction" in tmpl
+
+
+def test_reddit_sections_prompt_lists_required_sections():
+    """sections Reddit prompt must enumerate the structure to enforce."""
+    tmpl = p.PROMPT_SECTIONS_REDDIT
+    # Required headings the LLM should produce
+    for required in ("Linked article", "Original post", "Community reaction"):
+        assert required in tmpl, f"Missing required section guidance: {required}"
+
+
+def test_reddit_prompts_have_security_rules():
+    """Reddit prompts must inherit REF_RULES_WEB security/citation rules."""
+    for tmpl in (p.PROMPT_BRIEF_REDDIT, p.PROMPT_KEY_POINTS_REDDIT,
+                 p.PROMPT_SECTIONS_REDDIT):
+        assert "STRICT RULES" in tmpl
+        assert "<article>" in tmpl
+        assert "UNTRUSTED USER CONTENT" in tmpl
+
+
+def test_reddit_prompts_use_source_placeholder():
+    """Reddit prompts use {source} like the web prompts."""
+    for tmpl in (p.PROMPT_BRIEF_REDDIT, p.PROMPT_KEY_POINTS_REDDIT,
+                 p.PROMPT_SECTIONS_REDDIT):
+        assert "{source}" in tmpl
+
+
+def test_process_url_routes_reddit_to_reddit_prompts():
+    """When body contains Reddit structural markers OR URL is reddit, use
+    Reddit prompts. Source-level check (process_url uses the variables)."""
+    import inspect
+    src = inspect.getsource(bot.process_url)
+    # Detection logic must consider both URL and body markers
+    assert "_is_reddit_post_url(job.url)" in src
+    assert "# Reddit discussion" in src
+    assert "## Top " in src
+    # Both prompt families must be referenced
+    assert "PROMPT_BRIEF_REDDIT" in src
+    assert "PROMPT_BRIEF_WEB" in src  # fallback
+    assert "PROMPT_SECTIONS_REDDIT" in src
+    assert "REDUCE_KEY_POINTS_REDDIT" in src
+
+
+def test_reddit_detection_by_url_alone():
+    """Sanity: _is_reddit_post_url returns True for Reddit URLs even when
+    we're checking process_url routing in isolation."""
+    assert bot._is_reddit_post_url(
+        "https://www.reddit.com/r/television/comments/1t7sehx/karl_urban/"
+    )
+
+
+# ─── YouTube comments (Community Reaction embed) ─────────────────────────────
+
+
+def test_yt_comments_constants():
+    """Default config: comments enabled, sane caps."""
+    assert hasattr(bot, "YT_COMMENTS_ENABLED")
+    assert bot.YT_COMMENTS_ENABLED is True
+    assert bot.YT_COMMENTS_MAX == 100
+    assert bot.YT_COMMENT_MIN_CHARS == 40
+    assert bot.YT_COMMENT_SUMMARY_TOP_N == 30
+
+
+def test_job_yt_comments_field():
+    """Job carries yt_comments_enabled, default True (matches global default)."""
+    j = bot.Job(url="x", video_id="x", channel=object(), submitter_id=1,
+                message=object())
+    assert j.yt_comments_enabled is True
+    j2 = bot.Job(url="x", video_id="x", channel=object(), submitter_id=1,
+                 yt_comments_enabled=False, message=object())
+    assert j2.yt_comments_enabled is False
+
+
+def test_filter_yt_comments_drops_short_and_emoji_only():
+    """Substantive comments only — no 'first', no 🔥🔥🔥, no <40 chars."""
+    comments = [
+        {"text": "First!", "author": "a", "like_count": 5},
+        {"text": "🔥🔥🔥💯💯", "author": "b", "like_count": 100},
+        {"text": "lol", "author": "c", "like_count": 50},
+        {"text": "x" * 50, "author": "d", "like_count": 10},  # substantive
+        {"text": "This is a thoughtful long comment with real content.",
+         "author": "e", "like_count": 25},
+    ]
+    out = bot.filter_yt_comments(comments)
+    authors = {c["author"] for c in out}
+    assert "d" in authors and "e" in authors
+    assert "a" not in authors
+    assert "b" not in authors
+    assert "c" not in authors
+
+
+def test_filter_yt_comments_ranks_pinned_first():
+    """Pinned > hearted > likes."""
+    comments = [
+        {"text": "x" * 100, "author": "high_likes",
+         "like_count": 1000, "is_pinned": False, "is_favorited": False},
+        {"text": "x" * 100, "author": "hearted",
+         "like_count": 50, "is_pinned": False, "is_favorited": True},
+        {"text": "x" * 100, "author": "pinned",
+         "like_count": 10, "is_pinned": True, "is_favorited": False},
+    ]
+    out = bot.filter_yt_comments(comments, top_n=3)
+    # Pinned first, then hearted, then high-likes
+    assert [c["author"] for c in out] == ["pinned", "hearted", "high_likes"]
+
+
+def test_filter_yt_comments_respects_top_n():
+    comments = [
+        {"text": "x" * 100, "author": f"u{i}", "like_count": 100 - i}
+        for i in range(50)
+    ]
+    out = bot.filter_yt_comments(comments, top_n=10)
+    assert len(out) == 10
+    # Sorted by likes desc — u0 (100 likes) first
+    assert out[0]["author"] == "u0"
+
+
+def test_filter_yt_comments_empty_input():
+    assert bot.filter_yt_comments([]) == []
+    assert bot.filter_yt_comments(None or []) == []
+
+
+def test_format_yt_comments_tags_creator_engagement():
+    """📌 pinned + ❤️ creator-hearted tags appear when set."""
+    comments = [
+        {"text": "Hello world testing", "author": "alice",
+         "like_count": 100, "is_pinned": True, "is_favorited": True,
+         "author_is_uploader": False, "parent": "root"},
+        {"text": "Reply text testing", "author": "bob",
+         "like_count": 5, "is_pinned": False, "is_favorited": False,
+         "author_is_uploader": False, "parent": "abc123"},
+    ]
+    out = bot.format_yt_comments(comments)
+    assert "📌pinned" in out
+    assert "creator-hearted" in out
+    assert "alice" in out and "bob" in out
+    # Reply (parent != root) should be indented
+    assert "  - " in out
+
+
+def test_format_yt_comments_truncates_long_bodies():
+    long_body = "x" * 2500
+    comments = [{
+        "text": long_body, "author": "a", "like_count": 1,
+        "is_pinned": False, "is_favorited": False,
+        "author_is_uploader": False, "parent": "root",
+    }]
+    out = bot.format_yt_comments(comments)
+    # 1500-char cap + ellipsis
+    assert "x" * 1500 in out
+    assert "x" * 1501 not in out
+    assert "…" in out
+
+
+def test_yt_comments_prompt_exists():
+    """PROMPT_YT_COMMENTS + REDUCE_YT_COMMENTS exported from prompts."""
+    assert hasattr(p, "PROMPT_YT_COMMENTS")
+    assert hasattr(p, "REDUCE_YT_COMMENTS")
+    assert "{title}" in p.PROMPT_YT_COMMENTS
+    assert "{duration}" in p.PROMPT_YT_COMMENTS
+    assert "{char_cap}" in p.PROMPT_YT_COMMENTS
+    assert "{transcript}" in p.PROMPT_YT_COMMENTS
+
+
+def test_yt_comments_prompt_emphasises_creator_engagement():
+    """The whole reason we tag pinned/hearted comments — prompt must use them."""
+    tmpl = p.PROMPT_YT_COMMENTS.lower()
+    assert "pinned" in tmpl
+    assert "hearted" in tmpl or "engagement" in tmpl
+    # Asks for substantive structure
+    assert "agree" in tmpl
+    assert "disagree" in tmpl or "disagreement" in tmpl
+
+
+def test_process_uses_yt_comments_pipeline():
+    """process() must request comments from the server, filter, summarize,
+    and post the 4th embed."""
+    src = BOT_SRC
+    # Download payload includes comment params
+    assert '"include_comments": job.yt_comments_enabled' in src
+    assert "YT_COMMENTS_MAX" in src
+    # Result picked up
+    assert 'dl.get("comments")' in src
+    # Filter + summarize step
+    assert "filter_yt_comments(raw_comments)" in src
+    assert "PROMPT_YT_COMMENTS" in src
+    # 4th embed
+    assert '"Community Reaction"' in src
+
+
+def test_yt_download_payload_has_comments_fields():
+    """The HTTP request to /api/yt-download includes the comment knobs the
+    server expects."""
+    src = BOT_SRC
+    # Find the download_payload dict literal (small window after the marker)
+    start = src.index("download_payload = {")
+    end = src.index("}", start)
+    payload_section = src[start:end]
+    assert '"include_comments"' in payload_section
+    assert '"comments_max"' in payload_section
+    assert '"comments_sort"' in payload_section
+
+
+def test_server_yt_download_extracts_comments():
+    """app.py's /api/yt-download endpoint passes --get-comments and parses
+    the result via _extract_comments."""
+    assert "include_comments" in APP_SRC
+    assert "--get-comments" in APP_SRC
+    assert "_extract_comments" in APP_SRC
+    # Helper exists and pulls out the right fields
+    assert "is_favorited" in APP_SRC  # creator-hearted flag
+    assert "author_is_uploader" in APP_SRC
+    assert "is_pinned" in APP_SRC
+
+
+def test_config_command_has_yt_comments_param():
+    """/config gained yt_comments toggle so channels can opt out."""
+    src = BOT_SRC
+    cmd_src = src[src.index('@bot.tree.command(name="config"'):
+                   src.index('@bot.tree.command(name="serverconfig"')]
+    assert "yt_comments" in cmd_src
+    assert 'fields["yt_comments_enabled"]' in cmd_src
+
+
+# ─── AI litmus test ──────────────────────────────────────────────────────────
+
+
+def test_litmus_trigger_regex_matches():
+    """`litmus` (with optional punctuation) triggers; sentences don't."""
+    matches = ["litmus", "Litmus", "LITMUS", "litmus.", "litmus!", "litmus?",
+               " litmus ", "  litmus  "]
+    for s in matches:
+        assert bot.LITMUS_TRIGGER_RE.match(s), f"should match: {s!r}"
+
+
+def test_litmus_trigger_regex_rejects_sentences():
+    rejects = [
+        "give me a litmus test",
+        "litmus please",
+        "this is a litmus paper",
+        "tldr",  # different keyword
+        "",
+        "lol",
+    ]
+    for s in rejects:
+        assert not bot.LITMUS_TRIGGER_RE.match(s), f"should reject: {s!r}"
+
+
+def test_job_kind_accepts_litmus():
+    j = bot.Job(url="x", video_id="x", channel=object(), submitter_id=1,
+                kind="litmus", message=object())
+    assert j.kind == "litmus"
+
+
+def test_job_kind_rejects_invalid():
+    try:
+        bot.Job(url="x", video_id="x", channel=object(), submitter_id=1,
+                kind="bogus", message=object())
+    except ValueError as e:
+        assert "kind" in str(e)
+    else:
+        raise AssertionError("invalid kind should raise")
+
+
+def test_litmus_constants_exist():
+    """All litmus knobs + phrase tables exported from bot."""
+    for name in ("LLM_TIC_PHRASES", "LLM_BUZZWORDS", "LLM_HEDGE_PHRASES",
+                 "LITMUS_SKIP_LLM_BELOW", "LITMUS_SKIP_LLM_ABOVE",
+                 "WAYBACK_TIMEOUT", "LITMUS_EXCERPT_CHARS"):
+        assert hasattr(bot, name), f"missing: {name}"
+
+
+# ─── Regex signal detection ──────────────────────────────────────────────────
+
+
+def test_regex_signals_too_short():
+    """Articles below the threshold get a too_short marker."""
+    out = bot._regex_signals("hi.")
+    assert "too_short" in out
+
+
+def test_regex_signals_clean_human_text():
+    """Carefully-edited human prose shouldn't trip any high-severity signal."""
+    text = (
+        "Sarah Connor walked into the lab on a Tuesday morning. "
+        "She'd been working on the project since 2019, when funding came "
+        "through. \"It's been a long road,\" she told reporters. The team "
+        "of six engineers had spent $4.2 million on prototypes. Three of "
+        "them quit last spring. By her count, they'd shipped 47 versions. "
+        "The 48th, she said, would be the one that mattered. " * 3
+    )
+    out = bot._regex_signals(text)
+    # No high-severity signals expected on clean substantive prose
+    high_sigs = [k for k, v in out.items() if v.get("severity") == "high"]
+    assert "too_short" not in out
+    assert not high_sigs, f"unexpected high signals: {high_sigs}"
+
+
+def test_regex_signals_llm_tic_heavy():
+    """Text loaded with LLM tic phrases should fire llm_tic_phrases high."""
+    text = (
+        "In the realm of modern computing, it's worth noting that we must "
+        "delve into the rich tapestry of innovation. Moreover, this "
+        "underscores the importance of navigating the landscape with "
+        "robust, seamless, cutting-edge approaches. Furthermore, in "
+        "today's fast-paced world, we must showcase how to embark on "
+        "this transformative journey. It is important to note that "
+        "leveraging these paradigms will elevate our understanding. "
+        "Ultimately, the myriad of options stands the test of time, "
+        "shedding light on what truly matters. " * 2
+    )
+    out = bot._regex_signals(text)
+    assert "llm_tic_phrases" in out
+    assert out["llm_tic_phrases"]["severity"] in ("med", "high")
+    assert "buzzwords" in out
+    assert out["buzzwords"]["severity"] in ("med", "high")
+    assert "hedges" in out
+
+
+def test_regex_signals_em_dash_heavy():
+    """Em-dash density above ~5/1000 words flags."""
+    text = (
+        "The work — finally complete — drew praise. " * 80
+    )
+    out = bot._regex_signals(text)
+    assert "em_dash_density" in out
+    assert out["em_dash_density"]["severity"] in ("med", "high")
+
+
+def test_regex_signals_listicle_structure():
+    """Heavy heading + bullet density triggers listicle structure."""
+    text = "## Heading One\n- bullet a\n- bullet b\n- bullet c\n" * 30
+    out = bot._regex_signals(text)
+    assert "listicle_structure" in out
+
+
+def test_regex_signals_substance_present():
+    """Articles with quotes + names + dates + numbers get NO low_substance."""
+    text = (
+        '"This is a quote about something specific," Dr. Jane Smith said. '
+        "She made $1.2 million in 2024 from a 47% return. "
+        "According to Prof. John Doe, who joined in 2019, the 1990s saw "
+        "$500 billion in investments. " * 3
+    )
+    out = bot._regex_signals(text)
+    assert "low_substance" not in out  # substance present
+
+
+def test_regex_signals_low_substance_fires():
+    """Vague, no-specifics text triggers low_substance."""
+    text = (
+        "Many experts agree that the digital transformation has been "
+        "significant. Studies show that organizations are increasingly "
+        "aware of the importance of these trends. There are several "
+        "key considerations to keep in mind when navigating this space. " * 8
+    )
+    out = bot._regex_signals(text)
+    assert "low_substance" in out
+
+
+# ─── Metadata helpers ────────────────────────────────────────────────────────
+
+
+def test_extract_author_from_meta_name():
+    html = '<html><head><meta name="author" content="Jane Doe"></head></html>'
+    assert bot._extract_author_from_html(html) == "Jane Doe"
+
+
+def test_extract_author_from_meta_property():
+    html = '<meta property="article:author" content="John Smith">'
+    assert bot._extract_author_from_html(html) == "John Smith"
+
+
+def test_extract_author_from_rel_link():
+    html = '<a rel="author" href="/authors/jane">Jane Roe</a>'
+    assert bot._extract_author_from_html(html) == "Jane Roe"
+
+
+def test_extract_author_returns_none_when_missing():
+    html = "<html><body>just content</body></html>"
+    assert bot._extract_author_from_html(html) is None
+
+
+def test_detect_adsense_positive():
+    cases = [
+        '<script async src="https://pagead2.googlesyndication.com/x"></script>',
+        '<ins class="adsbygoogle"></ins>',
+        '<div data-ad-client="ca-pub-123" data-ad-slot="456"></div>',
+    ]
+    for html in cases:
+        assert bot._detect_adsense(html), f"should detect: {html!r}"
+
+
+def test_detect_adsense_negative():
+    assert not bot._detect_adsense("<html><body>just content</body></html>")
+    assert not bot._detect_adsense("")
+
+
+def test_domain_age_severity_recent():
+    """Domain first archived <6 months ago = high severity."""
+    from datetime import datetime, timezone, timedelta
+    recent = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y%m%d000000")
+    sev, text = bot._domain_age_severity(recent)
+    assert sev == "high"
+    assert "<6 months" in text
+
+
+def test_domain_age_severity_old():
+    """Domain first archived >2 years ago = low severity (established)."""
+    sev, text = bot._domain_age_severity("20100101000000")
+    assert sev == "low"
+    assert "years" in text
+
+
+def test_domain_age_severity_no_archive():
+    """No timestamp → 'no archive found', medium severity."""
+    sev, text = bot._domain_age_severity(None)
+    assert sev == "med"
+    assert "no archive" in text
+
+
+# ─── Severity aggregation + skip-LLM thresholds ──────────────────────────────
+
+
+def test_aggregate_severity_clean():
+    """Clean signals + author + old domain + no adsense = low score."""
+    score = bot._aggregate_severity(
+        signals={},
+        adsense_detected=False,
+        author_present=True,
+        domain_severity="low",
+    )
+    assert score == 0
+
+
+def test_aggregate_severity_loaded():
+    """Multiple high-severity signals + missing author + adsense + new
+    domain = high score."""
+    signals = {
+        "llm_tic_phrases": {"severity": "high"},
+        "buzzwords": {"severity": "high"},
+        "low_substance": {"severity": "high"},
+    }
+    score = bot._aggregate_severity(
+        signals=signals,
+        adsense_detected=True,
+        author_present=False,
+        domain_severity="high",
+    )
+    # 3 high signals (6) + adsense (1) + missing-author (1) + high domain (2) = 10
+    assert score >= 8
+
+
+def test_aggregate_severity_thresholds_sane():
+    """Skip-LLM thresholds bracket a reasonable middle range."""
+    assert bot.LITMUS_SKIP_LLM_BELOW < bot.LITMUS_SKIP_LLM_ABOVE
+
+
+# ─── End-to-end wiring ───────────────────────────────────────────────────────
+
+
+def test_process_litmus_exists_and_uses_helpers():
+    """process_litmus orchestrates the pieces."""
+    import inspect
+    src = inspect.getsource(bot.process_litmus)
+    # All key helpers referenced
+    assert "fetch_article" in src
+    assert "_regex_signals" in src
+    assert "_fetch_raw_html" in src
+    assert "_wayback_first_seen" in src
+    assert "_detect_adsense" in src
+    assert "_extract_author_from_html" in src
+    assert "_aggregate_severity" in src
+    # LLM call only for ambiguous range
+    assert "LITMUS_SKIP_LLM_BELOW" in src
+    assert "LITMUS_SKIP_LLM_ABOVE" in src
+    assert "PROMPT_LITMUS" in src
+
+
+def test_litmus_embed_does_not_claim_verdict():
+    """The embed body must NOT use a verdict ('AI' / 'human') format.
+    Source-level check: forensic framing, no green-yellow-red verdict."""
+    src = BOT_SRC
+    fmt_src = src[src.index("def _format_litmus_signals"):
+                   src.index("def _signals_summary_for_prompt")]
+    # No "AI verdict" / "likely AI" / "likely human" language
+    forbidden = ["likely AI", "likely human", "Verdict:", "AI: yes", "Human: yes"]
+    for f in forbidden:
+        assert f not in fmt_src, f"forbidden verdict language: {f}"
+
+
+def test_litmus_prompt_forbids_verdict():
+    """Prompt must explicitly tell the model NOT to output a verdict."""
+    tmpl = p.PROMPT_LITMUS
+    assert 'verdict' in tmpl.lower()
+    # The prompt body contains the negation: "Do NOT output a verdict"
+    assert "NOT output a verdict" in tmpl or "not output a verdict" in tmpl.lower()
+
+
+def test_litmus_prompt_has_signals_placeholder():
+    """{signals_summary} is the regex-pre-pass injection point."""
+    assert "{signals_summary}" in p.PROMPT_LITMUS
+    assert "{title}" in p.PROMPT_LITMUS
+    assert "{source}" in p.PROMPT_LITMUS
+    assert "{transcript}" in p.PROMPT_LITMUS
+
+
+def test_reply_trigger_litmus_routes_to_litmus_kind():
+    """_handle_reply_trigger litmus branch must build a Job(kind='litmus')
+    and bypass the video classifier."""
+    src = BOT_SRC
+    handler_src = src[src.index("async def _handle_reply_trigger"):
+                       src.index("# ─── Web scraper client")]
+    # litmus branch in the per-hint loop sets kind="litmus"
+    assert 'kind="litmus"' in handler_src
+    # Discriminator on the looped hint variable
+    assert 'if hint == "litmus":' in handler_src
+
+
+def test_on_message_routes_litmus_keyword():
+    """on_message uses the unified keyword parser to dispatch chained replies."""
+    src = BOT_SRC
+    on_msg = src[src.index("async def on_message"):
+                  src.index("# ─── Reply-trigger handler")]
+    # Unified parser does the routing; both keywords flow through it.
+    assert "_parse_trigger_keywords" in on_msg
+    assert "kind_hints=hints" in on_msg
+
+
+# ─── Chained replies (`tldr litmus`) ─────────────────────────────────────────
+
+
+def test_parse_trigger_single_keyword():
+    """Single-keyword replies still produce a 1-element list."""
+    assert bot._parse_trigger_keywords("tldr") == ["summary"]
+    assert bot._parse_trigger_keywords("TLDR") == ["summary"]
+    assert bot._parse_trigger_keywords("tldr.") == ["summary"]
+    assert bot._parse_trigger_keywords("summarize!") == ["summary"]
+    assert bot._parse_trigger_keywords("summarise") == ["summary"]
+    assert bot._parse_trigger_keywords("litmus") == ["litmus"]
+    assert bot._parse_trigger_keywords("Litmus?") == ["litmus"]
+
+
+def test_parse_trigger_chained_two_keywords():
+    """Multi-keyword reply preserves order and dedupes."""
+    assert bot._parse_trigger_keywords("tldr litmus") == ["summary", "litmus"]
+    assert bot._parse_trigger_keywords("litmus tldr") == ["litmus", "summary"]
+    assert bot._parse_trigger_keywords("LITMUS TLDR") == ["litmus", "summary"]
+    # Mixed punctuation
+    assert bot._parse_trigger_keywords("tldr, litmus.") == ["summary", "litmus"]
+    assert bot._parse_trigger_keywords("tldr! litmus?") == ["summary", "litmus"]
+
+
+def test_parse_trigger_dedups_repeats():
+    """`tldr tldr` charges the user once. `tldr summarize` likewise (both
+    map to the same hint)."""
+    assert bot._parse_trigger_keywords("tldr tldr") == ["summary"]
+    assert bot._parse_trigger_keywords("tldr summarize") == ["summary"]
+    assert bot._parse_trigger_keywords("tldr summarise summarize") == ["summary"]
+    assert bot._parse_trigger_keywords("tldr litmus tldr") == ["summary", "litmus"]
+
+
+def test_parse_trigger_rejects_sentences():
+    """Any non-keyword word → empty list (sentence triggers stay disabled)."""
+    rejects = [
+        "give me a tldr",
+        "tldr please",
+        "what's the litmus test",
+        "tldr and litmus",  # 'and' isn't a keyword
+        "tldr the article",
+        "litmus paper",
+        "lol tldr",
+        "tldr 123",  # digit token isn't a keyword
+        "",
+        "   ",
+    ]
+    for s in rejects:
+        assert bot._parse_trigger_keywords(s) == [], f"should be empty: {s!r}"
+
+
+def test_rate_limit_check_batch_count():
+    """Rate-limit check must accept a `count` parameter for batch atomic
+    enforcement (chained replies request multiple jobs in one go)."""
+    import inspect
+    sig = inspect.signature(bot._rate_limit_check)
+    assert "count" in sig.parameters
+    # Default should be 1 for backward-compat
+    assert sig.parameters["count"].default == 1
+
+
+def test_rate_limit_check_batch_rejects_overflow():
+    """Asking for N jobs when only N-1 slots remain → reject all-or-nothing."""
+    # Reset state for this test
+    bot._user_jobs.clear()
+    user = 999111
+    # Fill to MAX-1
+    for _ in range(bot.MAX_JOBS_PER_USER_PER_HOUR - 1):
+        bot._rate_limit_record(user)
+    # Single-job request: ok
+    ok, _ = bot._rate_limit_check(user, count=1)
+    assert ok
+    # Two-job request: would overflow → reject
+    ok, reason = bot._rate_limit_check(user, count=2)
+    assert not ok
+    assert "Rate limit" in reason
+    bot._user_jobs.clear()
+
+
+def test_handle_reply_trigger_signature_accepts_list():
+    """_handle_reply_trigger now takes kind_hints as list[str] | str."""
+    import inspect
+    sig = inspect.signature(bot._handle_reply_trigger)
+    assert "kind_hints" in sig.parameters
+    # Old kind_hint param should be gone
+    assert "kind_hint" not in sig.parameters
+
+
+def test_handle_reply_trigger_builds_one_job_per_hint():
+    """Source-level: handler iterates kind_hints to build N jobs and queues all."""
+    import inspect
+    src = inspect.getsource(bot._handle_reply_trigger)
+    # Iterate over hints
+    assert "for hint in kind_hints:" in src
+    # Build a list and queue at the end
+    assert "jobs.append(job)" in src
+    assert "for job in jobs:" in src
+    # Atomic batch rate-limit check
+    assert "count=len(kind_hints)" in src
 
 
 # ─── User prompt feature ────────────────────────────────────────────────────
@@ -596,17 +1962,39 @@ def test_extract_user_prompt_minimum_length():
 
 
 def test_job_dataclass_defaults():
-    """Job constructs with required fields and sane defaults."""
+    """Job constructs with required fields and sane defaults.
+
+    __post_init__ enforces a discriminated-union invariant: exactly one of
+    message/interaction must be set. We pass a sentinel message here.
+    """
     j = bot.Job(
         url="https://x", video_id="x",
         channel=object(), submitter_id=42,
+        message=object(),
     )
     assert j.user_prompt == ""
     assert j.diarize is False
+    assert j.vlm_enabled is True  # default tracks VLM_ENABLED env (default "1")
     assert j.model_override is None
-    assert j.message is None
     assert j.interaction is None
     assert j.submitter_name == ""
+
+
+def test_job_dataclass_invariant():
+    """__post_init__ rejects neither-or-both message/interaction."""
+    try:
+        bot.Job(url="https://x", video_id="x", channel=object(), submitter_id=1)
+    except ValueError as e:
+        assert "exactly one" in str(e)
+    else:
+        raise AssertionError("Job() with neither source should raise ValueError")
+    try:
+        bot.Job(url="https://x", video_id="x", channel=object(), submitter_id=1,
+                message=object(), interaction=object())
+    except ValueError as e:
+        assert "exactly one" in str(e)
+    else:
+        raise AssertionError("Job() with both sources should raise ValueError")
 
 
 def test_build_vlm_prompt_includes_user_text():
@@ -1146,23 +2534,32 @@ def test_env_overrides_respected():
     os.environ["EXA_NUM_RESULTS"] = "10"
 
     importlib.reload(bot)
-    assert bot.MAX_RETRIES == 7
-    assert bot.RETRY_BACKOFF == [1, 2, 3]
-    assert bot.LLM_TEMPERATURE == 0.9
-    assert bot.LLM_MAX_TOKENS_BRIEF == 100
-    assert bot.VIDEO_DOMAINS == {"foo.com", "bar.com"}
-    assert bot.EXA_NUM_RESULTS == 10
-    # Cleanup
-    for k in ("MAX_RETRIES", "RETRY_BACKOFF", "LLM_TEMPERATURE",
-              "LLM_MAX_TOKENS_BRIEF", "VIDEO_DOMAINS", "EXA_NUM_RESULTS"):
-        os.environ.pop(k, None)
+    try:
+        assert bot.MAX_RETRIES == 7
+        assert bot.RETRY_BACKOFF == [1, 2, 3]
+        assert bot.LLM_TEMPERATURE == 0.9
+        assert bot.LLM_MAX_TOKENS_BRIEF == 100
+        assert bot.VIDEO_DOMAINS == {"foo.com", "bar.com"}
+        assert bot.EXA_NUM_RESULTS == 10
+    finally:
+        # Cleanup: restore env AND reload bot back to its default state, so
+        # subsequent tests see the production VIDEO_URL_PATTERN. Without this
+        # reload the mutated regex leaks across the rest of the suite.
+        for k in ("MAX_RETRIES", "RETRY_BACKOFF", "LLM_TEMPERATURE",
+                  "LLM_MAX_TOKENS_BRIEF", "VIDEO_DOMAINS", "EXA_NUM_RESULTS"):
+            os.environ.pop(k, None)
+        importlib.reload(bot)
 
 
 # ─── Test runner ─────────────────────────────────────────────────────────────
 
 
 def main():
+    import traceback
     tests = sorted(name for name in globals() if name.startswith("test_"))
+    only = [a for a in sys.argv[1:] if a.startswith("test_")]
+    if only:
+        tests = [t for t in tests if t in only]
     passed, failed = 0, []
     for name in tests:
         try:
@@ -1170,8 +2567,11 @@ def main():
             passed += 1
             print(f"  ✓ {name}")
         except AssertionError as e:
-            failed.append((name, str(e)))
-            print(f"  ✗ {name}: {e}")
+            tb = traceback.format_exc()
+            failed.append((name, str(e) or tb))
+            print(f"  ✗ {name}: {e or '(empty AssertionError; tb below)'}")
+            if not str(e):
+                print(tb)
         except Exception as e:
             failed.append((name, f"{type(e).__name__}: {e}"))
             print(f"  ✗ {name}: {type(e).__name__}: {e}")

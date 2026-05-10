@@ -66,22 +66,21 @@ GPU_INFO_STR = "CPU mode (no GPU detected)"
 if torch.cuda.is_available():
     DEVICE = "cuda"
     COMPUTE_TYPE = "float16"
+    # Use torch directly — no subprocess to nvidia-smi. The CUDA runtime is
+    # already loaded (torch.cuda.is_available() returned True), so name +
+    # total memory are free property reads.
     try:
-        import subprocess
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
+        props = torch.cuda.get_device_properties(0)
+        gpu_name = props.name
+        vram_mb = props.total_memory // (1024 * 1024)
+        GPU_INFO_STR = (
+            f"{gpu_name}  |  {vram_mb // 1024} GB VRAM  |  "
+            f"whisperX (faster-whisper + wav2vec2 alignment)  |  float16"
         )
-        if result.returncode == 0:
-            parts = result.stdout.strip().split(", ")
-            gpu_name = parts[0]
-            vram_mb = int(parts[1])
-            GPU_INFO_STR = f"{gpu_name}  |  {vram_mb // 1024} GB VRAM  |  whisperX (faster-whisper + wav2vec2 alignment)  |  float16"
-            log.info(f"GPU 0: {gpu_name} ({vram_mb} MB VRAM)")
-        else:
-            GPU_INFO_STR = f"CUDA GPU detected  |  whisperX  |  float16"
-    except Exception:
-        GPU_INFO_STR = f"CUDA GPU detected  |  whisperX  |  float16"
+        log.info(f"GPU 0: {gpu_name} ({vram_mb} MB VRAM)")
+    except Exception as e:
+        log.warning(f"Failed to read GPU properties via torch: {e}")
+        GPU_INFO_STR = "CUDA GPU detected  |  whisperX  |  float16"
 else:
     log.info("No CUDA GPU detected, falling back to CPU mode")
 
@@ -111,7 +110,12 @@ else:
 whisper_model = None
 current_model_key = None  # (model_name, hotwords, initial_prompt, suppress_numerals) for cache invalidation
 diarize_model = None
-align_model_cache = {}  # keyed by language code
+# Bounded LRU for wav2vec2 alignment models. Each model is ~360 MB on GPU; on
+# a multilingual server transcribing dozens of languages, an unbounded dict
+# would steadily creep VRAM until the next idle unload. Cap is configurable.
+import collections
+ALIGN_MODEL_CACHE_SIZE = int(os.environ.get("ALIGN_MODEL_CACHE_SIZE", "4"))
+align_model_cache: "collections.OrderedDict[str, tuple]" = collections.OrderedDict()
 
 # Idle unload: free VRAM after MODEL_IDLE_TIMEOUT seconds of no transcription
 MODEL_IDLE_TIMEOUT = int(os.environ.get("MODEL_IDLE_TIMEOUT", "300"))  # 5 min default
@@ -206,8 +210,15 @@ def load_whisper(model_name, hotwords=None, initial_prompt=None, suppress_numera
 
 
 def load_align_model(language_code):
-    """Load (or reuse) a wav2vec2 alignment model for a given language."""
+    """Load (or reuse) a wav2vec2 alignment model for a given language.
+
+    Bounded by ALIGN_MODEL_CACHE_SIZE — when the cache is full, the
+    least-recently-used entry is evicted to free its VRAM. CUDA frees lazily
+    so we hint with empty_cache() after eviction.
+    """
     if language_code in align_model_cache:
+        # Move to MRU end
+        align_model_cache.move_to_end(language_code)
         return align_model_cache[language_code]
     log.info(f"Loading alignment model for '{language_code}'...")
     t0 = time.time()
@@ -216,6 +227,13 @@ def load_align_model(language_code):
         device=DEVICE,
     )
     align_model_cache[language_code] = (model_a, metadata)
+    # Evict LRU if over capacity. Capacity ≤ 0 disables the bound.
+    if ALIGN_MODEL_CACHE_SIZE > 0:
+        while len(align_model_cache) > ALIGN_MODEL_CACHE_SIZE:
+            evicted_lang, _evicted = align_model_cache.popitem(last=False)
+            log.info(f"  Evicted alignment model for '{evicted_lang}' (LRU)")
+        if DEVICE == "cuda" and len(align_model_cache) >= ALIGN_MODEL_CACHE_SIZE:
+            torch.cuda.empty_cache()
     log.info(f"  Alignment model loaded in {time.time()-t0:.2f}s")
     return model_a, metadata
 
@@ -247,6 +265,14 @@ def load_diarization():
 # -- Temp file cleanup ---------------------------------------------------------
 _previous_subtitle = None
 
+# Gradio writes uploads under GRADIO_TEMP_DIR (default {tempdir}/gradio).
+# Honour the env so users who relocate the temp dir get correct cleanup.
+GRADIO_TMP_DIR = os.environ.get("GRADIO_TEMP_DIR") or os.path.join(
+    tempfile.gettempdir(), "gradio"
+)
+# Trailing separator simplifies prefix matching in cleanup_upload below.
+_GRADIO_TMP_PREFIX = os.path.normpath(GRADIO_TMP_DIR) + os.sep
+
 
 def cleanup_upload(file_path):
     """Remove the uploaded file and its parent gradio temp dir if empty."""
@@ -255,7 +281,9 @@ def cleanup_upload(file_path):
     try:
         os.remove(file_path)
         parent = os.path.dirname(file_path)
-        if parent and parent.startswith("/tmp/gradio/") and not os.listdir(parent):
+        if parent and (
+            os.path.normpath(parent).startswith(_GRADIO_TMP_PREFIX.rstrip(os.sep))
+        ) and not os.listdir(parent):
             os.rmdir(parent)
         log.info(f"Cleaned up upload: {file_path}")
     except Exception as e:
@@ -263,12 +291,12 @@ def cleanup_upload(file_path):
 
 
 def cleanup_stale_gradio_tmp():
-    """Remove old /tmp/gradio/ directories on startup.
+    """Remove old gradio temp directories on startup.
 
     Only touches entries older than `STALE_TMP_AGE_SECONDS` to avoid trashing
-    in-flight uploads from another instance sharing /tmp.
+    in-flight uploads from another instance sharing the same tmp root.
     """
-    gradio_tmp = "/tmp/gradio"
+    gradio_tmp = GRADIO_TMP_DIR
     age_threshold = int(os.environ.get("STALE_TMP_AGE_SECONDS", "3600"))
     cutoff = time.time() - age_threshold
     if not os.path.isdir(gradio_tmp):
@@ -671,6 +699,12 @@ def format_transcript_plain(segments, has_speakers=False):
 _cancel_requested = {"value": False}
 
 # -- Last transcription result (for speaker renaming) --------------------------
+# Single-slot global. _transcription_lock prevents concurrent writes, but a
+# Gradio user staring at the rename UI from a just-completed transcription
+# will see _last_result clobbered if a different user starts a new
+# transcription in the same browser instance. Acceptable — Gradio is a
+# single-user-at-a-time UI here. Discord rename uses read_cache(video_id)
+# instead and is unaffected.
 _last_result = {"segments": [], "has_speakers": False, "format": "srt",
                 "language": "", "duration": 0.0}
 
@@ -1171,6 +1205,53 @@ _PERMANENT_YT_DLP_PATTERNS = (
 
 def _is_permanent_yt_dlp_error(stderr: str) -> bool:
     return any(p in stderr for p in _PERMANENT_YT_DLP_PATTERNS)
+
+
+def _extract_comments(meta: dict, output_dir: str, video_id: str) -> list[dict]:
+    """Pull comments from yt-dlp's --print-json blob; fall back to the
+    .info.json file on disk when --print-json truncated them.
+
+    yt-dlp's stdout JSON sometimes drops the `comments` array when it's
+    large (the runtime concats can hit buffer limits). The info.json file
+    on disk has the full payload. Either way the field is `comments`.
+
+    Returns a list of dicts with normalised keys:
+      text, author, like_count, is_pinned, is_favorited,
+      author_is_uploader, parent, time_text
+    """
+    raw = meta.get("comments")
+    if not raw:
+        # Probe the info.json file
+        info_path = os.path.join(output_dir, f"{video_id}.info.json")
+        if os.path.isfile(info_path):
+            try:
+                with open(info_path, "r") as f:
+                    info = json.load(f)
+                raw = info.get("comments") or []
+            except (OSError, json.JSONDecodeError) as e:
+                log.warning(f"[API] couldn't read info.json comments: {e}")
+                raw = []
+        else:
+            raw = []
+
+    if not isinstance(raw, list):
+        return []
+
+    out = []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        out.append({
+            "text": (c.get("text") or "").strip(),
+            "author": c.get("author") or "[unknown]",
+            "like_count": int(c.get("like_count") or 0),
+            "is_pinned": bool(c.get("is_pinned")),
+            "is_favorited": bool(c.get("is_favorited")),  # creator-hearted
+            "author_is_uploader": bool(c.get("author_is_uploader")),
+            "parent": c.get("parent") or "root",
+            "time_text": c.get("_time_text") or "",
+        })
+    return out
 
 
 def _yt_dlp_auth_args() -> list[str]:
@@ -1942,19 +2023,30 @@ async def api_yt_download(request: Request):
     """POST /api/yt-download — download audio (and optionally video) via yt-dlp.
 
     Body fields:
-      url:         str   (required) — YouTube/etc. URL
-      format:      str   — yt-dlp format spec (default depends on keep_video)
-      keep_video:  bool  (default false) — when true, downloads a low-res
-                   video stream alongside the audio so /api/describe can
-                   extract frames later. When false, audio-extracted to WAV
-                   (smaller; the legacy default for transcription-only).
-      playlist:    bool  (default false) — process as playlist
-      max_height:  int   (default VIDEO_DOWNLOAD_MAX_HEIGHT, currently 480)
-                   — cap on video resolution when keep_video=true. Frames are
-                   downscaled to VLM_FRAME_WIDTH for inference anyway, so
-                   higher resolution wastes bandwidth.
+      url:               str   (required) — YouTube/etc. URL
+      format:            str   — yt-dlp format spec (default depends on keep_video)
+      keep_video:        bool  (default false) — when true, downloads a low-res
+                         video stream alongside the audio so /api/describe can
+                         extract frames later. When false, audio-extracted to WAV
+                         (smaller; the legacy default for transcription-only).
+      playlist:          bool  (default false) — process as playlist
+      max_height:        int   (default VIDEO_DOWNLOAD_MAX_HEIGHT, currently 480)
+                         — cap on video resolution when keep_video=true. Frames are
+                         downscaled to VLM_FRAME_WIDTH for inference anyway, so
+                         higher resolution wastes bandwidth.
+      include_comments:  bool  (default false) — when true, also fetches the
+                         video's top YouTube comments (yt-dlp `--get-comments`)
+                         and includes them in the response. Adds ~5-30s to the
+                         download depending on `comments_max`. Each comment is:
+                         {text, author, like_count, is_pinned, is_favorited,
+                          author_is_uploader, parent, time_text}.
+      comments_max:      int   (default 100) — cap on comments fetched. yt-dlp
+                         pulls top-level comments first, then dives into
+                         replies up to this total.
+      comments_sort:     str   (default "top") — yt-dlp comment sort order:
+                         "top" (default, by likes) or "new".
 
-    Returns (single video): {"filename": "...", "title": "...", "duration": 123}
+    Returns (single video): {"filename", "title", "duration", optionally "comments": [...]}
     Returns (playlist):     {"items": [{...}, ...], "count": N}
     """
     body = await request.json()
@@ -1965,6 +2057,9 @@ async def api_yt_download(request: Request):
     keep_video = bool(body.get("keep_video", False))
     playlist = body.get("playlist", False)
     max_height = int(body.get("max_height", os.environ.get("VIDEO_DOWNLOAD_MAX_HEIGHT", "480")))
+    include_comments = bool(body.get("include_comments", False))
+    comments_max = int(body.get("comments_max", 100))
+    comments_sort = body.get("comments_sort", "top")
     output_dir = tempfile.mkdtemp(prefix="yt-dlp-")
 
     # Format spec depends on whether the caller will need video frames later.
@@ -1994,6 +2089,17 @@ async def api_yt_download(request: Request):
             "--audio-format", "wav",
             "--audio-quality", "0",
         ])
+    if include_comments:
+        # `--write-info-json` ensures the comments end up in <id>.info.json
+        # on disk (yt-dlp embeds them when --get-comments is set). We parse
+        # that file below — `--print-json` output sometimes truncates large
+        # comment arrays in stdout.
+        cmd.extend([
+            "--write-info-json",
+            "--get-comments",
+            "--extractor-args",
+            f"youtube:max_comments={comments_max};comment_sort={comments_sort}",
+        ])
     cmd.extend([
         "--print-json",
         "-o", output_template,
@@ -2001,7 +2107,8 @@ async def api_yt_download(request: Request):
     ])
     if not playlist:
         cmd.insert(1, "--no-playlist")
-    log.info(f"[API] yt-dlp download: {url} (playlist={playlist})")
+    log.info(f"[API] yt-dlp download: {url} (playlist={playlist}, "
+             f"comments={include_comments and comments_max or 0})")
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if result.returncode != 0:
@@ -2047,11 +2154,14 @@ async def api_yt_download(request: Request):
                 else:
                     log.warning(f"[API] no file found in {output_dir} for {video_id}")
                     continue
-            items.append({
+            item = {
                 "filename": filename,
                 "title": meta.get("title", "unknown"),
                 "duration": meta.get("duration", 0),
-            })
+            }
+            if include_comments:
+                item["comments"] = _extract_comments(meta, output_dir, video_id)
+            items.append(item)
 
         if not items:
             return JSONResponse({"error": "yt-dlp produced no output"}, status_code=500)
@@ -2135,22 +2245,20 @@ async def api_transcribe(request: Request):
 
     try:
         import asyncio
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _run_transcription(
-                file_path,
-                model_name=body.get("model", "turbo"),
-                language=body.get("language", "Auto-detect"),
-                output_format=body.get("format", "txt"),
-                enable_diarization=body.get("diarize", False),
-                min_speakers=body.get("min_speakers", 0),
-                max_speakers=body.get("max_speakers", 0),
-                batch_size=body.get("batch_size"),
-                hotwords=body.get("hotwords", ""),
-                initial_prompt=body.get("initial_prompt", ""),
-                suppress_numerals=body.get("suppress_numerals", False),
-                return_file=return_file,
-            ),
+        result = await asyncio.to_thread(
+            _run_transcription,
+            file_path,
+            model_name=body.get("model", "turbo"),
+            language=body.get("language", "Auto-detect"),
+            output_format=body.get("format", "txt"),
+            enable_diarization=body.get("diarize", False),
+            min_speakers=body.get("min_speakers", 0),
+            max_speakers=body.get("max_speakers", 0),
+            batch_size=body.get("batch_size"),
+            hotwords=body.get("hotwords", ""),
+            initial_prompt=body.get("initial_prompt", ""),
+            suppress_numerals=body.get("suppress_numerals", False),
+            return_file=return_file,
         )
         result_subtitle = result.get("subtitle_file")
         return JSONResponse(result)
@@ -2204,6 +2312,11 @@ VLM_FPS_INTERVAL = float(os.environ.get("VLM_FPS_INTERVAL", "10"))  # seconds be
 VLM_MAX_FRAMES = int(os.environ.get("VLM_MAX_FRAMES", "60"))         # cap per video
 VLM_FRAME_WIDTH = int(os.environ.get("VLM_FRAME_WIDTH", "512"))      # downscale for inference
 VLM_FRAME_TIMEOUT = int(os.environ.get("VLM_FRAME_TIMEOUT", "120"))  # per-frame VLM call timeout
+# Bounded parallelism for /api/describe. The VLM proxy serves one model on
+# one GPU; too high a value queues at the proxy without speedup, but small
+# values (2-4) overlap network/serialization and image encoding with model
+# inference. 4 chosen empirically for a single-GPU llm-compose setup.
+VLM_FRAME_CONCURRENCY = int(os.environ.get("VLM_FRAME_CONCURRENCY", "4"))
 
 VLM_FRAME_PROMPT = os.environ.get(
     "VLM_FRAME_PROMPT",
@@ -2369,13 +2482,21 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
         "descriptions": [{"timestamp": float, "text": str}, ...],
     }
 
+    Concurrency: frames are described in parallel up to VLM_FRAME_CONCURRENCY
+    in flight. The VLM backend is single-GPU so unbounded gather just queues
+    at the proxy; bounded parallelism overlaps image encoding + network
+    round-trips with model inference for a meaningful 2-4x speedup.
+
     Raises:
         VLMNotConfiguredError: when the deployed model rejects all images
             (e.g. llama-server loaded without mmproj). Detected as soon as
-            the first frame fails with that pattern — we don't waste 60
+            the first frame fails with that pattern — we don't waste 59
             calls just to see the same error 60 times.
         NoVideoStreamError: input file has no video track.
     """
+    import concurrent.futures
+    import threading
+
     duration = _ffprobe_duration(file_path)
     frames_dir = tempfile.mkdtemp(prefix="vlm-frames-")
     try:
@@ -2386,37 +2507,69 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
         effective_interval = max(fps_interval, duration / max_frames) \
             if duration > 0 else fps_interval
 
+        workers = max(1, VLM_FRAME_CONCURRENCY)
         log.info(f"[VLM] {len(frame_paths)} frames at {effective_interval:.1f}s "
-                 f"interval, model={vlm_model}")
-        descriptions = []
+                 f"interval, model={vlm_model}, concurrency={workers}")
+
+        # Pre-allocate result list so each worker writes its own slot — keeps
+        # output ordered without a sort step.
+        results: list[dict | None] = [None] * len(frame_paths)
         success_count = 0
         first_failure: str | None = None
-        for i, fp in enumerate(frame_paths):
+        not_configured_err: str | None = None  # set by first frame to hit it
+        cancel = threading.Event()
+        lock = threading.Lock()
+
+        def _worker(i: int, fp: str) -> None:
+            nonlocal success_count, first_failure, not_configured_err
+            if cancel.is_set():
+                # Don't even start — early-out on VLM config errors.
+                results[i] = {"timestamp": i * effective_interval,
+                              "text": "[frame description unavailable]"}
+                return
             timestamp = i * effective_interval
             try:
                 text = _describe_frame(fp, vlm_model, prompt)
-                success_count += 1
+                with lock:
+                    success_count += 1
             except Exception as e:
                 err = str(e)
-                # Bail out early on config errors — re-trying 59 more frames
-                # won't make the model gain vision capability.
                 if _is_vlm_not_configured(err):
-                    raise VLMNotConfiguredError(
-                        f"VLM model '{vlm_model}' on the LLM proxy rejected the "
-                        f"image input. Likely cause: the model is loaded "
-                        f"WITHOUT an mmproj (multimodal projector) file. "
-                        f"Fix: download the corresponding mmproj GGUF (same "
-                        f"HF repo as the main model) and pass it to "
-                        f"llama-server with --mmproj. Underlying error: {err[:200]}"
+                    with lock:
+                        if not_configured_err is None:
+                            not_configured_err = err
+                    cancel.set()
+                    text = "[frame description unavailable]"
+                else:
+                    log.warning(
+                        f"[VLM] Frame {i} ({timestamp:.0f}s) failed: {err}"
                     )
-                log.warning(f"[VLM] Frame {i} ({timestamp:.0f}s) failed: {err}")
-                if first_failure is None:
-                    first_failure = err
-                text = "[frame description unavailable]"
-            descriptions.append({"timestamp": timestamp, "text": text})
+                    with lock:
+                        if first_failure is None:
+                            first_failure = err
+                    text = "[frame description unavailable]"
+            results[i] = {"timestamp": timestamp, "text": text}
 
-        # If literally every frame failed (transient network, GPU OOM, etc.),
-        # raise so the bot doesn't try to summarise an empty transcript.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_worker, i, fp) for i, fp in enumerate(frame_paths)]
+            # Wait for all (workers swallow their own exceptions and write
+            # placeholders so gather/wait never raises here).
+            concurrent.futures.wait(futures)
+
+        # Bail on VLM config error — re-running for every frame won't help.
+        if not_configured_err:
+            raise VLMNotConfiguredError(
+                f"VLM model '{vlm_model}' on the LLM proxy rejected the "
+                f"image input. Likely cause: the model is loaded "
+                f"WITHOUT an mmproj (multimodal projector) file. "
+                f"Fix: download the corresponding mmproj GGUF (same "
+                f"HF repo as the main model) and pass it to "
+                f"llama-server with --mmproj. Underlying error: {not_configured_err[:200]}"
+            )
+
+        descriptions = [r for r in results if r is not None]
+
+        # Every frame failed → raise so the bot doesn't summarise nothing.
         if success_count == 0 and frame_paths:
             raise RuntimeError(
                 f"All {len(frame_paths)} frame descriptions failed. "
@@ -2466,10 +2619,9 @@ async def api_describe(request: Request):
 
     try:
         import asyncio
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _describe_video(file_path, fps_interval, max_frames,
-                                    vlm_model, prompt),
+        result = await asyncio.to_thread(
+            _describe_video, file_path, fps_interval, max_frames,
+            vlm_model, prompt,
         )
         return JSONResponse(result)
     except NoVideoStreamError as e:

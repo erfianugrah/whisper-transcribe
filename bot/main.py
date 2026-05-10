@@ -34,6 +34,12 @@ def _load_env_file(path):
     Doesn't try to be a full bash parser — no command substitution, no
     variable expansion, no multi-line values. For richer needs, install
     python-dotenv. Existing process env wins (uses os.environ.setdefault).
+
+    Production note: when the bot runs under `compose env_file: ./bot/.env`,
+    Compose has already loaded those values into the container's process
+    env before this code executes — so this loader becomes a no-op (every
+    setdefault hits an existing key). It exists for non-Docker dev runs
+    (`python bot/main.py` from the repo root with a sibling .env file).
     """
     if not path.exists():
         return
@@ -134,6 +140,14 @@ if not DISCORD_TOKEN:
               "Set it via env or bot/.env (see bot/.env.example).")
     sys.exit(2)
 WHISPER_API = os.environ.get("WHISPER_API_URL", "http://localhost:7860")
+SCRAPER_API = os.environ.get("SCRAPER_API_URL", "http://localhost:11235")
+FLARESOLVERR_API = os.environ.get("FLARESOLVERR_API_URL",
+                                  "http://localhost:8191/v1")
+SCRAPER_TIMEOUT = int(os.environ.get("SCRAPER_TIMEOUT", "120"))
+FLARESOLVERR_TIMEOUT = int(os.environ.get("FLARESOLVERR_TIMEOUT", "90"))
+# Scraped article body cap. Articles longer than this hit map-reduce in
+# summarize() — the budget calc applies as it does for transcripts.
+SCRAPED_BODY_CHAR_CAP = int(os.environ.get("SCRAPED_BODY_CHAR_CAP", "200000"))
 LLM_API = os.environ.get("LLM_API_URL", "http://localhost:11434/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen3.5-4B-Q8_0")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "turbo")
@@ -229,6 +243,27 @@ VLM_FPS_INTERVAL = float(os.environ.get("VLM_FPS_INTERVAL", "10"))
 VLM_MAX_FRAMES = int(os.environ.get("VLM_MAX_FRAMES", "60"))
 VLM_TIMEOUT = int(os.environ.get("VLM_TIMEOUT", "1800"))  # 30 min worst case for 60-frame video
 
+# ─── YouTube comments ────────────────────────────────────────────────────────
+# When enabled, the bot asks the whisper service to fetch top YT comments
+# alongside the video download (yt-dlp --get-comments). Comments are filtered
+# (substantive + creator-hearted prioritised) and summarised into a
+# "Community reaction" embed posted alongside the existing brief / key_points
+# / chapters embeds. On by default; channels can opt out via /config.
+YT_COMMENTS_ENABLED = os.environ.get("YT_COMMENTS_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
+YT_COMMENTS_MAX = int(os.environ.get("YT_COMMENTS_MAX", "100"))
+YT_COMMENTS_SORT = os.environ.get("YT_COMMENTS_SORT", "top")
+# Minimum comment text length (chars) to count as substantive. Below this,
+# a comment is almost certainly noise: "first", "lol", emoji-only.
+YT_COMMENT_MIN_CHARS = int(os.environ.get("YT_COMMENT_MIN_CHARS", "40"))
+# Top-N substantive comments fed to the LLM after filtering+sorting.
+YT_COMMENT_SUMMARY_TOP_N = int(os.environ.get("YT_COMMENT_SUMMARY_TOP_N", "30"))
+
+# Per-call timeout for /api/transcribe. Long videos on slow models can
+# exceed the global session timeout (900s). Picked to be roughly equal
+# to VLM_TIMEOUT so audio + video pipelines align: a long-running job
+# that fails one side fails both sides predictably.
+TRANSCRIBE_TIMEOUT = int(os.environ.get("TRANSCRIBE_TIMEOUT", "1800"))
+
 # ─── Exa search tuning ────────────────────────────────────────────────────────
 EXA_NUM_RESULTS = int(os.environ.get("EXA_NUM_RESULTS", "5"))
 EXA_MAX_CHARACTERS = int(os.environ.get("EXA_MAX_CHARACTERS", "5000"))
@@ -292,6 +327,12 @@ VIDEO_URL_PATTERN = re.compile(
 from prompts import (
     PROMPT_BRIEF, PROMPT_KEY_POINTS, PROMPT_CHAPTERS,
     REDUCE_BRIEF, REDUCE_KEY_POINTS,
+    PROMPT_BRIEF_WEB, PROMPT_KEY_POINTS_WEB, PROMPT_SECTIONS,
+    REDUCE_BRIEF_WEB, REDUCE_KEY_POINTS_WEB, REDUCE_SECTIONS,
+    PROMPT_BRIEF_REDDIT, PROMPT_KEY_POINTS_REDDIT, PROMPT_SECTIONS_REDDIT,
+    REDUCE_BRIEF_REDDIT, REDUCE_KEY_POINTS_REDDIT, REDUCE_SECTIONS_REDDIT,
+    PROMPT_YT_COMMENTS, REDUCE_YT_COMMENTS,
+    PROMPT_LITMUS,
     CHUNK_PREAMBLE,
 )
 
@@ -302,17 +343,48 @@ from prompts import (
 @dataclass
 class Job:
     url: str
-    video_id: str
-    channel: discord.TextChannel       # always present (where embeds post)
+    video_id: str  # also used as cache key for web jobs (URL-hash for kind="web")
+    # `Messageable` covers TextChannel, DMChannel, Thread — anything we can
+    # `.send()` to. Slash commands in DMs land here with a DMChannel; on_message
+    # in DMs would too if we ever drop the guild gate. resolve_summary_channel
+    # already handles the no-guild case.
+    channel: "discord.abc.Messageable"
     submitter_id: int                  # Discord user.id of the requester
     submitter_name: str = ""           # for log lines / mentions
     user_prompt: str = ""              # steering text (see process())
     diarize: bool = False              # opt-in via /transcribe; default off
+    vlm_enabled: bool = True           # per-channel override; falls back to global VLM_ENABLED
+    yt_comments_enabled: bool = True   # per-channel override; falls back to global YT_COMMENTS_ENABLED
     model_override: str | None = None  # per-channel config can override LLM_MODEL
+    # Job kind: "video" (default — yt-dlp + whisper + summarize) or "web"
+    # (crawl4ai + summarize). Worker dispatches on this discriminant.
+    kind: str = "video"
+    # True when the user explicitly asked for a summary (reply-trigger,
+    # slash command). False when the URL was just posted in a watched
+    # channel and the bot picked it up automatically. Controls failure
+    # behaviour: explicit jobs that turn out not to be video URLs fall
+    # through to the web pipeline; auto-paste jobs fail silently to avoid
+    # spamming the channel with "this isn't a video" messages every time
+    # someone shares a Reddit text post.
+    explicit_request: bool = False
     # Source of the request. Exactly one of these is set; helpers in the
-    # `_ack_*` family branch on which is non-None.
+    # `_ack_*` family branch on which is non-None. Validated in __post_init__.
     message: discord.Message | None = None     # set when on_message-triggered
     interaction: discord.Interaction | None = None  # set when slash-triggered
+
+    def __post_init__(self) -> None:
+        # Discriminated-union invariant: exactly one source.
+        if (self.message is None) == (self.interaction is None):
+            raise ValueError(
+                "Job must have exactly one of message/interaction set "
+                "(got message=%r, interaction=%r)" % (
+                    self.message is not None, self.interaction is not None,
+                )
+            )
+        if self.kind not in ("video", "web", "litmus"):
+            raise ValueError(
+                f"Job.kind must be 'video' | 'web' | 'litmus', got {self.kind!r}"
+            )
 
 
 # Maximum length of user-prompt text we'll honour (truncated above this).
@@ -320,6 +392,11 @@ class Job:
 # both VLM and summary calls. Picked to fit comfortably alongside the
 # transcript content within LLM_INPUT_CHAR_BUDGET.
 USER_PROMPT_MAX_CHARS = int(os.environ.get("USER_PROMPT_MAX_CHARS", "1500"))
+
+# Below this many non-whitespace chars, the message-text-minus-URLs is
+# considered too short to be meaningful steering (e.g. a bare "lol" or just
+# punctuation). Caller falls through to default automatic processing.
+USER_PROMPT_MIN_CHARS = 3
 
 
 # ─── Rate limiting ────────────────────────────────────────────────────────────
@@ -344,7 +421,7 @@ from collections import deque, defaultdict
 _user_jobs: dict[int, deque[float]] = defaultdict(deque)
 
 
-def _rate_limit_check(user_id: int) -> tuple[bool, str]:
+def _rate_limit_check(user_id: int, count: int = 1) -> tuple[bool, str]:
     """Returns (allowed, reason). `allowed=False` rejects with `reason`.
 
     Two checks:
@@ -354,11 +431,16 @@ def _rate_limit_check(user_id: int) -> tuple[bool, str]:
          spam.
     Bypass list (RATE_LIMIT_BYPASS_USERS) skips the per-user check but
     still enforces the queue cap (so admins can't crash the bot either).
+
+    `count` is the number of jobs the caller wants to enqueue atomically
+    (e.g. chained `tldr litmus` reply requests two jobs in one go). The
+    cap check uses `count` so we reject all-or-nothing rather than
+    partial-fail mid-batch.
     """
-    if queue.qsize() >= MAX_QUEUE_SIZE:
+    if queue.qsize() + count > MAX_QUEUE_SIZE:
         return False, (
-            f"Queue is full ({queue.qsize()}/{MAX_QUEUE_SIZE} jobs pending). "
-            f"Try again once existing jobs complete."
+            f"Queue is full — would push {queue.qsize()}+{count} past "
+            f"{MAX_QUEUE_SIZE}. Try again once existing jobs complete."
         )
     if user_id in RATE_LIMIT_BYPASS_USERS:
         return True, ""
@@ -367,13 +449,13 @@ def _rate_limit_check(user_id: int) -> tuple[bool, str]:
     dq = _user_jobs[user_id]
     while dq and dq[0] < cutoff:
         dq.popleft()
-    if len(dq) >= MAX_JOBS_PER_USER_PER_HOUR:
-        oldest_in_window = dq[0]
+    if len(dq) + count > MAX_JOBS_PER_USER_PER_HOUR:
+        oldest_in_window = dq[0] if dq else now
         retry_in = int((oldest_in_window + 3600) - now)
-        mins = retry_in // 60
+        mins = max(0, retry_in // 60)
         return False, (
-            f"Rate limit: {len(dq)}/{MAX_JOBS_PER_USER_PER_HOUR} jobs in the "
-            f"last hour. Try again in ~{mins} min."
+            f"Rate limit: {len(dq)}+{count} jobs would exceed "
+            f"{MAX_JOBS_PER_USER_PER_HOUR}/hour. Try again in ~{mins} min."
         )
     return True, ""
 
@@ -594,7 +676,7 @@ def _extract_user_prompt(message_content: str, urls: list[str]) -> str:
     text = re.sub(r"<[@#:][^>]+>", " ", text)
     # Collapse whitespace
     text = re.sub(r"\s+", " ", text).strip()
-    if len(text) < 3:
+    if len(text) < USER_PROMPT_MIN_CHARS:
         return ""
     return text[:USER_PROMPT_MAX_CHARS]
 
@@ -606,6 +688,8 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 queue: asyncio.Queue[Job] = asyncio.Queue()
+# Shared session; populated in on_ready(). Each network helper guards with an
+# explicit `if http is None: raise` so the check survives `python -O`.
 http: aiohttp.ClientSession | None = None
 
 
@@ -638,12 +722,188 @@ async def cache_cleanup_loop():
             log.info("Cache cleanup: removed %d expired transcripts", removed)
 
 
+# ─── Reply-trigger ("tldr"/"summarize") for URL summaries ────────────────────
+# Users post a URL → reply "tldr" → bot scrapes + summarises that URL.
+# Strict matching: message body must be ONLY the keyword (with optional
+# trailing punctuation), to avoid accidental triggers in a normal sentence
+# like "give me a tldr of …".
+REPLY_TRIGGER_RE = re.compile(r"^\s*(tldr|summarize|summarise)[!.\s]*$",
+                              re.IGNORECASE)
+
+# Reply-trigger for the AI litmus test: surfaces stylistic + metadata
+# signals that an article may be LLM-generated or LLM-heavy-edited. Same
+# strict match — only fires when the reply body is JUST the keyword.
+LITMUS_TRIGGER_RE = re.compile(r"^\s*litmus[!.?\s]*$", re.IGNORECASE)
+
+# Canonical mapping for chained replies. Keys are exact lowercase keywords
+# the user might type; values are the kind_hint passed to the dispatch.
+# Same kind_hint may have multiple keyword aliases (tldr/summarize/summarise).
+_TRIGGER_KEYWORD_MAP = {
+    "tldr": "summary",
+    "summarize": "summary",
+    "summarise": "summary",
+    "litmus": "litmus",
+}
+
+
+def _parse_trigger_keywords(content: str) -> list[str]:
+    """Return the list of distinct kind_hints when a reply body is composed
+    ENTIRELY of recognised trigger keywords (any order, any number,
+    optional punctuation between them). Else empty list.
+
+    Examples:
+      'tldr'             → ['summary']
+      'TLDR.'            → ['summary']
+      'tldr litmus'      → ['summary', 'litmus']
+      'litmus tldr'      → ['litmus', 'summary']  (preserves order)
+      'tldr tldr'        → ['summary']             (deduplicated)
+      'summarize litmus' → ['summary', 'litmus']
+      'give me a tldr'   → []  (extra non-keyword words → no fire)
+      ''                 → []
+
+    Order is preserved so chained dispatch matches the user's typing intent
+    (e.g. `tldr litmus` queues summary first, then litmus). Dedup prevents
+    double-charging the rate limit when a user accidentally types
+    `tldr tldr`.
+    """
+    if not content or not content.strip():
+        return []
+    # Tokenise on whitespace + punctuation. \w includes digits + underscores
+    # so "tldr 123" produces ['tldr', '123'] and `123` (not a keyword) falls
+    # into the reject branch — keeps the trigger strict.
+    tokens = re.findall(r"\w+", content)
+    if not tokens:
+        return []
+    seen: set[str] = set()
+    hints: list[str] = []
+    for tok in tokens:
+        kw = _TRIGGER_KEYWORD_MAP.get(tok.lower())
+        if kw is None:
+            # Any non-keyword token (word, number, mention, etc.) →
+            # reject the whole reply (sentence-style mention shouldn't fire).
+            return []
+        if kw not in seen:
+            seen.add(kw)
+            hints.append(kw)
+    return hints
+
+# Bare URL extractor — used when on_message-triggered URL discovery doesn't
+# match a video domain. Permissive on host, restrictive on scheme. Excludes
+# Discord-internal URLs (channels.com etc.) by host filter at the call site.
+_ANY_URL_RE = re.compile(r"https?://[^\s<>()\[\]]+", re.IGNORECASE)
+
+
+def _hash_url(url: str) -> str:
+    """Stable 11-char id from a URL, used as cache key for web jobs."""
+    import hashlib
+    return "w" + hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
+
+
+def _is_video_url(url: str) -> bool:
+    """True iff the URL host matches a domain in VIDEO_DOMAINS.
+
+    Coarse domain-membership check. Use _is_clearly_video_url() instead
+    when deciding routing — many of the listed domains (reddit.com,
+    twitter.com, instagram.com) host both videos AND text posts, and the
+    bare host check sends text posts down the video pipeline where
+    yt-dlp fails noisily.
+    """
+    return bool(VIDEO_URL_PATTERN.search(url))
+
+
+# URL-shape patterns that strongly indicate the URL points at a single
+# video. Used for routing — anything matching here goes to the video
+# pipeline; everything else (including text posts on video-hosting
+# platforms) goes to the web pipeline.
+#
+# Curated per platform from observation of real URLs. Ordering doesn't
+# matter; first match wins.
+_CLEAR_VIDEO_URL_PATTERNS = (
+    # YouTube + shorts/live (also covered by YT_PATTERN; duplicated for clarity)
+    re.compile(r"https?://(?:www\.|m\.|music\.)?youtube\.com/(?:watch\?|shorts/|live/|embed/)", re.IGNORECASE),
+    re.compile(r"https?://youtu\.be/[\w-]{11}", re.IGNORECASE),
+    # Twitch — VODs, clips, live channels (live channels are clearly video too).
+    # Bare twitch.tv/<channel> matches a live stream; twitch.tv/<channel>/about
+    # / /schedule etc are profile pages — exclude those by requiring the path
+    # to be just a single segment.
+    re.compile(r"https?://clips\.twitch\.tv/", re.IGNORECASE),
+    re.compile(r"https?://(?:www\.)?twitch\.tv/videos/\d+", re.IGNORECASE),
+    re.compile(r"https?://(?:www\.)?twitch\.tv/[\w-]+/?(?:\?|$)", re.IGNORECASE),
+    # Vimeo numeric video IDs. Matches:
+    #   vimeo.com/123, www.vimeo.com/123, player.vimeo.com/video/123,
+    #   vimeo.com/channels/staffpicks/123
+    re.compile(r"https?://(?:www\.|player\.|m\.)?vimeo\.com/(?:video/|channels/[\w-]+/)?\d+", re.IGNORECASE),
+    # TikTok video URLs (vm.tiktok.com short links + /@user/video/<id> long form)
+    re.compile(r"https?://vm\.tiktok\.com/", re.IGNORECASE),
+    re.compile(r"https?://(?:www\.)?tiktok\.com/@[\w.-]+/video/\d+", re.IGNORECASE),
+    # Reddit's video host (NOT reddit.com text posts!)
+    re.compile(r"https?://v\.redd\.it/", re.IGNORECASE),
+    # Dailymotion (`/video/<id>` is the canonical video path)
+    re.compile(r"https?://(?:www\.)?dailymotion\.com/video/", re.IGNORECASE),
+    re.compile(r"https?://dai\.ly/", re.IGNORECASE),
+    # Rumble + Odysee + Kick — `/v/...` or `/<channel>/<slug>` paths
+    re.compile(r"https?://(?:www\.)?rumble\.com/v[\w.-]+", re.IGNORECASE),
+    re.compile(r"https?://(?:www\.)?odysee\.com/@[\w-]+(?:[:.][\w-]+)?/[\w-]+", re.IGNORECASE),
+    re.compile(r"https?://(?:www\.)?kick\.com/[\w-]+/(?:videos|clips)/", re.IGNORECASE),
+    # Bilibili
+    re.compile(r"https?://(?:www\.)?bilibili\.com/video/", re.IGNORECASE),
+    re.compile(r"https?://b23\.tv/", re.IGNORECASE),
+    # SoundCloud (audio counts as video for our purposes — yt-dlp handles it)
+    re.compile(r"https?://(?:www\.|m\.)?soundcloud\.com/[\w-]+/[\w-]+", re.IGNORECASE),
+)
+
+
+def _is_clearly_video_url(url: str) -> bool:
+    """True iff the URL shape unambiguously points at a video / audio file.
+
+    Stricter than _is_video_url. Use this for ROUTING decisions — it
+    prevents reddit.com text posts from being treated as videos just
+    because reddit.com is in VIDEO_DOMAINS.
+
+    False negatives are acceptable here: an unrecognised video URL just
+    means the bot routes it to the web pipeline first; the
+    NotAVideoError fallback in process() can still upgrade it to video
+    if Crawl4AI extracts video metadata. False positives (text URLs
+    classified as video) are NOT acceptable — that's the bug we're
+    fixing.
+    """
+    if not url:
+        return False
+    return any(p.search(url) for p in _CLEAR_VIDEO_URL_PATTERNS)
+
+
+def _extract_first_url(text: str) -> str | None:
+    """Return the first non-Discord URL found in `text`, or None."""
+    if not text:
+        return None
+    for m in _ANY_URL_RE.finditer(text):
+        url = m.group(0).rstrip(".,;:!?")  # trim trailing sentence punctuation
+        # Skip Discord-internal links — those aren't articles
+        if "discord.com" in url or "discordapp.com" in url:
+            continue
+        return url
+    return None
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
     if ALLOWED_CHANNELS and message.channel.id not in ALLOWED_CHANNELS:
         return
+
+    # Reply-trigger paths. Recognised keywords:
+    #   tldr / summarize / summarise → summary flow (kind="web" or "video")
+    #   litmus                       → AI litmus flow (kind="litmus")
+    # Chaining: a reply body composed of multiple keywords (e.g. `tldr litmus`)
+    # fires BOTH flows in order. _parse_trigger_keywords returns [] when the
+    # body contains any non-keyword word, preventing accidental triggers in
+    # sentences like "give me a tldr".
+    if message.reference is not None:
+        hints = _parse_trigger_keywords(message.content or "")
+        if hints:
+            await _handle_reply_trigger(message, kind_hints=hints)
+            return
 
     # Collect video URLs — YouTube gets special handling (ID extraction for timestamps)
     jobs_to_queue = []
@@ -660,11 +920,22 @@ async def on_message(message: discord.Message):
             submitter_id=message.author.id,
             submitter_name=str(message.author),
             diarize=chan_cfg.get("diarize", False),
+            vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
+            yt_comments_enabled=chan_cfg.get(
+                "yt_comments_enabled", YT_COMMENTS_ENABLED
+            ),
             model_override=chan_cfg.get("model"),
+            # Auto-paste — not an explicit user request. NotAVideoError
+            # will silently drop instead of falling through to web,
+            # because users posting reddit/twitter text-post URLs
+            # generally don't expect a summary unless they ask.
+            explicit_request=False,
             message=message,
         )
 
-    # YouTube URLs → extract video ID for timestamp linking.
+    # YouTube URLs → extract video ID for timestamp linking. YT_PATTERN is
+    # already strict (matches /watch, /shorts, /live, youtu.be paths) so
+    # all matches are real videos.
     for m in YT_PATTERN.finditer(message.content):
         all_urls.append(m.group(0))
         video_id = m.group(1)
@@ -674,15 +945,20 @@ async def on_message(message: discord.Message):
         url = f"https://www.youtube.com/watch?v={video_id}"
         jobs_to_queue.append(_new_job(url, video_id))
 
-    # Other video platform URLs
+    # Other video platform URLs — only auto-trigger when the URL SHAPE
+    # clearly points at a video. Reddit/Twitter/Instagram domains are in
+    # VIDEO_DOMAINS but most URLs on those hosts are text posts that
+    # would just produce a noisy yt-dlp failure.
     for url_match in VIDEO_URL_PATTERN.finditer(message.content):
         url = url_match.group(1)
         all_urls.append(url)
         if any(d in url for d in ("youtube.com", "youtu.be")):
             continue
-        path_parts = [p for p in url.rstrip("/").split("/")
-                      if p and "." not in p and "//" not in p]
-        vid = re.sub(r"[^\w-]", "", path_parts[-1])[:20] if path_parts else "unknown"
+        if not _is_clearly_video_url(url):
+            # Text post / profile page on a video-hosting domain. Don't
+            # auto-summarise; user can still ask via `tldr` reply.
+            continue
+        vid = _derive_video_id(url)
         if vid in seen:
             continue
         seen.add(vid)
@@ -721,11 +997,600 @@ async def on_message(message: discord.Message):
                  job.video_id, job.submitter_name, message.channel.id)
 
 
+# ─── Reply-trigger handler ───────────────────────────────────────────────────
+
+
+async def _resolve_referenced_message(message: discord.Message) -> discord.Message | None:
+    """Return the message that `message` is replying to.
+
+    discord.py auto-resolves it for cached references; for older replies the
+    server fetch is required. Either way, returns None if unreachable
+    (deleted, no permission, etc.).
+    """
+    ref = message.reference
+    if ref is None:
+        return None
+    # Already-resolved reference (the common case)
+    resolved = getattr(ref, "resolved", None)
+    if isinstance(resolved, discord.Message):
+        return resolved
+    # Fall back to channel.fetch_message for stale references
+    if ref.message_id is None:
+        return None
+    try:
+        return await message.channel.fetch_message(ref.message_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+        log.info("Reply-trigger: couldn't fetch referenced message %s: %s",
+                 ref.message_id, e)
+        return None
+
+
+async def _handle_reply_trigger(
+    message: discord.Message,
+    kind_hints: list[str] | str = "summary",
+) -> None:
+    """User replied to a message with one or more trigger keywords. Find
+    the URL in the replied-to message ONCE; build one Job per kind_hint
+    and enqueue them all.
+
+    `kind_hints`:
+      str          → single hint (legacy single-keyword behaviour)
+      list[str]    → chained reply (e.g. ["summary", "litmus"]). Each hint
+                     produces its own Job; rate limit charged per Job;
+                     queueing is atomic (rejected as a batch if any of
+                     the cap checks would be violated).
+
+    Hint values:
+      "summary" → tldr / summarize / summarise. Routes to video or web
+                  depending on URL shape.
+      "litmus"  → AI-litmus-test reply. Always routes to kind="litmus"
+                  regardless of URL — even YouTube URLs get litmus'd
+                  (the bot pulls the page, not the video file).
+    """
+    if isinstance(kind_hints, str):
+        kind_hints = [kind_hints]
+    if not kind_hints:
+        return  # caller bug; nothing to do
+    referenced = await _resolve_referenced_message(message)
+    if referenced is None:
+        try:
+            await message.channel.send(
+                "❌ Couldn't read the message you replied to. "
+                "Try replying directly to the message containing the URL.",
+                reference=message, mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    url = _extract_first_url(referenced.content)
+    if url is None:
+        try:
+            await message.channel.send(
+                "❌ No URL found in the message you replied to.",
+                reference=message, mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    chan_cfg = get_channel_config(message.channel.id)
+
+    # Rate-limit + queue-cap apply equally to web/video/litmus jobs.
+    # Atomic batch: reject the whole reply if it would push past either cap.
+    ok, reason = _rate_limit_check(message.author.id, count=len(kind_hints))
+    if not ok:
+        await safe_react(message, "\U0001f6ab")  # 🚫
+        try:
+            await message.channel.send(
+                f"❌ {message.author.mention} {reason}",
+                reference=message, mention_author=False,
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    # Build one Job per hint. URL parsing happens once above; per-hint we
+    # only flip the kind discriminator and pick the right ID scheme.
+    jobs: list[Job] = []
+    for hint in kind_hints:
+        if hint == "litmus":
+            # Litmus is always a web-style fetch — even when the URL points
+            # at a video, we want to inspect the page (text, byline,
+            # AdSense, domain age), not transcribe the audio.
+            job = Job(
+                url=url, video_id=_hash_url(url),
+                channel=message.channel,
+                submitter_id=message.author.id,
+                submitter_name=str(message.author),
+                model_override=chan_cfg.get("model"),
+                kind="litmus",
+                explicit_request=True,
+                message=message,
+            )
+        elif _is_clearly_video_url(url):
+            # Routing: only send to video pipeline when the URL shape
+            # clearly points at a video. Reddit/Twitter/Instagram URLs go
+            # to web by default — most of them are text posts. The
+            # NotAVideoError fallback in the worker upgrades to/from web
+            # if the routing turns out wrong (e.g. a tweet that does have
+            # an embedded video and the user replied tldr to it).
+            m_yt = YT_PATTERN.search(url)
+            if m_yt:
+                video_id = m_yt.group(1)
+                canonical = f"https://www.youtube.com/watch?v={video_id}"
+            else:
+                canonical = url
+                video_id = _derive_video_id(url)
+            job = Job(
+                url=canonical, video_id=video_id,
+                channel=message.channel,
+                submitter_id=message.author.id,
+                submitter_name=str(message.author),
+                diarize=chan_cfg.get("diarize", False),
+                vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
+                yt_comments_enabled=chan_cfg.get(
+                    "yt_comments_enabled", YT_COMMENTS_ENABLED
+                ),
+                model_override=chan_cfg.get("model"),
+                kind="video",
+                explicit_request=True,  # user typed tldr → wants a summary
+                message=message,
+            )
+        else:
+            job = Job(
+                url=url, video_id=_hash_url(url),
+                channel=message.channel,
+                submitter_id=message.author.id,
+                submitter_name=str(message.author),
+                model_override=chan_cfg.get("model"),
+                kind="web",
+                explicit_request=True,
+                message=message,
+            )
+        jobs.append(job)
+
+    for job in jobs:
+        _rate_limit_record(job.submitter_id)
+        await queue.put(job)
+        await _ack_queued(job, queue.qsize())
+        log.info("Reply-trigger queued %s (%s) from %s (channel=%s)",
+                 job.video_id, job.kind, job.submitter_name, message.channel.id)
+    if len(jobs) > 1:
+        log.info("Chained reply: %d jobs queued from %s",
+                 len(jobs), message.author)
+
+
+# ─── Web scraper client ──────────────────────────────────────────────────────
+
+
+# Patterns in scraped Markdown that indicate a Cloudflare interstitial /
+# challenge page. When seen in the Crawl4AI output, fall back to FlareSolverr.
+_CF_CHALLENGE_MARKERS = (
+    "Just a moment",
+    "Checking your browser",
+    "challenges.cloudflare.com",
+    "cf-challenge",
+    "ddos protection by cloudflare",
+    "Enable JavaScript and cookies to continue",
+    "cf_chl_opt",
+)
+
+
+def _looks_like_cf_challenge(text: str) -> bool:
+    """Heuristic: extracted Markdown that's just a CF interstitial.
+
+    A real article body is usually >500 chars and contains paragraph text;
+    a CF challenge page is short and dominated by the marker phrases above.
+    Both checks together avoid false positives on long articles that happen
+    to mention Cloudflare in passing.
+    """
+    if not text or len(text) > 2000:
+        return False
+    return any(m.lower() in text.lower() for m in _CF_CHALLENGE_MARKERS)
+
+
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+_HTML_WS_RE = re.compile(r"\s+")
+_HTML_SCRIPT_STYLE_RE = re.compile(
+    r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL,
+)
+
+
+def _html_to_text(html: str) -> str:
+    """Crude HTML → plain text. Used only for the FlareSolverr fallback path
+    (rare; primary scrape returns Markdown directly).
+
+    Intentional non-goals: handle every weird tag, preserve list/heading
+    structure perfectly. Goal is "give the LLM something readable when CF
+    has us cornered". For better quality on the hot path we use Crawl4AI's
+    readability extractor.
+    """
+    text = _HTML_SCRIPT_STYLE_RE.sub(" ", html)
+    text = _HTML_TAG_RE.sub(" ", text)
+    text = html_mod.unescape(text)
+    return _HTML_WS_RE.sub(" ", text).strip()
+
+
+def _derive_title_from_markdown(md: str, url: str) -> str:
+    """Pull the first H1 from the markdown, or fall back to the URL host."""
+    for line in md.splitlines():
+        line = line.strip()
+        if line.startswith("# "):
+            return line[2:].strip()[:300]
+    from urllib.parse import urlparse
+    return urlparse(url).hostname or url
+
+
+async def _fetch_via_crawl4ai(url: str) -> str | None:
+    """Hit Crawl4AI /md. Returns the Markdown body, or None on failure /
+    obvious CF challenge. Permanent errors raise PermanentError.
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+    payload = {
+        "url": url,
+        "f": "fit",   # readability-based extraction (cleanest)
+        "c": "0",     # cache mode: bypass server-side cache (we cache locally)
+    }
+    try:
+        async with http.post(
+            f"{SCRAPER_API}/md",
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=SCRAPER_TIMEOUT),
+        ) as resp:
+            if resp.status == 400:
+                body = await resp.text()
+                raise PermanentError(f"Scraper rejected URL: {body[:200]}")
+            if resp.status != 200:
+                body = await resp.text()
+                log.warning("Crawl4AI %d for %s: %s", resp.status, url, body[:200])
+                return None
+            data = await resp.json()
+    except asyncio.TimeoutError:
+        log.warning("Crawl4AI timeout for %s", url)
+        return None
+    except aiohttp.ClientError as e:
+        log.warning("Crawl4AI transport error for %s: %s", url, e)
+        return None
+
+    md = (data.get("markdown") or "").strip()
+    if not md or _looks_like_cf_challenge(md):
+        return None
+    return md
+
+
+async def _fetch_via_flaresolverr(url: str) -> str | None:
+    """Fallback path. Asks FlareSolverr to solve any CF challenge and return
+    the resolved HTML; we then strip to plain text. Returns None on failure.
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+    payload = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": FLARESOLVERR_TIMEOUT * 1000,  # ms
+    }
+    try:
+        async with http.post(
+            FLARESOLVERR_API,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=FLARESOLVERR_TIMEOUT + 30),
+        ) as resp:
+            if resp.status != 200:
+                log.warning("FlareSolverr %d for %s", resp.status, url)
+                return None
+            data = await resp.json()
+    except asyncio.TimeoutError:
+        log.warning("FlareSolverr timeout for %s", url)
+        return None
+    except aiohttp.ClientError as e:
+        log.warning("FlareSolverr transport error for %s: %s", url, e)
+        return None
+
+    if data.get("status") != "ok":
+        log.warning("FlareSolverr non-ok for %s: %s", url, data.get("message"))
+        return None
+    solution = data.get("solution") or {}
+    html = solution.get("response") or ""
+    if not html:
+        return None
+    text = _html_to_text(html)
+    if not text or len(text) < 200:
+        # Probably still a challenge or login wall — give up rather than feed
+        # the LLM a few hundred bytes of nav-bar text.
+        return None
+    return text
+
+
+# ─── Reddit-specific scraper ──────────────────────────────────────────────────
+# Reddit URLs benefit from a structured fetch (OP post + comments) instead of
+# generic HTML scraping. The anonymous JSON API exposes everything we need
+# without auth. For link posts, we additionally fetch the target article via
+# the generic scraper and compose both into a single Markdown blob.
+
+_REDDIT_POST_RE = re.compile(
+    r"https?://(?:(?:www|old|new|sh|np)\.)?reddit\.com/r/[\w-]+/comments/(\w+)/",
+    re.IGNORECASE,
+)
+
+# Reddit's anonymous endpoint rate-limits per User-Agent; the default aiohttp
+# UA gets 429-d. Override to identify ourselves cleanly.
+REDDIT_UA = os.environ.get(
+    "REDDIT_USER_AGENT",
+    "whisper-transcribe-bot/1.0 (TL;DW summary bot)"
+)
+REDDIT_TOP_COMMENTS = int(os.environ.get("REDDIT_TOP_COMMENTS", "10"))
+REDDIT_REPLY_DEPTH = int(os.environ.get("REDDIT_REPLY_DEPTH", "1"))
+REDDIT_TIMEOUT = int(os.environ.get("REDDIT_TIMEOUT", "30"))
+
+
+def _is_reddit_post_url(url: str) -> bool:
+    """True iff url is a /r/<sub>/comments/<id>/... post URL."""
+    return bool(_REDDIT_POST_RE.search(url or ""))
+
+
+async def _fetch_reddit_json(url: str) -> list | None:
+    """Hit Reddit's anonymous JSON endpoint for a post URL. Returns the parsed
+    array `[post_listing, comments_listing]` or None on failure.
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+    base = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    if not base.endswith(".json"):
+        base = base + ".json"
+    # `raw_json=1` disables HTML-entity escaping in selftext / body fields.
+    # `limit=50` + `depth=2` cap payload size.
+    json_url = base + "?raw_json=1&limit=50&depth=2"
+    headers = {"User-Agent": REDDIT_UA}
+    try:
+        async with http.get(
+            json_url, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=REDDIT_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                log.warning("Reddit JSON %d for %s", resp.status, url)
+                return None
+            data = await resp.json(content_type=None)  # reddit serves text/json
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        log.warning("Reddit JSON error for %s: %s", url, e)
+        return None
+    if not isinstance(data, list) or len(data) < 2:
+        log.warning("Reddit JSON: unexpected shape for %s", url)
+        return None
+    return data
+
+
+def _format_reddit_comment(node: dict, depth: int, max_depth: int) -> str:
+    """Render a comment node + replies up to max_depth as Markdown. Skips
+    deleted/removed/AutoModerator. Returns "" when nothing useful renders.
+    """
+    if node.get("kind") != "t1":
+        return ""
+    data = node.get("data") or {}
+    body = (data.get("body") or "").strip()
+    if body in ("", "[deleted]", "[removed]"):
+        return ""
+    author = data.get("author") or "[deleted]"
+    score = data.get("score", 0)
+    indent = "  " * depth
+    # Collapse very long bodies — comments aren't articles
+    if len(body) > 2000:
+        body = body[:2000] + "…"
+    lines = [f"{indent}- **u/{author}** ({score} pts): {body}"]
+    if depth < max_depth:
+        replies = data.get("replies")
+        if isinstance(replies, dict):
+            children = (replies.get("data") or {}).get("children") or []
+            for child in children:
+                rendered = _format_reddit_comment(child, depth + 1, max_depth)
+                if rendered:
+                    lines.append(rendered)
+    return "\n".join(lines)
+
+
+def _build_reddit_markdown(post_data: dict,
+                           comment_nodes: list,
+                           article_md: str | None,
+                           article_url: str,
+                           article_error: str | None) -> tuple[str, str]:
+    """Compose the post + comments + (optional) linked article into one
+    Markdown blob. Returns (title, body).
+    """
+    title = post_data.get("title") or "Reddit post"
+    subreddit = post_data.get("subreddit") or ""
+    author = post_data.get("author") or "[deleted]"
+    selftext = (post_data.get("selftext") or "").strip()
+    is_self = bool(post_data.get("is_self"))
+    score = post_data.get("score", 0)
+    num_comments = post_data.get("num_comments", 0)
+
+    parts: list[str] = []
+
+    # Article section (link posts that target a non-Reddit URL and scraped OK)
+    if not is_self and article_url:
+        if article_md:
+            from urllib.parse import urlparse
+            host = urlparse(article_url).hostname or article_url
+            parts.append(f"# Linked article ({host})\n\n{article_md.strip()}")
+        elif article_error:
+            parts.append(
+                f"# Linked article: {article_url}\n\n"
+                f"*Article unreachable: {article_error}*"
+            )
+
+    # Reddit post section
+    post_lines = [f"# Reddit discussion — r/{subreddit}"]
+    post_lines.append(
+        f"**Posted by u/{author}** "
+        f"({score} pts, {num_comments} comments): **{title}**"
+    )
+    if selftext:
+        post_lines.append("")
+        post_lines.append(selftext)
+    parts.append("\n".join(post_lines))
+
+    # Top comments by score
+    scored: list[tuple[int, dict]] = []
+    for node in comment_nodes:
+        if node.get("kind") != "t1":
+            continue
+        data = node.get("data") or {}
+        body = (data.get("body") or "").strip()
+        if body in ("", "[deleted]", "[removed]"):
+            continue
+        scored.append((data.get("score", 0), node))
+    scored.sort(key=lambda kv: kv[0], reverse=True)
+    top = scored[:REDDIT_TOP_COMMENTS]
+
+    if top:
+        comment_lines = [f"## Top {len(top)} comments"]
+        for _s, node in top:
+            rendered = _format_reddit_comment(node, 0, REDDIT_REPLY_DEPTH)
+            if rendered:
+                comment_lines.append(rendered)
+                comment_lines.append("")
+        parts.append("\n".join(comment_lines).rstrip())
+
+    return title, "\n\n".join(parts)
+
+
+async def _fetch_reddit(url: str) -> tuple[str, str]:
+    """Reddit-specific path: OP + top comments + linked article (if any).
+
+    Raises RuntimeError on JSON-API failure so the caller falls back to the
+    generic Crawl4AI path.
+    """
+    data = await _fetch_reddit_json(url)
+    if data is None:
+        raise RuntimeError(f"Reddit JSON API returned no data for {url}")
+
+    post_children = ((data[0] or {}).get("data") or {}).get("children") or []
+    if not post_children:
+        raise RuntimeError(f"Reddit JSON: empty post listing for {url}")
+    post_data = (post_children[0] or {}).get("data") or {}
+
+    comment_children = ((data[1] or {}).get("data") or {}).get("children") or []
+
+    # If it's a link post, fetch the target article alongside.
+    article_md: str | None = None
+    article_error: str | None = None
+    article_url = ""
+    is_self = bool(post_data.get("is_self"))
+    candidate = (post_data.get("url") or "").strip()
+    if not is_self and candidate and not candidate.startswith((
+        "https://www.reddit.com", "https://reddit.com",
+        "https://i.redd.it", "https://v.redd.it",
+        "https://i.imgur.com",  # raw images aren't articles
+    )):
+        article_url = candidate
+        log.info("[reddit] link post → fetching target: %s", article_url)
+        try:
+            article_md = await _fetch_via_crawl4ai(article_url)
+            if article_md is None:
+                article_md = await _fetch_via_flaresolverr(article_url)
+            if article_md is None:
+                article_error = "scraper returned empty / CF challenge"
+        except PermanentError as e:
+            article_error = f"permanent: {e}"[:200]
+        except Exception as e:
+            article_error = f"transient: {type(e).__name__}: {e}"[:200]
+        if article_md:
+            log.info("[reddit] linked article scraped: %d chars", len(article_md))
+        else:
+            log.info("[reddit] linked article unreachable: %s", article_error)
+
+    title, body = _build_reddit_markdown(
+        post_data, comment_children, article_md, article_url, article_error,
+    )
+    return title, body
+
+
+async def fetch_article(url: str) -> tuple[str, str]:
+    """Scrape `url` and return (title, body_text).
+
+    Routing:
+      1. Reddit post URLs → JSON API + linked-article fetch + top comments.
+      2. Everything else → Crawl4AI; FlareSolverr on CF block / failure.
+
+    Raises PermanentError on 4xx (bad URL, scheme reject) — caller should NOT
+    retry. Raises RuntimeError on total failure across both backends.
+    """
+    if _is_reddit_post_url(url):
+        try:
+            title, body = await _fetch_reddit(url)
+            log.info("[scrape] reddit ok: %s (%d chars)", url, len(body))
+            return title, body[:SCRAPED_BODY_CHAR_CAP]
+        except RuntimeError as e:
+            # Reddit-specific path failed (JSON 5xx, malformed payload).
+            # Fall through to generic Crawl4AI scrape so the user still gets
+            # SOMETHING, even if it's just whatever readability extracts.
+            log.warning("[scrape] reddit path failed (%s) — falling back to generic", e)
+
+    md = await _fetch_via_crawl4ai(url)
+    if md is not None:
+        title = _derive_title_from_markdown(md, url)
+        log.info("[scrape] crawl4ai ok: %s (%d chars)", url, len(md))
+        return title, md[:SCRAPED_BODY_CHAR_CAP]
+
+    log.info("[scrape] crawl4ai miss/CF — trying FlareSolverr for %s", url)
+    text = await _fetch_via_flaresolverr(url)
+    if text is not None:
+        from urllib.parse import urlparse
+        title = urlparse(url).hostname or url
+        log.info("[scrape] flaresolverr ok: %s (%d chars)", url, len(text))
+        return title, text[:SCRAPED_BODY_CHAR_CAP]
+
+    raise RuntimeError(
+        f"Both scrapers failed for {url} — site likely behind hard "
+        f"Turnstile or down."
+    )
+
+
 # ─── Worker ───────────────────────────────────────────────────────────────────
 
 
 class PermanentError(Exception):
     """Errors that will fail identically on retry (4xx, oversized inputs, etc.)."""
+
+
+class NotAVideoError(PermanentError):
+    """yt-dlp determined the URL doesn't point at a video.
+
+    Subclass of PermanentError so it skips the transient-retry loop, but
+    the worker handles it specially: explicit user requests fall through
+    to the web pipeline (the user asked for a summary, give them one);
+    auto-paste jobs silently drop (URL probably wasn't intended for the
+    bot at all).
+    """
+
+
+# Subset of _PERMANENT_REMOTE_PATTERNS that specifically mean "this URL is not
+# a video". Used to distinguish "yt-dlp can't handle this URL at all" from
+# "yt-dlp could but the content is gated/unavailable" (private video, members
+# only, geo-blocked, etc. — those should NOT fall through to web because the
+# article-page version would be just as restricted).
+_NOT_A_VIDEO_PATTERNS = (
+    "Unsupported URL",
+    "is not a valid URL",
+    "No video could be found in this tweet",
+    "No video could be found in this",
+    "There's no video in this post",
+    "No media found",
+    "Post does not contain any media",
+    "No video formats found",
+    "no video formats found",
+)
+
+
+def _is_not_a_video_error(text: str) -> bool:
+    """True iff the error message specifically means 'this URL is not a video'.
+
+    Excludes gating/availability errors (private, members-only, geo-blocked)
+    — those fail the same way on the article page so falling through to web
+    wouldn't help.
+    """
+    return any(p in text for p in _NOT_A_VIDEO_PATTERNS)
 
 
 # Belt-and-suspenders: even if the whisper service misclassifies a yt-dlp
@@ -789,24 +1654,77 @@ def _is_permanent_remote_error(text: str) -> bool:
 
 
 
-# Reaction emoji used during processing — cleaned up on completion or failure
-PROCESSING_EMOJI = ("\u23f3", "\U0001f3a7", "\U0001f9e0")  # ⏳ 🎧 🧠
+# Reaction emoji used during processing — cleaned up on completion or failure.
+# Both video and web flows reuse the queued (⏳) and summarising (🧠) emoji;
+# the middle "fetching content" emoji differs by kind so users can tell at a
+# glance what the bot is doing:
+#   🎧  video / audio download (yt-dlp + whisper)
+#   📰  web article scrape (crawl4ai / flaresolverr)
+PROCESSING_EMOJI_VIDEO = "\U0001f3a7"  # 🎧
+PROCESSING_EMOJI_WEB = "\U0001f4f0"    # 📰
+# Cleanup list covers BOTH so a kind switch (e.g. NotAVideoError fall-through)
+# leaves no stale reactions behind.
+PROCESSING_EMOJI = (
+    "\u23f3",                  # ⏳ queued
+    PROCESSING_EMOJI_VIDEO,    # 🎧 video fetch
+    PROCESSING_EMOJI_WEB,      # 📰 web fetch
+    "\U0001f9e0",              # 🧠 summarising
+)
 
 
 async def worker():
-    """Sequential worker — one transcription at a time (GPU bound)."""
+    """Sequential worker — one job at a time. Video jobs are GPU-bound (whisper);
+    web jobs share the same LLM proxy used by video summaries, so even though
+    they don't compete for GPU they still serialise on the model and we keep
+    a single worker for predictable throughput.
+
+    Routing fallback: if a video job's download fails with NotAVideoError
+    (yt-dlp says "Unsupported URL" / "No video found"), the URL probably
+    points at an article instead. For explicit user requests we re-dispatch
+    as a web job and continue. For auto-paste we silently drop — the user
+    didn't ask for a summary, no need to spam the channel with errors.
+    """
     while True:
         job = await queue.get()
         last_error = None
+        silent_drop = False
         for attempt in range(MAX_RETRIES + 1):
             try:
                 if attempt > 0:
                     delay = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
                     log.info("[%s] Retry %d/%d in %ds...", job.video_id, attempt, MAX_RETRIES, delay)
                     await asyncio.sleep(delay)
-                await process(job)
+                # Recompute handler each attempt — NotAVideoError flips kind.
+                if job.kind == "litmus":
+                    handler = process_litmus
+                elif job.kind == "web":
+                    handler = process_url
+                else:
+                    handler = process
+                await handler(job)
                 last_error = None
                 break
+            except NotAVideoError as e:
+                if job.explicit_request:
+                    # User explicitly asked for a summary; URL isn't a
+                    # video → try the web pipeline. Reset video_id to the
+                    # URL hash so cache key matches the web pipeline.
+                    log.info(
+                        "[%s] not a video — falling through to web pipeline: %s",
+                        job.video_id, e,
+                    )
+                    job.kind = "web"
+                    job.video_id = _hash_url(job.url)
+                    # Don't count this as a retry — it's a routing change.
+                    # `continue` re-enters the loop with the new handler.
+                    continue
+                else:
+                    # Auto-paste of a non-video URL. User didn't ask for a
+                    # summary; don't spam the channel with an error embed.
+                    log.info("[%s] not a video (auto-paste) — silent drop: %s",
+                             job.video_id, e)
+                    silent_drop = True
+                    break
             except PermanentError as e:
                 last_error = e
                 log.error("[%s] Permanent failure (no retry): %s", job.video_id, e)
@@ -815,7 +1733,11 @@ async def worker():
                 last_error = e
                 log.warning("[%s] Attempt %d failed: %s", job.video_id, attempt + 1, e)
 
-        if last_error:
+        if silent_drop:
+            # Remove the ⏳ reaction so the message looks clean
+            for emoji in PROCESSING_EMOJI:
+                await _job_remove_react(job, emoji)
+        elif last_error:
             attempts = "permanent error" if isinstance(last_error, PermanentError) \
                 else f"after {MAX_RETRIES + 1} attempts"
             log.error("[%s] Giving up — %s", job.video_id, attempts)
@@ -831,7 +1753,7 @@ async def worker():
 
 
 async def process(job: Job):
-    assert http
+    if http is None: raise RuntimeError("HTTP session not initialised")
 
     # 1. Check whisper service status
     async with http.get(f"{WHISPER_API}/api/status") as resp:
@@ -841,6 +1763,10 @@ async def process(job: Job):
     # 1a. Cache lookup — skip download+transcribe if we have a fresh transcript
     cached = read_cache(job.video_id)
     file_path = None
+    # Comments aren't cached today; cache hits skip the Community Reaction
+    # embed. First-time runs (cache miss) populate this from the yt-dlp
+    # response and use it after the main 3-style summary gather.
+    raw_comments: list[dict] = []
     if cached is not None:
         title, status, transcript, duration = cached
         log.info("[%s] Cache hit (%d chars, '%s')", job.video_id, len(transcript), title)
@@ -848,11 +1774,21 @@ async def process(job: Job):
         # 2. Download. Keep the video stream alongside audio when VLM is
         # enabled — /api/describe needs a video file to extract frames
         # from. When VLM is off, audio-only WAV (smaller, current default).
-        log.info("[%s] Downloading%s...", job.video_id,
-                 " (audio+video)" if VLM_ENABLED else "")
+        # Optionally also fetch top YT comments for the "Community reaction"
+        # embed (default on; per-channel opt-out via /config).
+        log.info("[%s] Downloading%s%s...", job.video_id,
+                 " (audio+video)" if job.vlm_enabled else "",
+                 f" + comments(top {YT_COMMENTS_MAX})" if job.yt_comments_enabled else "")
+        download_payload = {
+            "url": job.url,
+            "keep_video": job.vlm_enabled,
+            "include_comments": job.yt_comments_enabled,
+            "comments_max": YT_COMMENTS_MAX,
+            "comments_sort": YT_COMMENTS_SORT,
+        }
         async with http.post(
             f"{WHISPER_API}/api/yt-download",
-            json={"url": job.url, "keep_video": VLM_ENABLED},
+            json=download_payload,
         ) as resp:
             if resp.status != 200:
                 try:
@@ -865,6 +1801,13 @@ async def process(job: Job):
                 # rebuilt with the classifier still fail fast here.
                 if (400 <= resp.status < 500) or body.get("permanent") \
                         or _is_permanent_remote_error(err):
+                    # Distinguish "URL isn't a video" from other permanent
+                    # errors (private/members-only/geo-blocked). The worker
+                    # falls through to web pipeline only on the former.
+                    if _is_not_a_video_error(err):
+                        raise NotAVideoError(
+                            f"URL is not a video ({resp.status}): {err}"
+                        )
                     raise PermanentError(f"Download failed ({resp.status}): {err}")
                 raise RuntimeError(f"Download failed: {err}")
             dl = await resp.json()
@@ -872,6 +1815,11 @@ async def process(job: Job):
         title = dl.get("title", job.video_id)
         duration = dl.get("duration", 0)
         file_path = dl["filename"]
+        # Comments are present only when include_comments=True was sent AND
+        # yt-dlp succeeded in extracting them. Empty list / missing key both
+        # mean "no comments to summarise" (e.g. comments disabled on the
+        # video, age-gated, or the comment-fetch path failed silently).
+        raw_comments = dl.get("comments") or []
 
         if MAX_DURATION > 0 and duration > MAX_DURATION:
             raise PermanentError(
@@ -903,7 +1851,7 @@ async def process(job: Job):
                      job.video_id, len(initial_prompt), initial_prompt[:80])
 
         log.info("[%s] Transcribing '%s' (%ds)...", job.video_id, title, duration)
-        await _job_react(job, "\U0001f3a7")  # 🎧
+        await _job_react(job, PROCESSING_EMOJI_VIDEO)  # 🎧
 
         transcribe_payload = {
             "file_path": file_path,
@@ -919,6 +1867,7 @@ async def process(job: Job):
         async with http.post(
             f"{WHISPER_API}/api/transcribe",
             json=transcribe_payload,
+            timeout=aiohttp.ClientTimeout(total=TRANSCRIBE_TIMEOUT),
         ) as resp:
             if resp.status == 409:
                 raise RuntimeError("Whisper busy — another transcription running")
@@ -958,7 +1907,7 @@ async def process(job: Job):
         # the user explicitly asked about visual content (or wants targeted
         # attention to specific things on screen).
         user_forced_vlm = bool(job.user_prompt)
-        run_vlm = VLM_ENABLED and (user_forced_vlm or density < SPEECH_DENSITY_SPARSE)
+        run_vlm = job.vlm_enabled and (user_forced_vlm or density < SPEECH_DENSITY_SPARSE)
 
         if run_vlm:
             visual_only = density < SPEECH_DENSITY_SILENT and not user_forced_vlm
@@ -1133,6 +2082,38 @@ async def process(job: Job):
     await send_long_embed(detail_channel, "Key Points", key_points, 0xFF6600)
     await send_long_embed(detail_channel, "Chapters", chapters, 0xFFAA00)
 
+    # 4th embed: Community Reaction (top YT comments). Only when:
+    #   - the job opted in (job.yt_comments_enabled, default true)
+    #   - the server returned a non-empty comment list
+    #   - filtering left enough substance to summarise
+    # Cache hits skip this — comments aren't persisted in the cache today.
+    yt_comments_summary: str | None = None
+    if job.yt_comments_enabled and raw_comments:
+        filtered = filter_yt_comments(raw_comments)
+        log.info("[%s] YT comments: %d raw, %d after filter",
+                 job.video_id, len(raw_comments), len(filtered))
+        if filtered:
+            comment_md = format_yt_comments(filtered)
+            try:
+                yt_comments_summary = await summarize(
+                    comment_md, PROMPT_YT_COMMENTS, LLM_MAX_TOKENS_KEY_POINTS,
+                    reduce_template=REDUCE_YT_COMMENTS,
+                    title=title, duration=duration_str,
+                    char_cap=SUMMARY_CHAR_CAP,
+                )
+                yt_comments_summary = sanitize_llm_output(yt_comments_summary)
+            except Exception as e:
+                # Non-fatal — log and skip the embed. Main video summary
+                # still posts. (Comment summary is supplementary.)
+                log.warning("[%s] Comment summary failed (non-fatal): %s",
+                            job.video_id, e)
+                yt_comments_summary = None
+    if yt_comments_summary:
+        await send_long_embed(
+            detail_channel, "Community Reaction",
+            yt_comments_summary, 0xFF3366,  # YT-red-pink, distinct from chapters
+        )
+
     # Post brief TL;DW in original channel
     embed = discord.Embed(
         title=f"TL;DW: {truncate(title, 240)}",
@@ -1173,6 +2154,461 @@ async def process(job: Job):
     log.info("[%s] Done — posted 3 embeds", job.video_id)
 
 
+async def process_url(job: Job):
+    """Web-article handler. Mirrors process() but skips download/transcribe/VLM.
+
+    Prompt selection:
+    - Reddit URLs (or scraped bodies that contain Reddit-discussion markers)
+      → Reddit-flavoured prompts that surface BOTH the linked article AND
+      community comment reactions.
+    - Everything else → generic article prompts (PROMPT_*_WEB +
+      PROMPT_SECTIONS).
+
+    Cache strategy: same {hash}.txt format as transcripts. The hash here is
+    the URL hash, so two identical URL summary requests share a cache hit;
+    different URLs to the same article (canonicalisation differences) miss
+    each other — acceptable, we don't try to canonicalise URLs.
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+
+    # 1. Cache lookup
+    cached = read_cache(job.video_id)
+    if cached is not None:
+        title, status, body, _duration = cached
+        log.info("[%s] Cache hit (%d chars, '%s')", job.video_id, len(body), title)
+    else:
+        # 2. Scrape via Crawl4AI → FlareSolverr fallback. Errors here are
+        # transient by default (network / scraper container down). Hard
+        # failures (4xx scheme reject) raise PermanentError from
+        # _fetch_via_crawl4ai.
+        log.info("[%s] Scraping %s ...", job.video_id, job.url)
+        await _job_react(job, PROCESSING_EMOJI_WEB)  # 📰 — distinguishes web from audio fetch
+        title, body = await fetch_article(job.url)
+        status = f"scraped {len(body)} chars"
+        log.info("[%s] Scraped: %s (%d chars)", job.video_id, title, len(body))
+        # Persist before LLM step so a transient LLM failure doesn't force a
+        # re-scrape on retry. duration=0 for web jobs (no runtime concept).
+        write_cache(job.video_id, title, status, body, 0)
+
+    # 3. Optional: Exa context for terminology spelling. Same rationale as
+    # video pipeline — gives the LLM a glossary without polluting the body.
+    web_context = await search_topic_context(title)
+    if web_context:
+        log.info("[%s] Got web context (%d chars)", job.video_id, len(web_context))
+
+    # 4. Reference + user-prompt blocks (same convention as process()).
+    ref_block = ""
+    if web_context:
+        ref_block = (
+            "Reference material — USE FOR SPELLING/TERMINOLOGY ONLY. "
+            "Do NOT copy facts, dates, numbers, or claims from this into the summary. "
+            "Summary content must come exclusively from the article below.\n"
+            "<reference>\n"
+            f"{web_context[:REFERENCE_CHAR_CAP]}\n"
+            "</reference>\n\n"
+        )
+
+    if job.user_prompt:
+        ref_block = (
+            "The Discord user who requested this summary specifically asked: "
+            "<user_request>\n"
+            f"{job.user_prompt}\n"
+            "</user_request>\n"
+            "Honour that request when shaping your output — emphasise the "
+            "aspects they're interested in, while still covering the rest of "
+            "the article. The user_request is steering, not data to "
+            "summarise.\n\n"
+        ) + ref_block
+
+    from urllib.parse import urlparse
+    source = urlparse(job.url).hostname or job.url
+
+    # Reddit content has a multi-source structure (linked article + OP + top
+    # comments) that the generic web prompts ignore — they treat the whole
+    # blob as one article and drop the comment discussion. Detect Reddit
+    # content (either by URL match or by structural markers in the body)
+    # and switch to Reddit-flavoured prompts that explicitly cover both the
+    # article AND community reaction.
+    is_reddit_content = (
+        _is_reddit_post_url(job.url)
+        or "# Reddit discussion" in body
+        or "## Top " in body and " comments" in body
+    )
+    if is_reddit_content:
+        log.info("[%s] Reddit content detected — using Reddit-aware prompts",
+                 job.video_id)
+        prompt_brief = PROMPT_BRIEF_REDDIT
+        prompt_key_points = PROMPT_KEY_POINTS_REDDIT
+        prompt_sections = PROMPT_SECTIONS_REDDIT
+        reduce_brief = REDUCE_BRIEF_REDDIT
+        reduce_key_points = REDUCE_KEY_POINTS_REDDIT
+        reduce_sections = REDUCE_SECTIONS_REDDIT
+    else:
+        prompt_brief = PROMPT_BRIEF_WEB
+        prompt_key_points = PROMPT_KEY_POINTS_WEB
+        prompt_sections = PROMPT_SECTIONS
+        reduce_brief = REDUCE_BRIEF_WEB
+        reduce_key_points = REDUCE_KEY_POINTS_WEB
+        reduce_sections = REDUCE_SECTIONS
+
+    log.info("[%s] Summarizing article (%d chars)...", job.video_id, len(body))
+    await _job_react(job, "\U0001f9e0")  # 🧠
+
+    _token = _model_override.set(job.model_override) if job.model_override else None
+    try:
+        brief, key_points, sections = await asyncio.gather(
+            summarize(
+                body, prompt_brief, LLM_MAX_TOKENS_BRIEF,
+                reduce_template=reduce_brief,
+                title=title, source=source, reference_block=ref_block,
+            ),
+            summarize(
+                body, prompt_key_points, LLM_MAX_TOKENS_KEY_POINTS,
+                reduce_template=reduce_key_points,
+                title=title, source=source, reference_block=ref_block,
+                char_cap=SUMMARY_CHAR_CAP,
+            ),
+            summarize(
+                body, prompt_sections, LLM_MAX_TOKENS_CHAPTERS,
+                reduce_template=reduce_sections,
+                title=title, source=source, reference_block=ref_block,
+                char_cap=SUMMARY_CHAR_CAP,
+            ),
+        )
+    finally:
+        if _token is not None:
+            _model_override.reset(_token)
+
+    brief = sanitize_llm_output(brief)
+    key_points = sanitize_llm_output(key_points)
+    sections = sanitize_llm_output(sections)
+
+    # 5. Post embeds. Same routing rule as video: detail goes to summary
+    # channel (when configured for this server), brief stays in-channel.
+    detail_channel = resolve_summary_channel(job.channel)
+    use_split = detail_channel.id != job.channel.id
+
+    detail_msg = None
+    if use_split:
+        if job.message is not None:
+            requester = job.message.author.mention
+        elif job.interaction is not None:
+            requester = job.interaction.user.mention
+        else:
+            requester = f"<@{job.submitter_id}>"
+        header = discord.Embed(
+            title=f"{truncate(title, 240)}",
+            url=job.url,
+            description=f"Requested by {requester} in <#{job.channel.id}>",
+            color=0x4A90E2,  # blue — visual distinguisher from video (red)
+        )
+        header.set_footer(text=source)
+        detail_msg = await detail_channel.send(embed=header)
+
+    await send_long_embed(detail_channel, "Key Points", key_points, 0x357ABD)
+    await send_long_embed(detail_channel, "Sections", sections, 0x5DADE2)
+
+    # Brief embed in the original channel
+    embed = discord.Embed(
+        title=f"TL;DR: {truncate(title, 240)}",
+        url=job.url,
+        description=truncate(brief, 4000),
+        color=0x4A90E2,
+    )
+    embed.set_footer(text=f"{source} | {status}")
+
+    if job.user_prompt:
+        embed.add_field(
+            name="User request",
+            value=truncate(job.user_prompt, 1000),
+            inline=False,
+        )
+
+    if use_split and detail_msg:
+        embed.add_field(
+            name="",
+            value=f"[Full breakdown →]({detail_msg.jump_url})",
+            inline=False,
+        )
+
+    if job.message is not None:
+        await job.channel.send(embed=embed, reference=job.message)
+    else:
+        await job.channel.send(embed=embed)
+
+    for emoji in PROCESSING_EMOJI:
+        await _job_remove_react(job, emoji)
+    await _job_react(job, "\u2705")  # ✅
+
+    log.info("[%s] Done — posted web summary", job.video_id)
+
+
+# ─── AI litmus handler ───────────────────────────────────────────────────────
+
+
+_SEVERITY_DOT = {"low": "🟢", "med": "🟡", "high": "🔴"}
+
+
+def _format_litmus_signals(signals: dict,
+                           adsense_detected: bool,
+                           author: str | None,
+                           domain_severity: str,
+                           domain_text: str) -> str:
+    """Render the regex + metadata signals as a readable bullet list for
+    the embed. Each line: `<dot> <signal name>: <details>`.
+    """
+    lines: list[str] = []
+
+    def line(name: str, sev: str, detail: str) -> None:
+        dot = _SEVERITY_DOT.get(sev, "⚪")
+        lines.append(f"{dot} **{name}**: {detail}")
+
+    if "too_short" in signals:
+        line("Article too short", "low",
+             f"only {signals['too_short']['len']} chars; stylistic detection "
+             f"needs ~200+ chars of prose.")
+        # No further regex signals are meaningful on a stub
+        line("Domain age", domain_severity, domain_text)
+        if adsense_detected:
+            line("AdSense", "med", "ad-network markers detected in HTML")
+        if author:
+            line("Author byline", "low", f"present ({author})")
+        else:
+            line("Author byline", "med", "no `<meta name=author>` or rel=author")
+        return "\n".join(lines)
+
+    # Stylistic
+    if "llm_tic_phrases" in signals:
+        s = signals["llm_tic_phrases"]
+        examples = ", ".join(f"`{p}` ×{c}" for p, c in s["examples"][:4])
+        line("LLM-tic phrases", s["severity"],
+             f"{s['count']} hits ({s['density_per_1k']}/1k words). {examples}")
+    else:
+        line("LLM-tic phrases", "low", "0 hits")
+
+    if "buzzwords" in signals:
+        s = signals["buzzwords"]
+        examples = ", ".join(f"`{p}` ×{c}" for p, c in s["examples"][:4])
+        line("Generic buzzwords", s["severity"],
+             f"{s['count']} hits ({s['density_per_1k']}/1k words). {examples}")
+    else:
+        line("Generic buzzwords", "low", "0 hits")
+
+    if "hedges" in signals:
+        s = signals["hedges"]
+        line("Hedge phrases", s["severity"],
+             f"{s['count']} hits (e.g. \"it's worth noting\")")
+    else:
+        line("Hedge phrases", "low", "0 hits")
+
+    if "em_dash_density" in signals:
+        s = signals["em_dash_density"]
+        line("Em-dash density", s["severity"],
+             f"{s['count']} dashes ({s['density_per_1k']}/1k words; "
+             f"typical human ≈ 2-3)")
+    else:
+        line("Em-dash density", "low", "within typical-human range")
+
+    if "listicle_structure" in signals:
+        s = signals["listicle_structure"]
+        line("Listicle structure", s["severity"],
+             f"{s['headings']} headings, {s['bullets']} bullets "
+             f"({s['density_per_1k']}/1k words)")
+    else:
+        line("Listicle structure", "low", "prose-heavy, not heading-heavy")
+
+    if "low_substance" in signals:
+        s = signals["low_substance"]
+        line("Substance", s["severity"],
+             f"few specific markers — quotes:{s['quotes']}, "
+             f"named titles:{s['named_titles']}, year refs:{s['year_refs']}, "
+             f"$ refs:{s['monetary_refs']}, %:{s['percentages']} "
+             f"({s['density_per_1k']}/1k words)")
+    else:
+        line("Substance", "low", "specific quotes / dates / numbers present")
+
+    # Metadata
+    line("Domain age", domain_severity, domain_text)
+
+    if author:
+        line("Author byline", "low", f"present ({author})")
+    else:
+        line("Author byline", "med", "no `<meta name=author>` or rel=author")
+
+    if adsense_detected:
+        line("AdSense", "med", "ad-network markers detected in HTML")
+    else:
+        line("AdSense", "low", "not detected")
+
+    return "\n".join(lines)
+
+
+def _signals_summary_for_prompt(signals: dict,
+                                adsense_detected: bool,
+                                author: str | None,
+                                domain_severity: str,
+                                domain_text: str) -> str:
+    """Compact signals summary fed into PROMPT_LITMUS as `{signals_summary}`.
+    Same content as the embed format but more compact and without emoji.
+    """
+    parts = []
+    for name, info in signals.items():
+        sev = info.get("severity", "low")
+        detail_bits = []
+        for k, v in info.items():
+            if k in ("severity", "examples"):
+                continue
+            detail_bits.append(f"{k}={v}")
+        parts.append(f"- {name} ({sev}): {', '.join(detail_bits)}")
+    parts.append(f"- domain_age ({domain_severity}): {domain_text}")
+    parts.append(f"- author_byline: {'present (' + author + ')' if author else 'missing'}")
+    parts.append(f"- adsense: {'detected' if adsense_detected else 'not detected'}")
+    return "\n".join(parts)
+
+
+# Hard-cap article excerpt sent to the LLM for the qualitative read.
+# We don't need the full body — a representative excerpt is enough to gauge
+# voice / structure / substance, and full bodies blow context for marginal
+# qualitative gain.
+LITMUS_EXCERPT_CHARS = int(os.environ.get("LITMUS_EXCERPT_CHARS", "8000"))
+
+
+async def process_litmus(job: Job):
+    """Surface stylistic + metadata signals that a web article may be
+    LLM-generated or LLM-heavy-edited. Forensic output (signals + qualitative
+    read), no verdict.
+
+    Pipeline:
+      1. Scrape via fetch_article (reuses Crawl4AI / FlareSolverr / Reddit
+         path).
+      2. Regex pre-pass over the scraped Markdown — LLM-tic phrases,
+         em-dash density, hedge phrases, buzzwords, listicle structure,
+         substance markers (positive signal).
+      3. Parallel metadata fetch — Crawl4AI /html for AdSense + author,
+         Wayback /available for domain age.
+      4. Aggregate severity. If the score lands in the ambiguous middle
+         range, call the LLM for a qualitative description.
+      5. Compose a forensic embed: signals list + qualitative read +
+         caveat about detection unreliability.
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+
+    # Scraping reaction — same 📰 emoji as the web flow
+    await _job_react(job, PROCESSING_EMOJI_WEB)
+
+    log.info("[%s] Litmus: scraping %s", job.video_id, job.url)
+    title, body = await fetch_article(job.url)
+    log.info("[%s] Litmus: scraped %d chars", job.video_id, len(body))
+
+    # Regex pre-pass + metadata fetches concurrently
+    signals = _regex_signals(body)
+    raw_html, wayback_ts = await asyncio.gather(
+        _fetch_raw_html(job.url),
+        _wayback_first_seen(job.url),
+        return_exceptions=False,
+    )
+    adsense_detected = _detect_adsense(raw_html or "")
+    author = _extract_author_from_html(raw_html or "")
+    domain_severity, domain_text = _domain_age_severity(wayback_ts)
+
+    score = _aggregate_severity(
+        signals,
+        adsense_detected=adsense_detected,
+        author_present=bool(author),
+        domain_severity=domain_severity,
+    )
+    log.info("[%s] Litmus: severity score %d (skip-below=%d, skip-above=%d)",
+             job.video_id, score, LITMUS_SKIP_LLM_BELOW, LITMUS_SKIP_LLM_ABOVE)
+
+    # Qualitative LLM read only for the ambiguous middle range
+    qualitative: str | None = None
+    if LITMUS_SKIP_LLM_BELOW < score < LITMUS_SKIP_LLM_ABOVE:
+        await _job_react(job, "\U0001f9e0")  # 🧠
+        log.info("[%s] Litmus: ambiguous → calling LLM for qualitative read",
+                 job.video_id)
+        from urllib.parse import urlparse
+        excerpt = body[:LITMUS_EXCERPT_CHARS]
+        signals_summary = _signals_summary_for_prompt(
+            signals, adsense_detected, author, domain_severity, domain_text,
+        )
+        _token = _model_override.set(job.model_override) if job.model_override else None
+        try:
+            qualitative = await summarize(
+                excerpt, PROMPT_LITMUS, LLM_MAX_TOKENS_BRIEF,
+                reduce_template=None,  # single-pass; excerpt is bounded
+                title=title,
+                source=urlparse(job.url).hostname or job.url,
+                signals_summary=signals_summary,
+                reference_block="",
+            )
+            qualitative = sanitize_llm_output(qualitative)
+        except Exception as e:
+            log.warning("[%s] Litmus LLM call failed (non-fatal): %s",
+                        job.video_id, e)
+            qualitative = None
+        finally:
+            if _token is not None:
+                _model_override.reset(_token)
+    elif score <= LITMUS_SKIP_LLM_BELOW:
+        log.info("[%s] Litmus: low score → skipping LLM (clear-clean)", job.video_id)
+    else:
+        log.info("[%s] Litmus: high score → skipping LLM (clear-LLM-style)", job.video_id)
+
+    # Compose embed
+    from urllib.parse import urlparse
+    source = urlparse(job.url).hostname or job.url
+    body_lines = [
+        "**Detected signals:**",
+        _format_litmus_signals(
+            signals, adsense_detected, author, domain_severity, domain_text,
+        ),
+    ]
+    if qualitative:
+        body_lines.append(f"\n**Qualitative read** (`{job.model_override or LLM_MODEL}`):")
+        body_lines.append(qualitative.strip())
+    elif score <= LITMUS_SKIP_LLM_BELOW:
+        body_lines.append(
+            "\n*Few stylistic markers detected — typical-human-range. "
+            "Skipped LLM qualitative read (signals were clear).*"
+        )
+    else:
+        body_lines.append(
+            "\n*Multiple strong LLM-style markers detected. "
+            "Skipped LLM qualitative read (signals were clear).*"
+        )
+
+    body_lines.append(
+        "\n⚠️ *AI detection is fundamentally unreliable. False positives are "
+        "common on careful technical writing; false negatives common on "
+        "lightly-edited LLM output. Treat this as forensic signals only, "
+        "not a verdict.*"
+    )
+
+    description = "\n".join(body_lines)
+    embed = discord.Embed(
+        title=f"🔍 Litmus: {truncate(title, 200)}",
+        url=job.url,
+        description=truncate(description, 4000),
+        color=0xA855F7,  # purple — distinct from video (red), web (blue), reddit
+    )
+    embed.set_footer(text=f"{source} | severity score {score}")
+
+    # Litmus output is always a single embed in the original channel — no
+    # split to summary_channel (it's not a "summary"; it's a forensic note).
+    if job.message is not None:
+        await job.channel.send(embed=embed, reference=job.message)
+    else:
+        await job.channel.send(embed=embed)
+
+    for emoji in PROCESSING_EMOJI:
+        await _job_remove_react(job, emoji)
+    await _job_react(job, "\u2705")  # ✅
+    log.info("[%s] Litmus done — score %d, llm=%s",
+             job.video_id, score, "yes" if qualitative else "no")
+
+
 # Per-task model override (set by process() per Job). Reads at _llm_call
 # time via .get(). ContextVar lets us override without threading a `model`
 # kwarg through every recursive summarize() call.
@@ -1188,7 +2624,7 @@ async def _llm_call(prompt: str, max_tokens: int) -> str:
     Raises PermanentError on 4xx (won't recover on retry); RuntimeError on 5xx
     or transport errors (worker will retry).
     """
-    assert http
+    if http is None: raise RuntimeError("HTTP session not initialised")
     payload = {
         "model": _model_override.get() or LLM_MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -1318,10 +2754,13 @@ async def summarize(
         len(transcript), budget, len(chunks),
     )
 
-    # Map: per-chunk summarization, sequential to avoid GPU thrash on a
-    # single-instance llm-compose backend. Each call recurses through
-    # summarize() with no reduce_template so an overflow on one chunk
-    # halves only that chunk, not the whole pipeline.
+    # Map: per-chunk summarization, sequential WITHIN this style. Note that
+    # process() runs three styles (brief / key_points / chapters) concurrently
+    # via asyncio.gather, so the LLM still sees up to 3 in-flight requests at
+    # any time — sequencing here only bounds chunk fan-out within a single
+    # style. Each call recurses through summarize() with no reduce_template
+    # so an overflow on one chunk halves only that chunk, not the whole
+    # pipeline.
     partials: list[str] = []
     for i, chunk in enumerate(chunks, 1):
         chunk_preamble = _preamble + CHUNK_PREAMBLE.format(n=i, total=len(chunks))
@@ -1457,7 +2896,7 @@ def read_cache(video_id: str) -> tuple[str, str, str, int] | None:
 
 async def fetch_video_description(video_id: str) -> str:
     """Fetch full YouTube video description from page JSON data."""
-    assert http
+    if http is None: raise RuntimeError("HTTP session not initialised")
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
         headers = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en"}
@@ -1503,7 +2942,7 @@ async def fetch_video_description(video_id: str) -> str:
 
 async def search_topic_context(title: str, description: str = "") -> str:
     """Use Exa to find authoritative sources with correct terminology."""
-    assert http
+    if http is None: raise RuntimeError("HTTP session not initialised")
     if not EXA_API_KEY:
         log.debug("No EXA_API_KEY — skipping web research")
         return ""
@@ -1675,9 +3114,32 @@ def build_initial_prompt(title: str, web_context: str) -> str:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
+# Discord embed limits per message: title 256, description 4096, fields 25,
+# field name 256, field value 1024, footer 2048, AND total payload ≤ 6000
+# chars summed across title + description + fields + footer + author. If we
+# fill description to 4000 + a 256-char title + a 1000-char field + 200-char
+# footer we're at 5456 — fine. The guard below trims description to keep us
+# safely under the total limit even if title/footer grow.
+EMBED_TOTAL_LIMIT = 6000
+
+
+def _safe_description_len(title: str, footer: str = "", extra: int = 0) -> int:
+    """How many description chars we can spend without breaching the
+    6000-char total cap. `extra` is reserved for fields the caller will add.
+    """
+    overhead = len(title or "") + len(footer or "") + extra
+    return max(256, EMBED_TOTAL_LIMIT - overhead - 64)  # 64 char safety margin
+
+
 async def send_long_embed(channel, title: str, content: str, color: int):
-    """Send embed, splitting into continuation embeds if >4000 chars."""
-    chunks = split_content(content, 4000)
+    """Send embed, splitting into continuation embeds if >4000 chars.
+
+    Each chunk respects the 4096 description cap AND the 6000 total payload
+    cap. Title is the only other contributor here (no fields, no footer),
+    so we cap at min(4000, 6000 - len(title)).
+    """
+    cap = min(4000, _safe_description_len(title))
+    chunks = split_content(content, cap)
     for i, chunk in enumerate(chunks):
         t = title if i == 0 else f"{title} (cont.)"
         embed = discord.Embed(title=t, description=chunk, color=color)
@@ -1782,6 +3244,426 @@ def split_content(text: str, max_len: int) -> list[str]:
     return chunks
 
 
+# ─── AI litmus test ──────────────────────────────────────────────────────────
+# Surfaces stylistic + metadata signals that an article may be LLM-generated
+# or LLM-heavy-edited. Forensic output (signals + qualitative read) — not a
+# verdict; AI detection is fundamentally unreliable. The honest framing is
+# "here are signals; you decide", not "this is AI".
+
+# Phrases that LLMs (especially RLHF-trained chat models) reach for far more
+# than human writers. Many have legitimate uses; what matters is DENSITY in
+# a single article. Pulled from observed LLM output patterns + published
+# style-detection research.
+LLM_TIC_PHRASES = (
+    # Vocabulary tics
+    "delve into", "delving into", "delve deeper",
+    "tapestry of", "rich tapestry",
+    "navigate the landscape", "navigating the landscape",
+    "underscore the importance", "underscores the importance",
+    "shed light on", "shed some light",
+    "in the realm of", "in the world of",
+    "in today's fast-paced world", "in the digital age",
+    "stand the test of time",
+    "embark on", "embark upon",
+    "myriad of", "a plethora of",
+    "showcase", "showcasing",
+    "whether it be", "be it",
+    # Conclusion / transition tics
+    "in conclusion", "to conclude", "in essence",
+    "moreover", "furthermore",
+    "ultimately",
+    # Hedging tics
+    "it's worth noting", "it is worth noting",
+    "it's important to note", "it is important to note",
+    "it should be noted", "it bears mentioning",
+    # Buzzword adjectives — separate scoring; see _BUZZWORDS below
+)
+
+# Buzzwords scored separately because their density curve differs (a single
+# "robust" is fine; five in one article is a tic). Stacked buzzwords are a
+# strong stylistic marker.
+LLM_BUZZWORDS = (
+    "robust", "seamless", "comprehensive", "cutting-edge", "cutting edge",
+    "game-changer", "game changer", "revolutionary", "transformative",
+    "leverage", "leveraging", "elevate", "elevating",
+    "commendable", "noteworthy", "paramount", "pivotal",
+    "unparalleled", "unprecedented",
+)
+
+# Hedge phrases scored separately; LLMs over-hedge to seem cautious.
+LLM_HEDGE_PHRASES = (
+    "it's important to note",
+    "it is important to note",
+    "it's worth noting",
+    "it is worth noting",
+    "it should be noted",
+    "it is worth mentioning",
+    "it bears mentioning",
+    "it's crucial to remember",
+    "it's essential to consider",
+    "it goes without saying",
+)
+
+# Severity → numeric score for aggregation (higher = stronger LLM signal)
+_SEVERITY_SCORE = {"low": 0, "med": 1, "high": 2}
+# Aggregate-score thresholds for the "ambiguous → call LLM" decision.
+# Sum of all signals' severity scores. Two signals = clearly clean = skip;
+# eight = clearly LLM-style = skip; in between = call the LLM for nuance.
+LITMUS_SKIP_LLM_BELOW = int(os.environ.get("LITMUS_SKIP_LLM_BELOW", "2"))
+LITMUS_SKIP_LLM_ABOVE = int(os.environ.get("LITMUS_SKIP_LLM_ABOVE", "8"))
+
+# Wayback API timeout — short, since Wayback is occasionally slow and we
+# don't want to hold up the whole litmus job.
+WAYBACK_TIMEOUT = int(os.environ.get("WAYBACK_TIMEOUT", "8"))
+
+
+def _per_1000(count: int, total_words: int) -> float:
+    if total_words <= 0:
+        return 0.0
+    return (count * 1000.0) / total_words
+
+
+def _count_phrases(text: str, phrases) -> tuple[int, list[tuple[str, int]]]:
+    """Return (total_count, [(phrase, count), ...]) for case-insensitive
+    word-boundaried matches. Phrases with hyphens / apostrophes are
+    matched literally within word boundaries.
+    """
+    hits: list[tuple[str, int]] = []
+    total = 0
+    for phrase in phrases:
+        # Word boundary on each end; phrase may contain spaces/hyphens.
+        pat = r"(?:^|[^\w])" + re.escape(phrase) + r"(?:[^\w]|$)"
+        c = len(re.findall(pat, text, re.IGNORECASE))
+        if c > 0:
+            hits.append((phrase, c))
+            total += c
+    return total, hits
+
+
+def _regex_signals(text: str) -> dict:
+    """Run cheap regex / structural detectors on scraped article text.
+
+    Returns dict of {signal_name: {count|density|examples|severity}}.
+    Only includes signals that fired (i.e. count > 0) — keeps the embed
+    short. Severities are calibrated against typical-human baseline:
+      low  = within human range
+      med  = elevated; one of several signals would be unremarkable
+      high = beyond typical-human density
+    """
+    signals: dict = {}
+    if not text or len(text) < 200:
+        # Too short for stylistic analysis — return marker
+        signals["too_short"] = {"len": len(text), "severity": "low"}
+        return signals
+
+    word_count = len(re.findall(r"\b\w+\b", text))
+
+    # 1. LLM tic phrases
+    tic_count, tic_hits = _count_phrases(text, LLM_TIC_PHRASES)
+    if tic_count > 0:
+        density = _per_1000(tic_count, word_count)
+        sev = "high" if density >= 3 else ("med" if density >= 1 else "low")
+        signals["llm_tic_phrases"] = {
+            "count": tic_count,
+            "density_per_1k": round(density, 2),
+            "examples": sorted(tic_hits, key=lambda kv: -kv[1])[:6],
+            "severity": sev,
+        }
+
+    # 2. Buzzwords
+    buzz_count, buzz_hits = _count_phrases(text, LLM_BUZZWORDS)
+    if buzz_count > 0:
+        density = _per_1000(buzz_count, word_count)
+        sev = "high" if density >= 3 else ("med" if density >= 1 else "low")
+        signals["buzzwords"] = {
+            "count": buzz_count,
+            "density_per_1k": round(density, 2),
+            "examples": sorted(buzz_hits, key=lambda kv: -kv[1])[:6],
+            "severity": sev,
+        }
+
+    # 3. Hedge phrases (slightly different threshold — denser human writing
+    # uses these legitimately, but more than 4 in one article is unusual).
+    hedge_count, hedge_hits = _count_phrases(text, LLM_HEDGE_PHRASES)
+    if hedge_count > 0:
+        sev = "high" if hedge_count >= 5 else ("med" if hedge_count >= 2 else "low")
+        signals["hedges"] = {
+            "count": hedge_count,
+            "examples": hedge_hits[:4],
+            "severity": sev,
+        }
+
+    # 4. Em-dash density. — character + literal `--`. LLMs (notably GPT
+    # family) over-use em-dashes; humans average ~2-3 per 1000 words.
+    em_count = text.count("—") + text.count(" -- ")
+    em_density = _per_1000(em_count, word_count)
+    if em_density >= 2:
+        sev = "high" if em_density >= 8 else ("med" if em_density >= 5 else "low")
+        signals["em_dash_density"] = {
+            "count": em_count,
+            "density_per_1k": round(em_density, 2),
+            "severity": sev,
+        }
+
+    # 5. Listicle structure — heading + bullet ratio per 1000 words. High
+    # density of structural markers in short prose is a "content farm" tell.
+    headings = len(re.findall(r"^#{1,6}\s", text, re.MULTILINE))
+    bullets = len(re.findall(r"^\s*[-*+]\s", text, re.MULTILINE))
+    structure_density = _per_1000(headings + bullets, word_count)
+    if structure_density >= 5:
+        sev = "high" if structure_density >= 15 else ("med" if structure_density >= 10 else "low")
+        signals["listicle_structure"] = {
+            "headings": headings,
+            "bullets": bullets,
+            "density_per_1k": round(structure_density, 2),
+            "severity": sev,
+        }
+
+    # 6. Substance markers (POSITIVE — presence reduces overall LLM signal).
+    # Specific quotes, named individuals, dated events, numeric specifics.
+    # Counted as a single "substance" signal with severity inverted: more
+    # substance = lower severity (= less LLM-like).
+    quoted = len(re.findall(r'"[^"\n]{20,}"', text))   # >=20 char quotes
+    named = len(re.findall(r"\b(?:Dr\.|Prof\.|Mr\.|Mrs\.|Ms\.|Sen\.|Rep\.)\s+[A-Z][a-zA-Z'-]+", text))
+    cited_speakers = len(re.findall(r"according to\s+[A-Z]", text))
+    years = len(re.findall(r"\b(?:19|20)\d{2}\b", text))
+    money = len(re.findall(r"\$\s?\d", text))
+    percentages = len(re.findall(r"\b\d+(?:\.\d+)?\s?%", text))
+    substance_total = quoted + named + cited_speakers + years + money + percentages
+    substance_density = _per_1000(substance_total, word_count)
+    if substance_density < 2:
+        # Severely lacking substance — strong LLM signal
+        signals["low_substance"] = {
+            "quotes": quoted, "named_titles": named,
+            "year_refs": years, "monetary_refs": money,
+            "percentages": percentages,
+            "density_per_1k": round(substance_density, 2),
+            "severity": "high" if substance_density < 0.5 else "med",
+        }
+
+    return signals
+
+
+# ─── Litmus metadata signals (Wayback, AdSense, author meta) ─────────────────
+
+
+_AUTHOR_META_RE = re.compile(
+    r"<meta\s+(?:[^>]+\s+)?(?:name|property)=['\"](author|article:author)['\"]"
+    r"\s+content=['\"]([^'\"]+)['\"]",
+    re.IGNORECASE,
+)
+_REL_AUTHOR_RE = re.compile(
+    r"<a[^>]+rel=['\"]author['\"][^>]*>\s*([^<]+?)\s*</a>",
+    re.IGNORECASE,
+)
+_ADSENSE_PATTERNS = (
+    "adsbygoogle",
+    "googleads.g.doubleclick",
+    "pagead2.googlesyndication",
+    "data-ad-client",
+    "data-ad-slot",
+    'class="adsbygoogle"',
+)
+
+
+def _extract_author_from_html(html: str) -> str | None:
+    """Pull a likely author byline from raw HTML. Returns the author string
+    or None when none of the standard markers fire.
+    """
+    if not html:
+        return None
+    m = _AUTHOR_META_RE.search(html)
+    if m:
+        return m.group(2).strip()
+    m = _REL_AUTHOR_RE.search(html)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _detect_adsense(html: str) -> bool:
+    """True iff the raw HTML contains AdSense / DoubleClick markers."""
+    if not html:
+        return False
+    low = html.lower()
+    return any(p in low for p in _ADSENSE_PATTERNS)
+
+
+async def _fetch_raw_html(url: str) -> str | None:
+    """Pull the rendered HTML via Crawl4AI's /html endpoint. Used for
+    AdSense / author-meta detection that the markdown-extraction path
+    discards. Returns None on failure (litmus continues without these
+    signals).
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+    try:
+        async with http.post(
+            f"{SCRAPER_API}/html",
+            json={"url": url},
+            timeout=aiohttp.ClientTimeout(total=SCRAPER_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                log.warning("Crawl4AI /html %d for %s", resp.status, url)
+                return None
+            data = await resp.json()
+    except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+        log.warning("Crawl4AI /html error for %s: %s", url, e)
+        return None
+    return data.get("html") or None
+
+
+async def _wayback_first_seen(url: str) -> str | None:
+    """Earliest archive.org snapshot timestamp for this URL.
+
+    Returns YYYYMMDDhhmmss string or None. Uses the `available` endpoint
+    asking for a 2000-01-01 starting timestamp — Wayback returns the
+    closest snapshot AFTER that, which (for established domains) is the
+    earliest archive.
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+    try:
+        async with http.get(
+            "http://archive.org/wayback/available",
+            params={"url": url, "timestamp": "20000101"},
+            timeout=aiohttp.ClientTimeout(total=WAYBACK_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except (asyncio.TimeoutError, aiohttp.ClientError, ValueError):
+        return None
+    snap = (data.get("archived_snapshots") or {}).get("closest") or {}
+    return snap.get("timestamp")
+
+
+def _domain_age_severity(timestamp: str | None) -> tuple[str, str]:
+    """Map a Wayback timestamp to (severity, human-readable description).
+
+    Brand-new domains pumping out content are a strong AI-content tell
+    (cheap RSS-mill style). Domains older than ~3 years are well-aged.
+    """
+    if not timestamp or len(timestamp) < 6:
+        return ("med", "no archive found")
+    try:
+        from datetime import datetime, timezone
+        first = datetime.strptime(timestamp[:8], "%Y%m%d").replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        age_days = (now - first).days
+    except ValueError:
+        return ("low", f"first archived {timestamp[:8]}")
+    if age_days < 180:
+        return ("high", f"first archived {timestamp[:6]} (<6 months ago)")
+    if age_days < 730:
+        return ("med", f"first archived {timestamp[:6]} (<2 years ago)")
+    return ("low", f"first archived {timestamp[:6]} ({age_days // 365}+ years ago)")
+
+
+def _aggregate_severity(signals: dict, *,
+                        adsense_detected: bool,
+                        author_present: bool,
+                        domain_severity: str) -> int:
+    """Sum severity scores across all signals. Used to decide whether to
+    call the LLM for a qualitative read (called when 2 < score < 8).
+    """
+    total = 0
+    for s in signals.values():
+        total += _SEVERITY_SCORE.get(s.get("severity", "low"), 0)
+    if adsense_detected:
+        total += 1
+    if not author_present:
+        total += 1  # missing byline is a soft tell
+    total += _SEVERITY_SCORE.get(domain_severity, 0)
+    return total
+
+
+# ─── YT comment filtering + rendering ────────────────────────────────────────
+
+
+def _is_emoji_only(text: str) -> bool:
+    """Heuristic: comment is just emoji + whitespace + minor punctuation.
+
+    Real comments contain at least some Latin / CJK / Cyrillic letters or
+    digits. Pure emoji + ❤️ lol-style reactions don't add summarisation
+    signal beyond "people reacted".
+    """
+    stripped = re.sub(r"[\s\W\d_]+", "", text, flags=re.UNICODE)
+    # If after stripping symbols/digits/whitespace nothing's left, it's noise
+    return len(stripped) < 5
+
+
+def filter_yt_comments(comments: list[dict],
+                       min_chars: int = YT_COMMENT_MIN_CHARS,
+                       top_n: int = YT_COMMENT_SUMMARY_TOP_N) -> list[dict]:
+    """Filter + rank YT comments for summarisation.
+
+    Filter (drop):
+      - Empty / deleted / shorter than min_chars
+      - Pure emoji / punctuation noise
+      - Bot-style spam ("First!", single-word reactions)
+
+    Rank (highest first):
+      1. Pinned (creator-pinned, signals importance)
+      2. Hearted by uploader (creator-engaged)
+      3. Top-level high-likes
+      4. Replies to high-engagement threads
+
+    Returns the top-N after filter+rank.
+    """
+    if not comments:
+        return []
+
+    keep: list[dict] = []
+    for c in comments:
+        text = (c.get("text") or "").strip()
+        if len(text) < min_chars:
+            continue
+        if _is_emoji_only(text):
+            continue
+        # Spam patterns
+        low = text.lower()
+        if low in {"first", "first!", "early gang", "who's here in 2026"}:
+            continue
+        keep.append(c)
+
+    # Sort: pinned > hearted > likes desc, with ties broken by likes
+    def _rank(c: dict) -> tuple:
+        pinned = 1 if c.get("is_pinned") else 0
+        hearted = 1 if c.get("is_favorited") else 0
+        likes = int(c.get("like_count") or 0)
+        # Negative for descending sort under tuple comparison
+        return (-pinned, -hearted, -likes)
+
+    keep.sort(key=_rank)
+    return keep[:top_n]
+
+
+def format_yt_comments(comments: list[dict]) -> str:
+    """Render filtered comments as Markdown for the LLM. Pinned and
+    creator-hearted comments get tagged so the model can weigh them.
+    """
+    lines = []
+    for c in comments:
+        author = c.get("author") or "[unknown]"
+        likes = c.get("like_count") or 0
+        text = (c.get("text") or "").strip()
+        if len(text) > 1500:
+            text = text[:1500] + "…"
+        tags = []
+        if c.get("is_pinned"):
+            tags.append("📌pinned")
+        if c.get("is_favorited"):
+            tags.append("❤️creator-hearted")
+        if c.get("author_is_uploader"):
+            tags.append("creator-replied")
+        is_reply = c.get("parent") and c.get("parent") != "root"
+        prefix = "  - " if is_reply else "- "
+        tag_str = (" [" + ", ".join(tags) + "]") if tags else ""
+        lines.append(f"{prefix}**{author}** ({likes} likes){tag_str}: {text}")
+    return "\n".join(lines)
+
+
 def truncate(s: str, max_len: int) -> str:
     return s if len(s) <= max_len else s[: max_len - 1] + "\u2026"
 
@@ -1817,7 +3699,7 @@ async def _fetch_descriptions(file_path: str, cleanup: bool = True,
 
     Raises PermanentError on 4xx, RuntimeError on 5xx/timeout/network.
     """
-    assert http
+    if http is None: raise RuntimeError("HTTP session not initialised")
     payload = {
         "file_path": file_path,
         "cleanup": cleanup,
@@ -1906,7 +3788,7 @@ async def _cleanup_remote_file(file_path: str) -> None:
     """
     if not file_path:
         return
-    assert http
+    if http is None: raise RuntimeError("HTTP session not initialised")
     try:
         async with http.post(
             f"{WHISPER_API}/api/cleanup",
@@ -1934,7 +3816,14 @@ _ALLOWED_LINK_HOSTS = _csv_env(
 
 # Markdown link [text](url) and bare URL patterns
 _MD_LINK_RE = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
-_BARE_URL_RE = re.compile(r"(?<![(\[])\bhttps?://[^\s)\]]+", re.IGNORECASE)
+# Bare URL match: lookbehind excludes `(`, `[`, `<` so we don't double-match
+# URLs already inside markdown links or Discord no-preview wrappers `<...>`.
+# Trailing exclude class adds `>` so `<https://x.com>` doesn't consume the
+# closing bracket and leave a dangling `<`.
+_BARE_URL_RE = re.compile(r"(?<![(\[<])\bhttps?://[^\s)\]>]+", re.IGNORECASE)
+# Discord no-preview form: `<https://...>`. Strip the wrapper if the inner
+# URL is disallowed; preserve as a normal link if allowed.
+_NOPREVIEW_URL_RE = re.compile(r"<(https?://[^\s>]+)>", re.IGNORECASE)
 
 
 def _is_allowed_link(url: str) -> bool:
@@ -1955,6 +3844,10 @@ def sanitize_llm_output(text: str) -> str:
     summary would otherwise see Discord render it as a clickable link. We
     keep markdown links only when their target is on `_ALLOWED_LINK_HOSTS`,
     and demote bare URLs from non-allowed hosts to bracketed plain text.
+
+    Order matters: handle Discord's `<https://...>` no-preview form FIRST so
+    the wrapper is consumed atomically (preventing dangling `<` from a
+    bare-URL match that would otherwise eat through the `>`).
     """
     def _replace_md(m: re.Match) -> str:
         label, url = m.group(1), m.group(2)
@@ -1965,6 +3858,14 @@ def sanitize_llm_output(text: str) -> str:
         return label or "[link removed]"
 
     text = _MD_LINK_RE.sub(_replace_md, text)
+
+    def _replace_nopreview(m: re.Match) -> str:
+        url = m.group(1)
+        if _is_allowed_link(url):
+            return m.group(0)  # keep entire `<url>` form
+        return "[link removed]"
+
+    text = _NOPREVIEW_URL_RE.sub(_replace_nopreview, text)
 
     def _replace_bare(m: re.Match) -> str:
         url = m.group(0)
@@ -2148,15 +4049,44 @@ async def _apply_rename(
 DISCORD_GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0"))
 
 
+def _derive_video_id(full_url: str) -> str:
+    """Derive a stable opaque ID for a non-YouTube URL.
+
+    Tries the last path segment first (handles `/status/12345`, `/v/abc`).
+    Falls back to a short hash of the full URL when that segment looks
+    like a profile/handle (no digits, short) — prevents collisions when
+    multiple distinct videos from the same author are posted.
+    """
+    import hashlib
+    path_parts = [p for p in full_url.rstrip("/").split("/")
+                  if p and "." not in p and "//" not in p]
+    last = re.sub(r"[^\w-]", "", path_parts[-1])[:20] if path_parts else ""
+    # Heuristic: real video IDs are mostly digits or alphanumeric tokens of
+    # decent length (>=5 chars and contain a digit). A plain author handle
+    # would be e.g. "elonmusk" → no digits → collision risk.
+    if last and len(last) >= 5 and any(c.isdigit() for c in last):
+        return last
+    # Hash fallback — short but unambiguous.
+    return "u" + hashlib.sha1(full_url.encode("utf-8")).hexdigest()[:11]
+
+
 def _job_from_interaction(
     interaction: discord.Interaction,
     url: str,
     *,
     user_prompt: str = "",
     diarize: bool = False,
+    vlm_enabled: bool | None = None,
+    yt_comments_enabled: bool | None = None,
     model_override: str | None = None,
 ) -> Job | None:
-    """Build a Job from an interaction. Returns None on URL parse failure."""
+    """Build a Job from an interaction. Returns None on URL parse failure.
+
+    Slash commands are always explicit_request=True — the user typed the
+    command and the URL.
+    """
+    eff_vlm = VLM_ENABLED if vlm_enabled is None else vlm_enabled
+    eff_comments = YT_COMMENTS_ENABLED if yt_comments_enabled is None else yt_comments_enabled
     # Try YouTube first for canonical video_id
     m = YT_PATTERN.search(url)
     if m:
@@ -2167,22 +4097,27 @@ def _job_from_interaction(
             channel=interaction.channel, submitter_id=interaction.user.id,
             submitter_name=str(interaction.user),
             user_prompt=user_prompt, diarize=diarize,
-            model_override=model_override, interaction=interaction,
+            vlm_enabled=eff_vlm,
+            yt_comments_enabled=eff_comments,
+            model_override=model_override,
+            explicit_request=True,
+            interaction=interaction,
         )
     # Fallback for other platforms
     m = VIDEO_URL_PATTERN.search(url)
     if not m:
         return None
     full_url = m.group(1)
-    path_parts = [p for p in full_url.rstrip("/").split("/")
-                  if p and "." not in p and "//" not in p]
-    vid = re.sub(r"[^\w-]", "", path_parts[-1])[:20] if path_parts else "unknown"
     return Job(
-        url=full_url, video_id=vid,
+        url=full_url, video_id=_derive_video_id(full_url),
         channel=interaction.channel, submitter_id=interaction.user.id,
         submitter_name=str(interaction.user),
         user_prompt=user_prompt, diarize=diarize,
-        model_override=model_override, interaction=interaction,
+        vlm_enabled=eff_vlm,
+        yt_comments_enabled=eff_comments,
+        model_override=model_override,
+        explicit_request=True,
+        interaction=interaction,
     )
 
 
@@ -2209,6 +4144,8 @@ async def cmd_summarize(
     job = _job_from_interaction(
         interaction, url,
         user_prompt=(prompt or "").strip()[:USER_PROMPT_MAX_CHARS],
+        vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
+        yt_comments_enabled=chan_cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
         model_override=effective_model,
     )
     if job is None:
@@ -2247,6 +4184,8 @@ async def cmd_transcribe(
     job = _job_from_interaction(
         interaction, url,
         diarize=diarize or chan_cfg.get("diarize", False),
+        vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
+        yt_comments_enabled=chan_cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
         model_override=chan_cfg.get("model"),
     )
     if job is None:
@@ -2264,7 +4203,7 @@ async def cmd_transcribe(
 @bot.tree.command(name="status", description="Show queue + service health")
 async def cmd_status(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
-    assert http
+    if http is None: raise RuntimeError("HTTP session not initialised")
     try:
         async with http.get(f"{WHISPER_API}/api/status",
                             timeout=aiohttp.ClientTimeout(total=5)) as resp:
@@ -2325,6 +4264,7 @@ async def cmd_find(interaction: discord.Interaction, query: str) -> None:
     model="Default LLM model id for this channel (empty = clear override)",
     vlm="Force VLM enrichment for every video in this channel",
     diarize="Enable speaker diarization by default in this channel",
+    yt_comments="Fetch + summarise YouTube comments (extra Community Reaction embed)",
     show="Just print the current config without changing it",
 )
 async def cmd_config(
@@ -2332,6 +4272,7 @@ async def cmd_config(
     model: str | None = None,
     vlm: bool | None = None,
     diarize: bool | None = None,
+    yt_comments: bool | None = None,
     show: bool = False,
 ) -> None:
     # Discord-side permission check: requires Manage Channel.
@@ -2342,7 +4283,7 @@ async def cmd_config(
             ephemeral=True,
         )
         return
-    if show or (model is None and vlm is None and diarize is None):
+    if show or (model is None and vlm is None and diarize is None and yt_comments is None):
         cfg = get_channel_config(interaction.channel.id)
         if not cfg:
             txt = "No overrides for this channel — using global defaults."
@@ -2358,6 +4299,8 @@ async def cmd_config(
         fields["vlm_enabled"] = vlm
     if diarize is not None:
         fields["diarize"] = diarize
+    if yt_comments is not None:
+        fields["yt_comments_enabled"] = yt_comments
     new_cfg = set_channel_config(interaction.channel.id, **fields)
     if new_cfg:
         txt = "Updated config:\n" + "\n".join(f"  **{k}**: `{v}`" for k, v in new_cfg.items())

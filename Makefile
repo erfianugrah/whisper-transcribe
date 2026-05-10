@@ -65,16 +65,22 @@ restart-whisper: ## Restart whisper only (picks up app.py changes via bind mount
 restart-bot: ## Restart bot only (in-place; does NOT re-read bot/.env — use recreate-bot for env changes)
 	$(COMPOSE) restart bot
 
-.PHONY: recreate-bot recreate-whisper
+restart-scraper: ## Restart crawl4ai + flaresolverr together (e.g. after a hung browser)
+	$(COMPOSE) restart crawl4ai flaresolverr
+
+.PHONY: recreate-bot recreate-whisper recreate-scraper restart-scraper
 recreate-bot: ## Tear down + recreate bot container (re-reads bot/.env, refreshes image)
 	$(COMPOSE) up -d --force-recreate bot
 
 recreate-whisper: ## Tear down + recreate whisper container (re-reads .env)
 	$(COMPOSE) up -d --force-recreate whisper
 
+recreate-scraper: ## Tear down + recreate scraper services (refreshes images, clears state)
+	$(COMPOSE) up -d --force-recreate crawl4ai flaresolverr
+
 # ─── Logs ─────────────────────────────────────────────────────────────────────
 
-.PHONY: logs logs-whisper logs-bot
+.PHONY: logs logs-whisper logs-bot logs-crawl4ai logs-flaresolverr logs-scraper
 logs: ## Tail all logs (-f)
 	$(COMPOSE) logs -f --tail 50
 
@@ -84,9 +90,18 @@ logs-whisper: ## Tail whisper logs
 logs-bot: ## Tail bot logs
 	$(COMPOSE) logs -f --tail 50 bot
 
+logs-crawl4ai: ## Tail crawl4ai (primary scraper) logs
+	$(COMPOSE) logs -f --tail 50 crawl4ai
+
+logs-flaresolverr: ## Tail flaresolverr (CF-challenge fallback) logs
+	$(COMPOSE) logs -f --tail 50 flaresolverr
+
+logs-scraper: ## Tail BOTH scraper services together
+	$(COMPOSE) logs -f --tail 50 crawl4ai flaresolverr
+
 # ─── Shell / debug ────────────────────────────────────────────────────────────
 
-.PHONY: shell-whisper shell-bot status ps
+.PHONY: shell-whisper shell-bot status status-scraper ps
 shell-whisper: ## Exec bash in whisper container
 	$(COMPOSE) exec whisper bash
 
@@ -95,6 +110,13 @@ shell-bot: ## Exec bash in bot container (sh — slim image has no bash)
 
 status: ## Show whisper /api/status JSON
 	@curl -s http://localhost:7860/api/status | python3 -m json.tool
+
+status-scraper: ## Probe crawl4ai /health + flaresolverr / from inside the bot container
+	@echo "── crawl4ai ──"
+	@$(COMPOSE) exec -T bot python3 -c "import urllib.request,json; r=urllib.request.urlopen('http://crawl4ai:11235/health',timeout=3); print(json.dumps(json.loads(r.read()),indent=2))" || echo "crawl4ai: unreachable"
+	@echo ""
+	@echo "── flaresolverr ──"
+	@$(COMPOSE) exec -T bot python3 -c "import urllib.request,json; r=urllib.request.urlopen('http://flaresolverr:8191/',timeout=3); print(json.dumps(json.loads(r.read()),indent=2))" || echo "flaresolverr: unreachable"
 
 ps: ## Show running containers
 	$(COMPOSE) ps
@@ -227,7 +249,15 @@ required = ('summarize', '_chunk_transcript', '_llm_call', 'PermanentError',
             'LLM_INPUT_CHAR_BUDGET', 'EMBED_SAFE_LIMIT',
             '_is_permanent_remote_error', 'PROMPT_BRIEF', 'PROMPT_KEY_POINTS',
             'PROMPT_CHAPTERS', 'REDUCE_BRIEF', 'REDUCE_KEY_POINTS',
-            'CHUNK_PREAMBLE')
+            'CHUNK_PREAMBLE',
+            # Web URL summary flow (added with the "tldr" reply trigger)
+            'process_url', 'fetch_article', '_fetch_via_crawl4ai',
+            '_fetch_via_flaresolverr', '_handle_reply_trigger',
+            '_extract_first_url', '_hash_url', '_is_video_url',
+            '_looks_like_cf_challenge', 'REPLY_TRIGGER_RE',
+            'PROMPT_BRIEF_WEB', 'PROMPT_KEY_POINTS_WEB', 'PROMPT_SECTIONS',
+            'REDUCE_BRIEF_WEB', 'REDUCE_KEY_POINTS_WEB', 'REDUCE_SECTIONS',
+            'SCRAPER_API', 'FLARESOLVERR_API', 'SCRAPER_TIMEOUT')
 missing = [s for s in required if not hasattr(main, s)]
 assert not missing, f'missing exports: {missing}'
 assert not hasattr(main, 'extract_hotwords_from_context'), 'dead helper still present'

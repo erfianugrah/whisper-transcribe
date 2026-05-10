@@ -57,6 +57,39 @@ services:
               capabilities: [gpu]
     restart: unless-stopped
 
+  # ─── Web scraper (for the URL-summary "tldr" reply trigger) ───────────────
+  # Crawl4AI: Playwright-based scraper, returns clean Markdown via /md.
+  # Handles JS-rendered pages, basic stealth. ~400 MB image (Chromium baked in).
+  crawl4ai:
+    image: unclecode/crawl4ai:0.7.4
+    pull_policy: missing
+    shm_size: 1gb  # Chromium needs >64 MB shared memory; default 64 MB OOMs
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:11235/health',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  # FlareSolverr: dedicated Cloudflare-challenge proxy (undetected-chromedriver).
+  # The bot falls back to this when Crawl4AI returns a CF interstitial.
+  # Doesn't solve hard Turnstile — those still fail, by design.
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:v3.4.6
+    pull_policy: missing
+    environment:
+      - LOG_LEVEL=info
+      - TZ=UTC
+      # Cap concurrent solve sessions; each one runs a Chrome instance.
+      - BROWSER_TIMEOUT=60000
+    networks:
+      - default
+    restart: unless-stopped
+
   bot:
     image: erfianugrah/whisper-transcribe-bot:latest
     build:
@@ -67,6 +100,8 @@ services:
     environment:
       # Inside the compose network, services are reached by name.
       - WHISPER_API_URL=http://whisper:7860
+      - SCRAPER_API_URL=http://crawl4ai:11235
+      - FLARESOLVERR_API_URL=http://flaresolverr:8191/v1
       # model_proxy lives on the external llm-compose_llm network.
       - LLM_API_URL=http://model_proxy:11434/v1
     volumes:
@@ -77,6 +112,12 @@ services:
     depends_on:
       whisper:
         condition: service_healthy
+      # Bot starts even if scraper is unhealthy (URL flow degrades gracefully;
+      # video flow is unaffected). Hence service_started, not service_healthy.
+      crawl4ai:
+        condition: service_started
+      flaresolverr:
+        condition: service_started
     restart: unless-stopped
 
 volumes:
