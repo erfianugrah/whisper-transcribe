@@ -252,18 +252,23 @@ cosmetic.
   **Fix:** `_last_result` now stores `language` + `duration`; rename regen
   matches the original schema (including word-level fields).
 
-- [ ] **`_words_to_segment` text join** (`app.py:506`)
-  `" ".join(...)` adds spaces in CJK languages where words have no spaces.
-  Deferred — needs language-aware logic; impacts only diarized CJK output.
+- [x] **`_words_to_segment` text join** (`app.py:506`)
+  Done — `_NO_SPACE_RANGES` Unicode-range table + `_is_no_space_script`
+  decides per-segment whether to space-join (Latin/Cyrillic/etc.) or
+  concatenate (CJK/Thai/Lao/Khmer). First non-empty token of the segment
+  picks the strategy.
 
-- [ ] **Duplicate transcribe events** (`app.py:1559, 1576`)
-  Upload triggers transcribe; user can also click button → two concurrent
-  jobs (lock saves us with "Busy" but UX is poor).
-  Deferred — UI polish.
+- [x] **Duplicate transcribe events** (`app.py:1559, 1576`)
+  Done — Gradio chain disables the Transcribe button + relabels to
+  "Transcribing..." for the duration of both upload-triggered and
+  click-triggered runs, then re-enables. Cancel button also flips it
+  back. The lock still catches the edge case if two users hit the same
+  Gradio session.
 
-- [ ] **Bot pre-check duration via metadata-only fetch** (`bot/main.py`)
-  Lower priority now that `MAX_DURATION` defaults to 0. Only matters when
-  the soft limit is explicitly set.
+- [~] **Bot pre-check duration via metadata-only fetch** (`bot/main.py`)
+  Deferred indefinitely — `MAX_DURATION` now defaults to 0 so this only
+  matters for users who explicitly opt into a soft runtime ceiling.
+  They've chosen to pay the download cost in exchange for simpler config.
 
 ---
 
@@ -341,21 +346,21 @@ cosmetic.
   touching main.py.
 
 - [~] **`app.py` is 2100+ lines**
-  Pure-function modules extracted to `whisper_app/` package
-  (`formatting.py`, `segmentation.py`, `media.py`, `audio_analysis.py`).
-  Modules are syntactically valid + unit-tested but **not yet wired into
-  app.py** — wiring requires careful global-state coordination
-  (`_speaker_index_map`, `_transcription_lock`, etc.) and was deferred to
-  reduce risk in this change set. Follow-up: replace inline definitions in
-  app.py with imports from `whisper_app.*`. Estimated 1-2h work, low
-  behavioural risk because all the extracted code is pure.
+  Decided not to refactor: the extracted `whisper_app/` package was
+  scaffolding without a feature change to motivate it, and having two
+  copies of the same code (extracted modules + still-inline originals)
+  was net negative. Deleted the package; will revisit when adding a
+  feature actually touches the relevant code.
 
 - [ ] **Redundant apostrophes in regex** (`bot/main.py`)
   `[a-zA-Z''-]` ≡ `[a-zA-Z'-]`. Cosmetic, not worth a commit on its own.
 
-- [ ] **`.env` loader fragile** (`bot/main.py`)
-  No quoted-value support. Document the limitation or pull in
-  `python-dotenv`. Not blocking.
+- [x] **`.env` loader fragile** (`bot/main.py`)
+  Done — extracted to `_load_env_file()` with quoted-value support
+  (single + double, `\n`/`\t`/`\\` escapes in double-quoted only),
+  inline comment stripping (only when unquoted, with leading whitespace),
+  optional `export` prefix, and `setdefault` semantics so process env
+  wins. 5 tests cover the main edge cases.
 
 ---
 

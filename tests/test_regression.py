@@ -597,6 +597,84 @@ def test_embed_shows_user_request_field():
     assert 'name="User request"' in BOT_SRC
 
 
+# ─── .env loader ────────────────────────────────────────────────────────────
+
+
+def test_env_loader_basic():
+    """Plain KEY=value lines."""
+    p = tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False)
+    p.write("FOO=bar\nBAZ=qux quux\n")
+    p.close()
+    # Clear any prior values
+    for k in ("FOO", "BAZ"):
+        os.environ.pop(k, None)
+    from pathlib import Path
+    bot._load_env_file(Path(p.name))
+    assert os.environ["FOO"] == "bar"
+    assert os.environ["BAZ"] == "qux quux"
+    os.unlink(p.name)
+
+
+def test_env_loader_quoted_values():
+    """Double + single quotes stripped; escapes honoured in double-quoted only."""
+    p = tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False)
+    p.write('DOUBLE="hello world"\nSINGLE=\'value with $special\'\n'
+            'ESCAPED="line1\\nline2"\nLITERAL=\'line1\\nline2\'\n')
+    p.close()
+    for k in ("DOUBLE", "SINGLE", "ESCAPED", "LITERAL"):
+        os.environ.pop(k, None)
+    from pathlib import Path
+    bot._load_env_file(Path(p.name))
+    assert os.environ["DOUBLE"] == "hello world"
+    assert os.environ["SINGLE"] == "value with $special"
+    assert os.environ["ESCAPED"] == "line1\nline2"  # \n decoded
+    assert os.environ["LITERAL"] == "line1\\nline2"  # literal backslash-n
+    os.unlink(p.name)
+
+
+def test_env_loader_inline_comments():
+    """Inline `# ...` stripped only on unquoted values."""
+    p = tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False)
+    p.write('FOO=bar # inline comment\n'
+            'QUOTED="bar # not a comment"\n'
+            'NOSPACE=bar#part-of-value\n')
+    p.close()
+    for k in ("FOO", "QUOTED", "NOSPACE"):
+        os.environ.pop(k, None)
+    from pathlib import Path
+    bot._load_env_file(Path(p.name))
+    assert os.environ["FOO"] == "bar"
+    assert os.environ["QUOTED"] == "bar # not a comment"
+    # `#` without preceding whitespace is part of the value
+    assert os.environ["NOSPACE"] == "bar#part-of-value"
+    os.unlink(p.name)
+
+
+def test_env_loader_export_prefix():
+    """`export KEY=value` (shell-compat) is accepted."""
+    p = tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False)
+    p.write("export FOO=bar\n")
+    p.close()
+    os.environ.pop("FOO", None)
+    from pathlib import Path
+    bot._load_env_file(Path(p.name))
+    assert os.environ["FOO"] == "bar"
+    os.unlink(p.name)
+
+
+def test_env_loader_does_not_override():
+    """setdefault — pre-set env vars take precedence over file values."""
+    p = tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False)
+    p.write("PREEXISTING=fromfile\n")
+    p.close()
+    os.environ["PREEXISTING"] = "fromenv"
+    from pathlib import Path
+    bot._load_env_file(Path(p.name))
+    assert os.environ["PREEXISTING"] == "fromenv"
+    os.environ.pop("PREEXISTING", None)
+    os.unlink(p.name)
+
+
 def test_process_routing_references_helpers():
     """The speech-density dispatch in process() calls all VLM helpers."""
     assert "SPEECH_DENSITY_SILENT" in BOT_SRC

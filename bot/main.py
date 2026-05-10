@@ -20,13 +20,54 @@ from dataclasses import dataclass
 from pathlib import Path
 
 # Load .env file if present (no external dependency)
-_env_file = Path(__file__).parent / ".env"
-if _env_file.exists():
-    for line in _env_file.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip())
+def _load_env_file(path):
+    """Minimal .env loader supporting quoted values and inline comments.
+
+    Recognised forms:
+      KEY=value
+      KEY=value with spaces  (whitespace preserved up to inline comment)
+      KEY="value"            (double quotes stripped; \\n / \\t / \\\\ escapes honoured)
+      KEY='value'            (single quotes stripped; literal contents)
+      KEY=value  # comment   (inline comments stripped only when unquoted)
+
+    Doesn't try to be a full bash parser — no command substitution, no
+    variable expansion, no multi-line values. For richer needs, install
+    python-dotenv. Existing process env wins (uses os.environ.setdefault).
+    """
+    if not path.exists():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Optional `export` prefix (compatible with shell-source-able files)
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+
+        # Quoted value: strip the matching quote, honour escapes inside double-quoted.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            quote = value[0]
+            value = value[1:-1]
+            if quote == '"':
+                value = (value.replace("\\n", "\n")
+                              .replace("\\t", "\t")
+                              .replace("\\\\", "\\"))
+        else:
+            # Unquoted: strip an inline comment iff preceded by whitespace.
+            m = re.search(r"\s+#", value)
+            if m:
+                value = value[:m.start()].rstrip()
+        os.environ.setdefault(key, value)
+
+
+_load_env_file(Path(__file__).parent / ".env")
 
 import aiohttp
 import discord
