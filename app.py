@@ -1154,6 +1154,18 @@ _PERMANENT_YT_DLP_PATTERNS = (
     "Sign in to confirm you're not a bot",    # IP/account-flagged
     "Join this channel to get access",         # paid membership
     "Video is not available",
+    # Platform-specific "no media in this URL" cases — link triggered the
+    # bot (post matched VIDEO_URL_PATTERN) but the destination has no
+    # downloadable media. Retrying re-hits the same empty result.
+    "No video could be found in this tweet",  # x.com / twitter
+    "No video could be found in this",        # generic catch
+    "No video formats found",
+    "no video formats found",                  # case variants
+    "Unsupported URL",                          # yt-dlp doesn't know the host
+    "is not a valid URL",
+    "There's no video in this post",          # instagram / threads
+    "No media found",
+    "Post does not contain any media",
 )
 
 
@@ -1854,9 +1866,20 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
             meta = json.loads(result.stdout.strip().split("\n")[-1])
         except Exception:
             return "", "Failed to parse yt-dlp output"
+        video_id = meta.get("id", "unknown")
         filename = meta.get("requested_downloads", [{}])[0].get("filepath", "")
-        if not filename:
-            filename = os.path.join(output_dir, f"{meta.get('id', 'unknown')}.wav")
+        if not filename or not os.path.isfile(filename):
+            # Probe output_dir for the actual file (any extension).
+            candidates = [
+                os.path.join(output_dir, f)
+                for f in os.listdir(output_dir)
+                if f.startswith(video_id) and not f.endswith(".info.json")
+                   and not f.endswith(".part")
+            ]
+            if candidates:
+                filename = max(candidates, key=os.path.getsize)
+            else:
+                return "", f"yt-dlp produced no file in {output_dir}"
         title = meta.get("title", "unknown")
         duration = meta.get("duration", 0)
         log.info(f"[UI] YT download: {filename} ({duration}s)")
@@ -1992,22 +2015,43 @@ async def api_yt_download(request: Request):
                 status_code=status_code,
             )
 
-        # Parse output — one JSON object per line per video
+        # Parse output — one JSON object per line per video. yt-dlp's
+        # `requested_downloads[0].filepath` is the canonical answer when
+        # populated, but for some formats (notably merged video+audio with
+        # post-processing) it can be missing or stale. Falls back to
+        # probing `output_dir` for the actual file — extension-agnostic so
+        # both .wav (audio-only) and .mp4 (keep_video=true) work.
         json_lines = [l for l in result.stdout.strip().split("\n") if l.strip().startswith("{")]
         items = []
         for line in json_lines:
             try:
                 meta = json.loads(line)
-                filename = meta.get("requested_downloads", [{}])[0].get("filepath", "")
-                if not filename:
-                    filename = os.path.join(output_dir, f"{meta.get('id', 'unknown')}.wav")
-                items.append({
-                    "filename": filename,
-                    "title": meta.get("title", "unknown"),
-                    "duration": meta.get("duration", 0),
-                })
             except json.JSONDecodeError:
                 continue
+            video_id = meta.get("id", "unknown")
+            filename = meta.get("requested_downloads", [{}])[0].get("filepath", "")
+            if not filename or not os.path.isfile(filename):
+                # Find any file matching the video id in output_dir,
+                # regardless of extension.
+                candidates = [
+                    os.path.join(output_dir, f)
+                    for f in os.listdir(output_dir)
+                    if f.startswith(video_id) and not f.endswith(".info.json")
+                       and not f.endswith(".part")
+                ]
+                if candidates:
+                    # Prefer largest (the actual media file vs. e.g. thumbnails)
+                    filename = max(candidates, key=os.path.getsize)
+                    log.info(f"[API] yt-dlp metadata missing filepath; "
+                             f"resolved {video_id} → {filename}")
+                else:
+                    log.warning(f"[API] no file found in {output_dir} for {video_id}")
+                    continue
+            items.append({
+                "filename": filename,
+                "title": meta.get("title", "unknown"),
+                "duration": meta.get("duration", 0),
+            })
 
         if not items:
             return JSONResponse({"error": "yt-dlp produced no output"}, status_code=500)
