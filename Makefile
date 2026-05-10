@@ -62,8 +62,15 @@ restart: ## Restart all services
 restart-whisper: ## Restart whisper only (picks up app.py changes via bind mount)
 	$(COMPOSE) restart whisper
 
-restart-bot: ## Restart bot only (requires rebuild for code changes)
+restart-bot: ## Restart bot only (in-place; does NOT re-read bot/.env — use recreate-bot for env changes)
 	$(COMPOSE) restart bot
+
+.PHONY: recreate-bot recreate-whisper
+recreate-bot: ## Tear down + recreate bot container (re-reads bot/.env, refreshes image)
+	$(COMPOSE) up -d --force-recreate bot
+
+recreate-whisper: ## Tear down + recreate whisper container (re-reads .env)
+	$(COMPOSE) up -d --force-recreate whisper
 
 # ─── Logs ─────────────────────────────────────────────────────────────────────
 

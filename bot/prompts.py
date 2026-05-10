@@ -111,6 +111,11 @@ portion of the {{duration}} runtime). Do NOT stop summarizing before the end.
 - For each section, use the approximate start timestamp from the transcript
 - Give each section a short descriptive heading
 - Under each heading, write 1-2 sentences summarizing that section
+- Each section heading uses EXACTLY ONE timestamp in [MM:SS] or [H:MM:SS] \
+format. Do NOT put words, ranges, or multiple timestamps inside the brackets \
+(e.g. "[0 and 0:05]", "[0:00–1:30]", "[0:00, 1:30]" are all WRONG; "[0:00]" \
+or "[1:23:45]" are correct). If a topic spans non-contiguous moments, pick \
+ONE representative timestamp.
 - Format: **[H:MM:SS] Section Title** followed by summary
 - Keep total output under {{char_cap}} characters
 

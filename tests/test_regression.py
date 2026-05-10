@@ -834,6 +834,37 @@ def test_guild_config_two_guilds_isolated():
     assert bot.get_guild_config(555555)["summary_channel"] == 2  # untouched
 
 
+def test_normalize_chapter_timestamps_handles_malformed():
+    """[0 and 0:05:46] → [0:05:46], real bug from production."""
+    out = bot._normalize_chapter_timestamps("[0 and 0:05:46] Title")
+    assert "[0:05:46] Title" == out
+
+
+def test_normalize_chapter_timestamps_preserves_clean():
+    """Already-correct timestamps shouldn't be rewritten."""
+    for ok in ("[0:00]", "[1:23]", "[1:23:45]", "[0:00:00]"):
+        assert bot._normalize_chapter_timestamps(f"{ok} Title") == f"{ok} Title"
+
+
+def test_normalize_chapter_timestamps_handles_ranges():
+    """Range-style brackets get the first timestamp extracted."""
+    assert bot._normalize_chapter_timestamps("[0:00-1:30] Intro") == "[0:00] Intro"
+    assert bot._normalize_chapter_timestamps("[1:30 to 2:45] Middle") == "[1:30] Middle"
+
+
+def test_normalize_chapter_timestamps_leaves_non_ts_brackets():
+    """Markdown link text in brackets without a timestamp stays untouched."""
+    assert bot._normalize_chapter_timestamps("[the video](url)") == "[the video](url)"
+    assert bot._normalize_chapter_timestamps("[Note: see below]") == "[Note: see below]"
+
+
+def test_linkify_timestamps_through_normaliser():
+    """End-to-end: malformed → normalised → linkified."""
+    out = bot.linkify_timestamps("**[0 and 0:05:46] Section title**", "VIDID")
+    assert "evil" not in out
+    assert "youtube.com/watch?v=VIDID&t=346" in out
+
+
 def test_resolve_summary_channel_falls_through():
     """resolve_summary_channel exists and is callable; returns the input
     channel when no overrides apply (real Discord channel objects can't be

@@ -492,23 +492,48 @@ def resolve_summary_channel(job_channel: "discord.TextChannel") -> "discord.Text
     """Pick the right channel for detail embeds (Key Points + Chapters).
 
     Precedence (most specific → least):
-      1. Per-guild override (`guilds.json[<gid>].summary_channel`)
-      2. Global env (`SUMMARY_CHANNEL`)
+      1. Per-guild override (`guilds.json[<gid>].summary_channel`).
+      2. Global env (`SUMMARY_CHANNEL`) — ONLY if same guild as the job.
       3. Original channel where the request came in.
-    Falls back through if a configured channel is no longer reachable.
+
+    Both overrides are guarded by a guild-affinity check: if the configured
+    summary channel lives in a different server than the job, fall through
+    rather than leak detail embeds across server boundaries. This makes
+    `SUMMARY_CHANNEL` safe to set even on a multi-server bot — it'll only
+    route inside the one server that contains it.
     """
     guild = getattr(job_channel, "guild", None)
-    if guild is not None:
-        guild_cfg = get_guild_config(guild.id)
-        sc_id = guild_cfg.get("summary_channel")
-        if sc_id:
-            ch = bot.get_channel(int(sc_id))
-            if ch is not None:
-                return ch
+    if guild is None:
+        # DM / no-guild context — nowhere meaningful to redirect to.
+        return job_channel
+
+    def _same_guild(channel) -> bool:
+        cg = getattr(channel, "guild", None)
+        return cg is not None and cg.id == guild.id
+
+    # Per-guild override
+    sc_id = get_guild_config(guild.id).get("summary_channel")
+    if sc_id:
+        ch = bot.get_channel(int(sc_id))
+        if ch is not None and _same_guild(ch):
+            return ch
+        if ch is not None:
+            log.warning(
+                "Per-guild summary_channel %s is in a different guild than "
+                "the job (%s vs %s) — ignoring; this should never happen "
+                "since /serverconfig validates guild affinity.",
+                sc_id, getattr(getattr(ch, "guild", None), "id", "?"), guild.id,
+            )
+
+    # Global env fallback — must also match guild
     if SUMMARY_CHANNEL:
         ch = bot.get_channel(SUMMARY_CHANNEL)
-        if ch is not None:
+        if ch is not None and _same_guild(ch):
             return ch
+        # Different guild → silently fall through (operator may have set
+        # SUMMARY_CHANNEL for one specific server's archive; jobs from
+        # other servers stay in-channel).
+
     return job_channel
 
 
@@ -1659,18 +1684,56 @@ async def send_long_embed(channel, title: str, content: str, color: int):
         await channel.send(embed=embed)
 
 
-# Matches timestamps in various formats the LLM might output
+# Matches timestamps the LLM might output. Order matters: bracketed forms
+# first (so we don't double-replace), then bare forms anchored at line
+# start or after a markdown bold marker.
 TIMESTAMP_RE = re.compile(
-    r"\[(\d{1,3}):(\d{2}):(\d{2})\]"        # [H:MM:SS] or [MMM:SS:??]
-    r"|\[(\d{1,3}):(\d{2})\]"               # [MM:SS] or [MMM:SS]
-    r"|(?:^|\*\*)(\d{1,3}):(\d{2}):(\d{2})" # bare H:MM:SS
+    r"\[(\d{1,3}):(\d{2}):(\d{2})\]"         # [H:MM:SS]
+    r"|\[(\d{1,3}):(\d{2})\]"                # [MM:SS]
+    r"|(?:^|\*\*)(\d{1,3}):(\d{2}):(\d{2})"  # bare H:MM:SS
     r"|(?:^|\*\*)(\d{1,3}):(\d{2})(?=\s)",   # bare MM:SS followed by space
     re.MULTILINE
 )
 
+# Normalisation pre-pass: bracketed expressions that are NOT a clean
+# `[H:MM:SS]` or `[MM:SS]` but DO contain a timestamp inside (e.g.
+# `[0 and 0:05:46]` from an LLM that conflated two moments). Strip the
+# noise and keep only the first valid timestamp so linkify_timestamps
+# below renders it as a clickable link.
+_MALFORMED_TS_BRACKET_RE = re.compile(
+    r"\[(?P<inner>[^\[\]]*?)\]"
+)
+_INNER_TS_RE = re.compile(r"(\d{1,3}):(\d{2})(?::(\d{2}))?")
+
+
+def _normalize_chapter_timestamps(text: str) -> str:
+    """Find `[...]` brackets containing a timestamp and replace with a
+    clean `[H:MM:SS]` / `[MM:SS]`. Brackets without a timestamp are left
+    alone (they're presumably real markdown link text or other content).
+    """
+    def fix(m: "re.Match") -> str:
+        inner = m.group("inner")
+        # If the inner content already matches a clean timestamp pattern,
+        # leave it alone — saves work and avoids accidental rewrites.
+        if re.fullmatch(r"\d{1,3}:\d{2}(?::\d{2})?", inner.strip()):
+            return m.group(0)
+        ts = _INNER_TS_RE.search(inner)
+        if not ts:
+            return m.group(0)
+        a, b, c = ts.groups()
+        if c is not None:
+            return f"[{int(a)}:{int(b):02d}:{int(c):02d}]"
+        return f"[{int(a)}:{int(b):02d}]"
+    return _MALFORMED_TS_BRACKET_RE.sub(fix, text)
+
 
 def linkify_timestamps(text: str, video_id: str) -> str:
-    """Replace timestamps with clickable YouTube timestamp links."""
+    """Replace timestamps with clickable YouTube timestamp links.
+
+    Runs a normalisation pre-pass first to clean up malformed brackets
+    like `[0 and 0:05:46]` (LLM artefact) → `[0:05:46]`.
+    """
+    text = _normalize_chapter_timestamps(text)
     def replace(match):
         groups = match.groups()
         if groups[0] is not None:  # [H:MM:SS]
