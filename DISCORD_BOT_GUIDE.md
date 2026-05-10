@@ -55,8 +55,8 @@ LLM_MODEL=Qwen3.5-4B-Q8_0          # any model on llm-compose proxy
 EXA_API_KEY=...                    # optional — drives terminology hints
 
 # Rate limiting (sane defaults)
-MAX_JOBS_PER_USER_PER_HOUR=5
-MAX_QUEUE_SIZE=20
+MAX_JOBS_PER_USER_PER_HOUR=20
+MAX_QUEUE_SIZE=40
 RATE_LIMIT_BYPASS_USERS=          # CSV of Discord user IDs
 
 # Slash command sync mode:
@@ -332,13 +332,17 @@ Server C:  (no command run — keeps everything in-channel)
 
 ## Rate limits
 
-Each user is capped at `MAX_JOBS_PER_USER_PER_HOUR` (default **5**)
+Each user is capped at `MAX_JOBS_PER_USER_PER_HOUR` (default **20**)
 sliding-window per hour. Hitting the cap reacts 🚫 to the offending
 message and posts a clarifying reply with the retry timer.
 
 The bot also enforces a global queue cap (`MAX_QUEUE_SIZE`, default
-**20**) — once that fills, new jobs are rejected with a "queue full"
+**40**) — once that fills, new jobs are rejected with a "queue full"
 error.
+
+**Chained replies count as N jobs**: replying `tldr litmus` to a message
+charges 2 slots against your per-hour cap (atomic — either both queue
+or neither does). Same applies to multiple URLs posted in one message.
 
 To bypass per-user limits for trusted users (yourself, mods),
 add their Discord user IDs to `RATE_LIMIT_BYPASS_USERS`:

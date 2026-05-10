@@ -406,8 +406,12 @@ USER_PROMPT_MIN_CHARS = 3
 # resets counters. Acceptable because (a) the queue capacity already bounds
 # concurrent abuse, (b) restart-flooding is a different attack model that
 # would need persistent storage to defend against.
-MAX_JOBS_PER_USER_PER_HOUR = int(os.environ.get("MAX_JOBS_PER_USER_PER_HOUR", "5"))
-MAX_QUEUE_SIZE = int(os.environ.get("MAX_QUEUE_SIZE", "20"))
+# Per-user sliding-window cap. Default 20 because the chained-reply flow
+# (`tldr litmus` queues 2 jobs at once) burns through smaller caps quickly,
+# especially when users iterate on a few videos in a session. Raise via
+# env or use RATE_LIMIT_BYPASS_USERS for admins.
+MAX_JOBS_PER_USER_PER_HOUR = int(os.environ.get("MAX_JOBS_PER_USER_PER_HOUR", "20"))
+MAX_QUEUE_SIZE = int(os.environ.get("MAX_QUEUE_SIZE", "40"))
 # Discord user IDs (CSV) that bypass the per-user rate limit. Empty by default.
 RATE_LIMIT_BYPASS_USERS = {
     int(x.strip()) for x in os.environ.get("RATE_LIMIT_BYPASS_USERS", "").split(",")
@@ -2373,7 +2377,13 @@ async def process(job: Job):
         await _job_remove_react(job, emoji)
     await _job_react(job, "\u2705")  # ✅
 
-    log.info("[%s] Done — posted 3 embeds", job.video_id)
+    # Count what we actually posted. Base: TL;DW + Key Points + Chapters = 3.
+    # +1 for the split-summary header card. +1 when Community Reaction fired.
+    posted_count = 3 + (1 if use_split else 0) + (1 if yt_comments_summary else 0)
+    log.info("[%s] Done — posted %d embeds%s%s",
+             job.video_id, posted_count,
+             " (split summary)" if use_split else "",
+             " + Community Reaction" if yt_comments_summary else "")
 
 
 async def process_url(job: Job):

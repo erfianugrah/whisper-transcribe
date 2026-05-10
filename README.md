@@ -165,8 +165,8 @@ directly — same surface area.
 | `LITMUS_SKIP_LLM_ABOVE` | `8` | Above this skips the LLM (clearly LLM-style; signals already strong) |
 | `LITMUS_EXCERPT_CHARS` | `8000` | Hard cap on article excerpt sent to the litmus LLM call |
 | `WAYBACK_TIMEOUT` | `8` | Seconds to wait on archive.org's /available endpoint |
-| `MAX_JOBS_PER_USER_PER_HOUR` | `5` | Per-user rate limit |
-| `MAX_QUEUE_SIZE` | `20` | Global queue cap |
+| `MAX_JOBS_PER_USER_PER_HOUR` | `20` | Per-user sliding-window rate limit |
+| `MAX_QUEUE_SIZE` | `40` | Global queue cap |
 
 See `.env.example` and `bot/.env.example` for the full list.
 
