@@ -2175,20 +2175,23 @@ async def process(job: Job):
                 desc_result = None
 
             if desc_result is not None:
-                visual_text = _format_descriptions(desc_result["descriptions"])
+                visual_text = _format_vlm_output(desc_result)
+                # Prefer scene-count for status when the new pipeline ran;
+                # fall back to frame_count for legacy responses.
+                scenes = desc_result.get("scenes") or []
+                unit = (
+                    f"{len(scenes)} scenes ({desc_result.get('frame_count', 0)} frames)"
+                    if scenes
+                    else f"{desc_result.get('frame_count', 0)} frames"
+                )
                 if visual_only:
                     transcript = visual_text
-                    status = (status or "") + (
-                        f" | visual-only ({desc_result['frame_count']} frames "
-                        f"@ {desc_result['interval_seconds']:.0f}s)"
-                    )
+                    status = (status or "") + f" | visual-only ({unit})"
                 else:
                     # Hybrid: interleave speech and visual lines by timestamp.
                     transcript = _interleave_by_timestamp(transcript, visual_text)
                     tag = "user-enriched" if user_forced_vlm else "hybrid"
-                    status = (status or "") + (
-                        f" | {tag} (+{desc_result['frame_count']} visual frames)"
-                    )
+                    status = (status or "") + f" | {tag} (+{unit})"
         else:
             # Speech-heavy or VLM disabled: nothing more to do, clean up file.
             await _cleanup_remote_file(file_path)
@@ -2915,27 +2918,59 @@ def _chunk_transcript(transcript: str, max_chars: int) -> list[str]:
 _MIN_CHUNK_CHARS = 4000
 
 
-def _dedup_lines(text: str) -> str:
-    """Drop lines that exact-match a previously-seen line in the same output.
+# Common English stopwords + domain-frequent generics. Removed before
+# Jaccard similarity comparison so paraphrased near-duplicates dedup
+# against each other instead of being kept as "distinct" content.
+_DEDUP_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "that", "this", "are", "from", "have",
+    "has", "was", "were", "been", "being", "into", "their", "they",
+    "which", "what", "when", "where", "while", "would", "could", "should",
+    "but", "not", "any", "all", "one", "two", "out", "use", "used",
+    # Domain-frequent — every summary mentions these so they don't
+    # discriminate between distinct bullets.
+    "video", "trailer", "story", "scene", "narrative",
+})
 
-    Local LLMs occasionally enter degenerate loops where they emit the
-    same sentence or bullet repeatedly (especially on repetitive input
-    like VLM-only transcripts of silent videos). Deterministic dedup is
-    a cheap safety net — strips clear duplicates so a looped output
-    doesn't blow out the Discord embed into 5 continuation cards.
 
-    Dedup key normalisation:
-      - Strip leading bullet markers (`- `, `* `, numbered lists)
-      - Strip surrounding whitespace
-      - Lowercase
+def _dedup_compare_set(line: str) -> set[str]:
+    """Word set used for Jaccard similarity. Strips bullet markers,
+    lowercases, keeps alpha tokens ≥3 chars, removes stopwords."""
+    s = re.sub(r"^[\s\-\*\d.•]+", "", line.strip()).lower()
+    words = re.findall(r"[a-z']{3,}", s)
+    return {w for w in words if w not in _DEDUP_STOPWORDS}
 
-    Short lines (<20 chars after normalisation) and empty lines pass
-    through unchanged — they're typically section breaks, headers, or
-    timestamp markers that legitimately recur in some output shapes.
+
+def _dedup_jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _dedup_lines(text: str, similarity_threshold: float = 0.5) -> str:
+    """Drop duplicate and near-duplicate lines from LLM output.
+
+    Local LLMs occasionally enter degenerate loops where they emit
+    paraphrased variations of the same sentence many times (especially
+    on repetitive input like VLM-only transcripts of silent videos).
+    Two-stage dedup catches both:
+
+    1. Exact-match (key = lowercase, bullet-markers stripped). Cheap,
+       O(1) lookup. Catches verbatim repeats.
+    2. Jaccard word-set similarity (stopwords + domain-generic words
+       removed). Catches paraphrase loops where the LLM rewords the
+       same point — "X is a creative performance" vs "X is an
+       innovative showcase". Default threshold 0.5 ≈ "half the
+       distinctive words overlap".
+
+    Short lines (<20 chars after normalisation) and lines with fewer
+    than 4 distinctive words pass through unchanged — typically section
+    headers, timestamp markers, or single-word emphasis. Logs the count
+    of dropped lines when it fires.
     """
     if not text:
         return text
-    seen: set[str] = set()
+    seen_exact: set[str] = set()
+    seen_sets: list[set[str]] = []
     out: list[str] = []
     dropped = 0
     for line in text.splitlines(keepends=False):
@@ -2943,14 +2978,53 @@ def _dedup_lines(text: str) -> str:
         if not key or len(key) < 20:
             out.append(line)
             continue
-        if key in seen:
+        if key in seen_exact:
             dropped += 1
             continue
-        seen.add(key)
+        word_set = _dedup_compare_set(line)
+        if len(word_set) >= 4:
+            is_dup = False
+            for prev in seen_sets:
+                if _dedup_jaccard(word_set, prev) >= similarity_threshold:
+                    is_dup = True
+                    break
+            if is_dup:
+                dropped += 1
+                continue
+            seen_sets.append(word_set)
+        seen_exact.add(key)
         out.append(line)
     if dropped > 0:
-        log.info("Dedup: dropped %d duplicate lines from LLM output", dropped)
-    return "\n".join(out)
+        log.info("Dedup: dropped %d duplicate/near-duplicate lines", dropped)
+    return _strip_incomplete_trailing_sentence("\n".join(out))
+
+
+def _strip_incomplete_trailing_sentence(text: str) -> str:
+    """Drop the last line if it ends mid-sentence (no terminal
+    punctuation). LLMs occasionally truncate when they hit max_tokens
+    while in the middle of a paraphrase loop — that final fragment
+    ("The video is a creative and innovative performance that") is
+    ugly and adds nothing. Safer to drop it than to leave it dangling.
+    """
+    if not text or not text.strip():
+        return text
+    lines = text.rstrip().splitlines()
+    if len(lines) < 2:
+        return text
+    last = lines[-1].rstrip()
+    if not last:
+        return text
+    # Sentence enders include English + CJK punctuation + colon/semi-colon
+    # (some markdown bullets legitimately end with `:` to introduce a list).
+    if last[-1] in ".!?。！？:;":
+        return text
+    # If the last line is very short (a label or fragment), it might be
+    # legitimate; only drop if it looks like a sentence fragment (>3 words).
+    if len(last.split()) <= 3:
+        return text
+    # Drop the trailing fragment
+    log.info("Dedup: dropped trailing mid-sentence fragment: %r", last[:60])
+    return "\n".join(lines[:-1])
 
 
 def _is_context_overflow(exc: Exception) -> bool:
@@ -4007,9 +4081,12 @@ async def _fetch_descriptions(file_path: str, cleanup: bool = True,
 
 
 def _format_descriptions(descriptions: list[dict]) -> str:
-    """Render VLM frame descriptions as `[H:MM:SS] text` lines, matching the
-    whisper transcript format exactly so existing summary prompts work
-    unmodified."""
+    """Render per-frame VLM descriptions as `[H:MM:SS] text` lines.
+
+    Legacy / fallback format for when the server didn't return scenes[].
+    Matches the whisper transcript format so existing summary prompts
+    work unmodified.
+    """
     lines = []
     for d in descriptions:
         ts = format_duration(int(d.get("timestamp", 0)))
@@ -4018,6 +4095,48 @@ def _format_descriptions(descriptions: list[dict]) -> str:
             continue
         lines.append(f"[{ts}] {text}")
     return "\n".join(lines)
+
+
+def _format_scenes(scenes: list[dict]) -> str:
+    """Render scene-clustered VLM output as `[H:MM:SS-H:MM:SS] text` lines.
+
+    Each scene is one line — the server already pre-clustered consecutive
+    frames into semantic scenes and synthesized a single description per
+    cluster, so input to the summarizer LLM is compact (no redundant
+    per-frame descriptions) and time-anchored.
+
+    Single-frame scenes use `[H:MM:SS]` (point timestamp); multi-frame
+    scenes use `[H:MM:SS-H:MM:SS]` (range). The downstream linkify
+    timestamp regex picks up the starting timestamp from either form.
+    """
+    lines = []
+    for s in scenes:
+        start = float(s.get("start", 0))
+        end = float(s.get("end", start))
+        text = (s.get("description") or "").strip()
+        if not text or text == "[frame description unavailable]":
+            continue
+        if end - start >= 1.0:
+            ts = f"[{format_duration(int(start))}-{format_duration(int(end))}]"
+        else:
+            ts = f"[{format_duration(int(start))}]"
+        n = int(s.get("frame_count", 1))
+        suffix = f" ({n} frames)" if n > 1 else ""
+        lines.append(f"{ts}{suffix} {text}")
+    return "\n".join(lines)
+
+
+def _format_vlm_output(desc_result: dict) -> str:
+    """Pick the right renderer based on server response shape.
+
+    Server ≥ scene-cluster pipeline returns `scenes[]`; older versions
+    only return `descriptions[]`. This helper keeps the bot working
+    against either.
+    """
+    scenes = desc_result.get("scenes")
+    if scenes:
+        return _format_scenes(scenes)
+    return _format_descriptions(desc_result.get("descriptions") or [])
 
 
 # Match the leading [H:MM:SS] / [MM:SS] timestamp on a transcript line.

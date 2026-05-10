@@ -738,6 +738,169 @@ def test_dedup_wired_into_summarize_return_paths():
     assert "_dedup_lines(combined)" in src
 
 
+# ─── Scene-clustered VLM output rendering ────────────────────────────────────
+
+
+def test_format_scenes_single_frame():
+    """Single-frame scene → point timestamp, no frame count suffix."""
+    scenes = [{
+        "start": 0.0, "end": 0.0, "frame_count": 1,
+        "description": "A woman plays a recorder.",
+    }]
+    out = bot._format_scenes(scenes)
+    assert out == "[0:00] A woman plays a recorder."
+
+
+def test_format_scenes_multi_frame_range():
+    """Multi-frame scene → range timestamp + frame count suffix."""
+    scenes = [{
+        "start": 0.0, "end": 50.0, "frame_count": 60,
+        "description": "A woman plays two recorders simultaneously.",
+    }]
+    out = bot._format_scenes(scenes)
+    assert out == "[0:00-0:50] (60 frames) A woman plays two recorders simultaneously."
+
+
+def test_format_scenes_skips_failed_descriptions():
+    """Scenes with placeholder text shouldn't appear in output."""
+    scenes = [
+        {"start": 0.0, "end": 10.0, "frame_count": 2,
+         "description": "Real scene description."},
+        {"start": 10.0, "end": 20.0, "frame_count": 1,
+         "description": "[frame description unavailable]"},
+        {"start": 20.0, "end": 30.0, "frame_count": 1, "description": ""},
+    ]
+    out = bot._format_scenes(scenes)
+    assert "Real scene description" in out
+    assert "unavailable" not in out
+    # Only one line survives
+    assert len(out.splitlines()) == 1
+
+
+def test_format_scenes_long_video_uses_hms():
+    """Times >1hr render as H:MM:SS in the range."""
+    scenes = [{
+        "start": 0.0, "end": 3700.0, "frame_count": 30,
+        "description": "Static shot throughout.",
+    }]
+    out = bot._format_scenes(scenes)
+    assert "[0:00-1:01:40]" in out
+
+
+def test_format_vlm_output_prefers_scenes():
+    """When server returns scenes[], bot uses _format_scenes; legacy
+    descriptions[] is ignored if scenes[] is present."""
+    desc_result = {
+        "scenes": [{
+            "start": 0.0, "end": 10.0, "frame_count": 5,
+            "description": "Clustered scene.",
+        }],
+        "descriptions": [
+            {"timestamp": 0.0, "text": "Frame 0."},
+            {"timestamp": 5.0, "text": "Frame 1."},
+        ],
+    }
+    out = bot._format_vlm_output(desc_result)
+    assert "Clustered scene." in out
+    assert "Frame 0." not in out
+    assert "Frame 1." not in out
+
+
+def test_format_vlm_output_falls_back_to_descriptions():
+    """Legacy server response (no scenes[]) → bot uses _format_descriptions."""
+    desc_result = {
+        "descriptions": [
+            {"timestamp": 0.0, "text": "Frame 0 description."},
+            {"timestamp": 10.0, "text": "Frame 1 description."},
+        ],
+    }
+    out = bot._format_vlm_output(desc_result)
+    assert "Frame 0 description." in out
+    assert "Frame 1 description." in out
+
+
+def test_format_vlm_output_empty():
+    """Neither scenes nor descriptions → empty string, no crash."""
+    assert bot._format_vlm_output({}) == ""
+    assert bot._format_vlm_output({"scenes": [], "descriptions": []}) == ""
+
+
+def test_process_uses_format_vlm_output():
+    """process() must call _format_vlm_output (auto-routes scenes vs descriptions),
+    not the legacy _format_descriptions directly."""
+    import inspect
+    src = inspect.getsource(bot.process)
+    assert "_format_vlm_output(desc_result)" in src
+    # Legacy direct call shouldn't appear (we routed through the helper)
+    assert "_format_descriptions(desc_result" not in src
+
+
+# ─── Server-side scene-clustering helpers (app.py) ───────────────────────────
+# These are tested by importing app.py module functions directly. The app
+# imports torch / whisperx at top-level — too heavy for the test stub layer.
+# We test via AST/source inspection of app.py instead.
+
+
+def test_app_has_scene_cluster_helpers():
+    """All scene-clustering helpers exist in app.py."""
+    for name in (
+        "_detect_scene_boundaries",
+        "_adaptive_sample_timestamps",
+        "_extract_frames_at_timestamps",
+        "_cluster_descriptions",
+        "_synthesize_cluster",
+        "_vlm_word_set",
+        "_vlm_jaccard",
+    ):
+        assert f"def {name}(" in APP_SRC, f"missing helper: {name}"
+
+
+def test_app_describe_video_uses_new_pipeline():
+    """_describe_video must run the new pipeline: scdet → sample →
+    VLM → cluster → synthesize → scenes[]."""
+    # Pull just the function body for inspection
+    start = APP_SRC.index("def _describe_video(")
+    end = APP_SRC.index("\nasync def api_describe(")
+    body = APP_SRC[start:end]
+    # All pipeline steps reference their helpers
+    assert "_detect_scene_boundaries" in body
+    assert "_adaptive_sample_timestamps" in body
+    assert "_extract_frames_at_timestamps" in body
+    assert "_cluster_descriptions" in body
+    assert "_synthesize_cluster" in body
+    # Response includes scenes[] + backward-compat descriptions[]
+    assert '"scenes": scene_outputs' in body
+    assert '"descriptions": descriptions' in body
+
+
+def test_app_scene_detect_threshold_env_overridable():
+    """SCENE_DETECT_THRESHOLD comes from env (tunable per deployment)."""
+    assert 'SCENE_DETECT_THRESHOLD = float(os.environ.get("SCENE_DETECT_THRESHOLD"' in APP_SRC
+
+
+def test_app_cluster_threshold_env_overridable():
+    """CLUSTER_SIMILARITY_THRESHOLD env knob."""
+    assert "CLUSTER_SIMILARITY_THRESHOLD" in APP_SRC
+    assert 'os.environ.get("CLUSTER_SIMILARITY_THRESHOLD"' in APP_SRC
+
+
+def test_app_synthesis_endpoint_separate_from_vlm():
+    """Text-only synthesis LLM endpoint is configurable independently
+    from the vision endpoint (operators may have different proxies)."""
+    assert "LLM_TEXT_API_URL" in APP_SRC
+    assert "LLM_SYNTHESIS_MODEL" in APP_SRC
+
+
+def test_app_response_schema_backward_compatible():
+    """New scenes[] is additive — descriptions[] still present for
+    older bot versions that don't know scenes[]."""
+    body = APP_SRC[APP_SRC.index("def _describe_video("):
+                    APP_SRC.index("\nasync def api_describe(")]
+    # Return dict includes both keys
+    assert '"scenes":' in body
+    assert '"descriptions":' in body
+
+
 def test_chunk_preamble_anchors_timestamps():
     """Map preamble must instruct the LLM to keep timestamps verbatim
     (otherwise chunked chapters could renormalize relative to chunk start)."""

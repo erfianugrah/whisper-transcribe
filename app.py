@@ -2325,6 +2325,256 @@ VLM_FRAME_PROMPT = os.environ.get(
     "factual; do not speculate about content not visible.",
 )
 
+# ─── Scene-clustering pipeline ───────────────────────────────────────────────
+# Frame-by-frame VLM on a static-shot video produces 60 near-identical
+# descriptions, which the downstream LLM either loops on or quotes verbatim.
+# We pre-cluster frames into scenes BEFORE the LLM sees them so the input
+# is structurally compact.
+#
+# Pipeline:
+#   ffmpeg scdet (scene boundaries)
+#     → adaptive frame sampling (1-3 per scene depending on length)
+#     → VLM per sampled frame (existing)
+#     → Jaccard clustering (catches scenes scdet missed)
+#     → LLM synthesis per cluster with >1 frame (text-only summary)
+#     → return scenes list with time ranges + synthesized descriptions
+
+LLM_TEXT_API_URL = os.environ.get(
+    "LLM_TEXT_API_URL",
+    os.environ.get("LLM_API_URL", LLM_VISION_API_URL),
+)
+LLM_SYNTHESIS_MODEL = os.environ.get(
+    "LLM_SYNTHESIS_MODEL",
+    os.environ.get("LLM_MODEL", LLM_VISION_MODEL),
+)
+LLM_SYNTHESIS_TIMEOUT = int(os.environ.get("LLM_SYNTHESIS_TIMEOUT", "60"))
+
+# scdet threshold: 0.0-1.0, higher = stricter (only big scene changes detected).
+# 0.3 is the ffmpeg default-ish — picks up most cuts, ignores subtle pans.
+SCENE_DETECT_THRESHOLD = float(os.environ.get("SCENE_DETECT_THRESHOLD", "0.3"))
+# Adaptive sampling: target ~1 frame per N seconds within a scene.
+# Short scenes (≤30s) → 1 sample. Medium (30-120s) → 2. Long (>120s) → 3.
+SCENE_SAMPLES_SHORT = 1
+SCENE_SAMPLES_MEDIUM = 2
+SCENE_SAMPLES_LONG = 3
+# Cluster similarity threshold (Jaccard on word sets). Catches scenes that
+# scdet split mistakenly OR cases where VLM produced near-identical
+# descriptions for distinct frames (e.g. static dialogue scene + reverse
+# shot). Lower = more aggressive clustering. 0.35 is loose enough to merge
+# paraphrases ("woman holds recorder" / "person holding wind instrument").
+CLUSTER_SIMILARITY_THRESHOLD = float(
+    os.environ.get("CLUSTER_SIMILARITY_THRESHOLD", "0.35")
+)
+
+_VLM_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "that", "this", "are", "from", "have",
+    "has", "was", "were", "been", "being", "into", "their", "they",
+    "which", "what", "when", "where", "while", "would", "could", "should",
+    "but", "not", "any", "all", "one", "two", "out", "use", "used",
+    # Domain-frequent VLM phrasings
+    "video", "frame", "shows", "appears", "image", "scene", "depicts",
+    "person", "people", "background", "foreground", "right", "left", "top",
+    "bottom", "side", "center", "front", "behind", "around",
+})
+
+
+def _vlm_word_set(text: str) -> set[str]:
+    """Word set for Jaccard similarity. Strips stopwords + short tokens."""
+    words = re.findall(r"[a-z']{3,}", text.lower())
+    return {w for w in words if w not in _VLM_STOPWORDS}
+
+
+def _vlm_jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _detect_scene_boundaries(file_path: str, duration: float) -> list[float]:
+    """Use ffmpeg scdet to find scene-change timestamps. Returns a list
+    `[0.0, t1, t2, ..., duration]` — boundaries inclusive of start/end.
+
+    Returns `[0.0, duration]` (one big scene) on failure or when no
+    scene changes are detected.
+    """
+    if duration <= 0:
+        return [0.0]
+    try:
+        # scdet emits "lavfi.scene_score=<float>" on stderr; pts of scene
+        # changes captured by `showinfo` filter.
+        result = subprocess.run(
+            ["ffmpeg", "-i", file_path,
+             "-vf", f"select='gt(scene,{SCENE_DETECT_THRESHOLD})',showinfo",
+             "-an", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("[VLM] scdet timed out; using single-scene fallback")
+        return [0.0, duration]
+    # Stderr contains `pts_time:<float>` for each selected frame
+    times = [0.0]
+    for match in re.finditer(r"pts_time:([\d.]+)", result.stderr):
+        try:
+            t = float(match.group(1))
+        except ValueError:
+            continue
+        # Filter out near-duplicates (scdet can fire twice on the same cut)
+        if not times or t - times[-1] > 0.5:
+            times.append(t)
+    if times[-1] < duration - 0.5:
+        times.append(duration)
+    log.info(f"[VLM] scdet found {len(times)-1} scenes "
+             f"(threshold={SCENE_DETECT_THRESHOLD})")
+    return times
+
+
+def _adaptive_sample_timestamps(
+    boundaries: list[float], max_total: int,
+) -> list[tuple[float, int]]:
+    """Pick sample timestamps for each scene.
+
+    Returns list of (timestamp, scene_index) pairs. Short scenes get 1
+    sample at midpoint; longer scenes get 2-3 evenly spaced.
+
+    Respects `max_total` cap by proportionally downsampling if needed:
+    long videos with many scenes get fewer samples per scene.
+    """
+    if len(boundaries) < 2:
+        return []
+    samples: list[tuple[float, int]] = []
+    for i in range(len(boundaries) - 1):
+        start, end = boundaries[i], boundaries[i + 1]
+        length = end - start
+        if length <= 30:
+            n = SCENE_SAMPLES_SHORT
+        elif length <= 120:
+            n = SCENE_SAMPLES_MEDIUM
+        else:
+            n = SCENE_SAMPLES_LONG
+        for j in range(n):
+            # j+0.5 puts samples at 1/(2n), 3/(2n), ... — centered, no edges
+            t = start + length * (j + 0.5) / n
+            samples.append((t, i))
+    # Cap at max_total: drop evenly across scenes if over budget
+    if len(samples) > max_total:
+        step = len(samples) / max_total
+        samples = [samples[int(k * step)] for k in range(max_total)]
+    return samples
+
+
+def _extract_frames_at_timestamps(
+    file_path: str, out_dir: str, timestamps: list[float], width: int,
+) -> list[tuple[str, float]]:
+    """Extract one frame per timestamp. Returns [(path, timestamp), ...]
+    in order. Uses one ffmpeg call per frame with `-ss` for precise seek.
+    Slower than batch fps-filter extraction but lets us target exact
+    moments instead of uniform intervals.
+    """
+    out: list[tuple[str, float]] = []
+    for i, ts in enumerate(timestamps):
+        path = os.path.join(out_dir, f"frame_{i:04d}.jpg")
+        cmd = [
+            "ffmpeg", "-y", "-ss", f"{ts:.3f}", "-i", file_path,
+            "-frames:v", "1", "-vf", f"scale={width}:-1",
+            "-q:v", "5", "-loglevel", "error", path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and os.path.exists(path):
+            out.append((path, ts))
+        else:
+            stderr = result.stderr or ""
+            if any(p in stderr for p in _FFMPEG_PERMANENT_PATTERNS):
+                raise NoVideoStreamError(
+                    f"frame extraction failed at {ts}s: {stderr[:200]}"
+                )
+            log.warning(f"[VLM] frame extract failed at {ts}s: {stderr[:100]}")
+    return out
+
+
+def _cluster_descriptions(descriptions: list[dict],
+                          threshold: float = None) -> list[list[dict]]:
+    """Group consecutive descriptions by similarity. Returns list of
+    clusters; each cluster is a list of `{timestamp, text}` dicts in
+    temporal order. A cluster represents one "scene" semantically.
+
+    Greedy merge: each new description joins the current cluster iff its
+    word set has Jaccard ≥ `threshold` with the cluster's representative
+    (the most recent frame's words). Otherwise it starts a new cluster.
+    """
+    if not descriptions:
+        return []
+    t = threshold if threshold is not None else CLUSTER_SIMILARITY_THRESHOLD
+    clusters: list[list[dict]] = []
+    current: list[dict] = [descriptions[0]]
+    current_words = _vlm_word_set(descriptions[0].get("text") or "")
+    for desc in descriptions[1:]:
+        words = _vlm_word_set(desc.get("text") or "")
+        if _vlm_jaccard(words, current_words) >= t:
+            current.append(desc)
+            # Merge words for accumulating cluster vocabulary
+            current_words = current_words | words
+        else:
+            clusters.append(current)
+            current = [desc]
+            current_words = words
+    if current:
+        clusters.append(current)
+    return clusters
+
+
+def _synthesize_cluster(cluster: list[dict]) -> str:
+    """Combine N frame descriptions from one scene into a single
+    1-2 sentence summary via the text LLM. Falls back to the longest
+    frame's description if the LLM call fails.
+    """
+    if not cluster:
+        return ""
+    if len(cluster) == 1:
+        return (cluster[0].get("text") or "").strip()
+
+    descriptions = [c.get("text", "").strip() for c in cluster if c.get("text")]
+    # Fallback: longest description (likely richest)
+    fallback = max(descriptions, key=len, default="")
+
+    # Skip synthesis when descriptions are extremely similar (avoid cost)
+    if len(set(descriptions)) <= 1:
+        return fallback
+
+    prompt = (
+        f"Below are {len(descriptions)} short descriptions of consecutive "
+        f"frames from the SAME scene in a video. Synthesize them into ONE "
+        f"coherent description (1-2 sentences) capturing what's in the "
+        f"scene (people, objects, setting) and any notable change or "
+        f"action across the frames. Output ONLY the synthesized "
+        f"description — no preamble, no list, no markdown.\n\n"
+        + "\n".join(f"{i+1}. {d}" for i, d in enumerate(descriptions))
+    )
+    import base64
+    import urllib.request
+    import urllib.error
+    payload = {
+        "model": LLM_SYNTHESIS_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.3,
+        "max_tokens": 200,
+    }
+    req = urllib.request.Request(
+        f"{LLM_TEXT_API_URL}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=LLM_SYNTHESIS_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        text = data["choices"][0]["message"]["content"].strip()
+        if text:
+            return text
+    except (urllib.error.HTTPError, urllib.error.URLError,
+            json.JSONDecodeError, KeyError, IndexError) as e:
+        log.warning(f"[VLM] synthesis failed (using longest-frame fallback): {e}")
+    return fallback
+
 
 def _ffprobe_duration(file_path: str) -> float:
     """Get duration in seconds via ffprobe. Returns 0.0 on failure."""
@@ -2473,25 +2723,41 @@ def _is_vlm_not_configured(err: str) -> bool:
 
 def _describe_video(file_path: str, fps_interval: float, max_frames: int,
                     vlm_model: str, prompt: str) -> dict:
-    """Extract frames and describe each via the VLM. Returns:
+    """Scene-clustered VLM description pipeline.
+
+    Pipeline:
+      1. ffmpeg scdet → scene boundaries
+      2. Adaptive sampling: 1-3 frames per scene depending on length
+      3. VLM in parallel (existing concurrency machinery)
+      4. Jaccard cluster (catches paraphrased near-duplicates that
+         scdet split or that VLM described inconsistently)
+      5. LLM synthesis per cluster with >1 frame
+
+    Returns:
     {
         "duration": float,
-        "frame_count": int,
-        "interval_seconds": float,
+        "frame_count": int,             # frames actually VLM'd
+        "successful_frames": int,
         "model": str,
-        "descriptions": [{"timestamp": float, "text": str}, ...],
+        "scenes": [                     # NEW — primary output for callers
+            {
+                "start": float,
+                "end": float,
+                "frame_count": int,
+                "description": str,     # synthesized when frames>1
+            },
+            ...
+        ],
+        "descriptions": [               # raw per-frame, backward-compat
+            {"timestamp": float, "text": str}, ...
+        ],
     }
 
-    Concurrency: frames are described in parallel up to VLM_FRAME_CONCURRENCY
-    in flight. The VLM backend is single-GPU so unbounded gather just queues
-    at the proxy; bounded parallelism overlaps image encoding + network
-    round-trips with model inference for a meaningful 2-4x speedup.
+    Backward compat: `descriptions` still present so older bot versions
+    keep working. `scenes` is the recommended consumer.
 
     Raises:
-        VLMNotConfiguredError: when the deployed model rejects all images
-            (e.g. llama-server loaded without mmproj). Detected as soon as
-            the first frame fails with that pattern — we don't waste 59
-            calls just to see the same error 60 times.
+        VLMNotConfiguredError: VLM model rejects images (no mmproj loaded).
         NoVideoStreamError: input file has no video track.
     """
     import concurrent.futures
@@ -2500,34 +2766,45 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
     duration = _ffprobe_duration(file_path)
     frames_dir = tempfile.mkdtemp(prefix="vlm-frames-")
     try:
-        frame_paths = _extract_frames(file_path, frames_dir, fps_interval,
-                                      max_frames, VLM_FRAME_WIDTH)
-        if not frame_paths:
+        # 1. Scene boundaries via ffmpeg scdet
+        boundaries = _detect_scene_boundaries(file_path, duration)
+        # 2. Adaptive sampling
+        samples = _adaptive_sample_timestamps(boundaries, max_frames)
+        if not samples:
+            # Fallback: uniform sampling for cases where scdet found nothing
+            # (rare, but defensive).
+            log.info("[VLM] scdet found no scenes; falling back to uniform sampling")
+            effective_interval = max(fps_interval, duration / max_frames) \
+                if duration > 0 else fps_interval
+            n = min(max_frames, max(1, int(duration / effective_interval)))
+            samples = [(i * effective_interval, 0) for i in range(n)]
+
+        sample_ts = [t for t, _ in samples]
+        scene_of_sample = [s for _, s in samples]
+
+        frame_files = _extract_frames_at_timestamps(
+            file_path, frames_dir, sample_ts, VLM_FRAME_WIDTH,
+        )
+        if not frame_files:
             raise RuntimeError("ffmpeg produced no frames")
-        effective_interval = max(fps_interval, duration / max_frames) \
-            if duration > 0 else fps_interval
+        log.info(f"[VLM] extracted {len(frame_files)} frames "
+                 f"across {len(boundaries)-1} scenes")
 
+        # 3. VLM in parallel
         workers = max(1, VLM_FRAME_CONCURRENCY)
-        log.info(f"[VLM] {len(frame_paths)} frames at {effective_interval:.1f}s "
-                 f"interval, model={vlm_model}, concurrency={workers}")
-
-        # Pre-allocate result list so each worker writes its own slot — keeps
-        # output ordered without a sort step.
-        results: list[dict | None] = [None] * len(frame_paths)
+        results: list[dict | None] = [None] * len(frame_files)
         success_count = 0
         first_failure: str | None = None
-        not_configured_err: str | None = None  # set by first frame to hit it
+        not_configured_err: str | None = None
         cancel = threading.Event()
         lock = threading.Lock()
 
-        def _worker(i: int, fp: str) -> None:
+        def _worker(i: int, fp: str, timestamp: float) -> None:
             nonlocal success_count, first_failure, not_configured_err
             if cancel.is_set():
-                # Don't even start — early-out on VLM config errors.
-                results[i] = {"timestamp": i * effective_interval,
+                results[i] = {"timestamp": timestamp,
                               "text": "[frame description unavailable]"}
                 return
-            timestamp = i * effective_interval
             try:
                 text = _describe_frame(fp, vlm_model, prompt)
                 with lock:
@@ -2551,12 +2828,12 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
             results[i] = {"timestamp": timestamp, "text": text}
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(_worker, i, fp) for i, fp in enumerate(frame_paths)]
-            # Wait for all (workers swallow their own exceptions and write
-            # placeholders so gather/wait never raises here).
+            futures = [
+                ex.submit(_worker, i, fp, ts)
+                for i, (fp, ts) in enumerate(frame_files)
+            ]
             concurrent.futures.wait(futures)
 
-        # Bail on VLM config error — re-running for every frame won't help.
         if not_configured_err:
             raise VLMNotConfiguredError(
                 f"VLM model '{vlm_model}' on the LLM proxy rejected the "
@@ -2564,26 +2841,46 @@ def _describe_video(file_path: str, fps_interval: float, max_frames: int,
                 f"WITHOUT an mmproj (multimodal projector) file. "
                 f"Fix: download the corresponding mmproj GGUF (same "
                 f"HF repo as the main model) and pass it to "
-                f"llama-server with --mmproj. Underlying error: {not_configured_err[:200]}"
+                f"llama-server with --mmproj. Underlying error: "
+                f"{not_configured_err[:200]}"
             )
 
         descriptions = [r for r in results if r is not None]
-
-        # Every frame failed → raise so the bot doesn't summarise nothing.
-        if success_count == 0 and frame_paths:
+        if success_count == 0 and frame_files:
             raise RuntimeError(
-                f"All {len(frame_paths)} frame descriptions failed. "
+                f"All {len(frame_files)} frame descriptions failed. "
                 f"First error: {first_failure}"
             )
+        log.info(f"[VLM] Described {success_count}/{len(frame_files)} frames")
 
-        log.info(f"[VLM] Described {success_count}/{len(frame_paths)} frames")
+        # 4. Cluster by description similarity (catches paraphrased near-dups
+        # that scdet would have split + cases where VLM described otherwise-
+        # identical frames differently). Drops frames that failed VLM.
+        clean = [d for d in descriptions
+                 if d.get("text") and d["text"] != "[frame description unavailable]"]
+        clusters = _cluster_descriptions(clean)
+        log.info(f"[VLM] clustered {len(clean)} frames → {len(clusters)} scenes")
+
+        # 5. Synthesize each cluster (parallel; cheap text-only LLM calls)
+        scene_outputs: list[dict] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_synthesize_cluster, c) for c in clusters]
+            syntheses = [f.result() for f in futures]
+        for cluster, synth in zip(clusters, syntheses):
+            scene_outputs.append({
+                "start": cluster[0]["timestamp"],
+                "end": cluster[-1]["timestamp"],
+                "frame_count": len(cluster),
+                "description": synth,
+            })
+
         return {
             "duration": duration,
             "frame_count": len(descriptions),
             "successful_frames": success_count,
-            "interval_seconds": effective_interval,
             "model": vlm_model,
-            "descriptions": descriptions,
+            "scenes": scene_outputs,
+            "descriptions": descriptions,  # backward-compat
         }
     finally:
         shutil.rmtree(frames_dir, ignore_errors=True)
