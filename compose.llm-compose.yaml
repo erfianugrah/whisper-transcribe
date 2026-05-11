@@ -14,14 +14,14 @@
 services:
   whisper:
     environment:
-      # Hop straight to model_proxy on the shared network.
+      # Unified vision + text endpoint via model_proxy → gemma-4-26B-A4B
+      # (mmproj loaded for image input). Avoids the dual-CUDA-context
+      # overhead that broke down on a 32 GB GPU when we tried a separate
+      # vision service. See llm-compose/models/summarizer.env for the
+      # architectural rationale.
       - LLM_VISION_API_URL=${LLM_VISION_API_URL:-http://model_proxy:11434/v1}
-      # Unified model: same as the bot's text summariser. Avoids cold-swap
-      # latency between vision and text calls (proxy auto-swaps on model
-      # mismatch otherwise — ~60s per swap). gemma-4-26B-A4B is MoE
-      # (3B active per token) so per-call throughput stays high.
       - LLM_VISION_MODEL=${LLM_VISION_MODEL:-gemma-4-26B-A4B-it-Q4_K_M}
-      # Same model for scene-cluster synthesis (server-side text LLM call).
+      # Scene-cluster synthesis (server-side text LLM call), same endpoint.
       - LLM_TEXT_API_URL=${LLM_TEXT_API_URL:-http://model_proxy:11434/v1}
       - LLM_SYNTHESIS_MODEL=${LLM_SYNTHESIS_MODEL:-gemma-4-26B-A4B-it-Q4_K_M}
     networks:

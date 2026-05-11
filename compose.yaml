@@ -20,6 +20,12 @@ services:
       # requests; saves the 5-15s cold-load on every subsequent transcription.
       # Set to 300+ to enable timed unloads if VRAM headroom is tight.
       - MODEL_IDLE_TIMEOUT=${MODEL_IDLE_TIMEOUT:-0}
+      # Per-cluster synthesis HTTP timeout (text LLM call to model_proxy).
+      # Default 60s is too tight when the gemma text endpoint runs as a
+      # single slot and many clusters serialise through it (8h ASMR runs
+      # produce ~27 clusters; bumping to 180s leaves headroom for queue
+      # waits without papering over actual UVM-fallback slowness).
+      - LLM_SYNTHESIS_TIMEOUT=${LLM_SYNTHESIS_TIMEOUT:-180}
     ports:
       - "7860:7860"
     extra_hosts:
