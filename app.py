@@ -118,8 +118,10 @@ import collections
 ALIGN_MODEL_CACHE_SIZE = int(os.environ.get("ALIGN_MODEL_CACHE_SIZE", "4"))
 align_model_cache: "collections.OrderedDict[str, tuple]" = collections.OrderedDict()
 
-# Idle unload: free VRAM after MODEL_IDLE_TIMEOUT seconds of no transcription
-MODEL_IDLE_TIMEOUT = int(os.environ.get("MODEL_IDLE_TIMEOUT", "300"))  # 5 min default
+# Idle unload: free VRAM after MODEL_IDLE_TIMEOUT seconds of no transcription.
+# Set to 0 to disable unloading entirely (keeps WhisperX resident; saves the
+# 5-15s cold-load on the next request — worth it when VRAM headroom allows).
+MODEL_IDLE_TIMEOUT = int(os.environ.get("MODEL_IDLE_TIMEOUT", "300"))  # 5 min default; 0 = never
 _last_activity = time.time()
 _idle_timer = None
 _idle_lock = threading.Lock()
@@ -158,9 +160,14 @@ def _unload_models():
 
 
 def _reset_idle_timer():
-    """Reset the idle timer. Called at start AND end of transcription."""
+    """Reset the idle timer. Called at start AND end of transcription.
+
+    No-op when MODEL_IDLE_TIMEOUT <= 0 — keeps models resident forever.
+    """
     global _last_activity, _idle_timer
     _last_activity = time.time()
+    if MODEL_IDLE_TIMEOUT <= 0:
+        return
     if _idle_timer is not None:
         _idle_timer.cancel()
     _idle_timer = threading.Timer(MODEL_IDLE_TIMEOUT + 5, _unload_models)
@@ -2159,6 +2166,13 @@ async def api_yt_download(request: Request):
                 "filename": filename,
                 "title": meta.get("title", "unknown"),
                 "duration": meta.get("duration", 0),
+                # Livestream signal — yt-dlp sets `was_live: true` for VOD'd
+                # streams, `live_status` is one of "not_live"|"is_live"|
+                # "was_live"|"post_live" etc. Bot uses this to skip VLM
+                # enrichment on livestreams (long quiet stretches are normal
+                # gameplay/music, not "silent video" in the VLM sense).
+                "was_live": bool(meta.get("was_live", False)),
+                "live_status": meta.get("live_status", "") or "",
             }
             if include_comments:
                 item["comments"] = _extract_comments(meta, output_dir, video_id)
@@ -2353,6 +2367,28 @@ LLM_SYNTHESIS_TIMEOUT = int(os.environ.get("LLM_SYNTHESIS_TIMEOUT", "60"))
 # scdet threshold: 0.0-1.0, higher = stricter (only big scene changes detected).
 # 0.3 is the ffmpeg default-ish — picks up most cuts, ignores subtle pans.
 SCENE_DETECT_THRESHOLD = float(os.environ.get("SCENE_DETECT_THRESHOLD", "0.3"))
+
+# Hardware-accelerated video decode for ffmpeg scene-detect + frame-extract.
+# Empty string = software decode (default).
+# "cuda" = NVDEC via -hwaccel cuda. Requires `capabilities: [gpu, video]` in
+# compose (injects libnvcuvid). Supports VP9/H.264/HEVC/AV1 on Ada/Blackwell.
+#
+# Why disabled by default: synthetic benchmarks showed software decode often
+# matches or beats NVDEC because (a) modern CPU h264/VP9 software decode is
+# already fast, (b) the `scene` filter forces every decoded frame back to
+# CPU memory via hwdownload, making PCIe transfer the bottleneck instead of
+# decode. NVDEC's real advantage is high-bitrate 1080p+ content where decode
+# IS the bottleneck — measure on your actual workload before enabling.
+#
+# Set FFMPEG_HWACCEL=cuda in env after verifying NVDEC actually helps the
+# specific codec / resolution / duration you're processing.
+FFMPEG_HWACCEL = os.environ.get("FFMPEG_HWACCEL", "").strip()
+
+
+def _hwaccel_args() -> list[str]:
+    """Return `-hwaccel <name>` args, or empty list when disabled.
+    Always placed BEFORE `-i` so it applies to the input demuxer."""
+    return ["-hwaccel", FFMPEG_HWACCEL] if FFMPEG_HWACCEL else []
 # Adaptive sampling: target ~1 frame per N seconds within a scene.
 # Short scenes (≤30s) → 1 sample. Medium (30-120s) → 2. Long (>120s) → 3.
 SCENE_SAMPLES_SHORT = 1
@@ -2441,7 +2477,7 @@ def _detect_scene_boundaries(file_path: str, duration: float) -> list[float]:
         # scdet emits "lavfi.scene_score=<float>" on stderr; pts of scene
         # changes captured by `showinfo` filter.
         result = subprocess.run(
-            ["ffmpeg", "-i", file_path,
+            ["ffmpeg", *_hwaccel_args(), "-i", file_path,
              "-vf", f"select='gt(scene,{SCENE_DETECT_THRESHOLD})',showinfo",
              "-an", "-f", "null", "-"],
             capture_output=True, text=True, timeout=600,
@@ -2512,7 +2548,8 @@ def _extract_frames_at_timestamps(
     for i, ts in enumerate(timestamps):
         path = os.path.join(out_dir, f"frame_{i:04d}.jpg")
         cmd = [
-            "ffmpeg", "-y", "-ss", f"{ts:.3f}", "-i", file_path,
+            "ffmpeg", "-y", *_hwaccel_args(),
+            "-ss", f"{ts:.3f}", "-i", file_path,
             "-frames:v", "1", "-vf", f"scale={width}:-1",
             "-q:v", "5", "-loglevel", "error", path,
         ]
@@ -2741,7 +2778,7 @@ def _extract_frames(file_path: str, out_dir: str,
         effective_interval = max(fps_interval, duration / max_frames)
     pattern = os.path.join(out_dir, "frame_%04d.jpg")
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg", "-y", *_hwaccel_args(),
         "-i", file_path,
         "-vf", f"fps=1/{effective_interval},scale={width}:-1",
         "-frames:v", str(max_frames),

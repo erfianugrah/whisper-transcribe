@@ -149,7 +149,7 @@ FLARESOLVERR_TIMEOUT = int(os.environ.get("FLARESOLVERR_TIMEOUT", "90"))
 # summarize() — the budget calc applies as it does for transcripts.
 SCRAPED_BODY_CHAR_CAP = int(os.environ.get("SCRAPED_BODY_CHAR_CAP", "200000"))
 LLM_API = os.environ.get("LLM_API_URL", "http://localhost:11434/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen3.5-4B-Q8_0")
+LLM_MODEL = os.environ.get("LLM_MODEL", "gemma-4-26B-A4B-it-Q4_K_M")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "turbo")
 # No hard duration limit by default — transcript length (text density) is what
 # actually matters for context budget, not video runtime. Set MAX_DURATION>0
@@ -242,6 +242,25 @@ SPEECH_DENSITY_SPARSE = float(os.environ.get("SPEECH_DENSITY_SPARSE", "8.0"))
 VLM_FPS_INTERVAL = float(os.environ.get("VLM_FPS_INTERVAL", "10"))
 VLM_MAX_FRAMES = int(os.environ.get("VLM_MAX_FRAMES", "60"))
 VLM_TIMEOUT = int(os.environ.get("VLM_TIMEOUT", "1800"))  # 30 min worst case for 60-frame video
+
+# Smart VLM gates — density alone misfires on long-form content (livestreams,
+# podcasts, lectures) where natural quiet stretches drag the average down
+# even when the absolute speech content is plenty. Any of these guards
+# triggering will skip VLM (unless the user explicitly forces it via prompt).
+#
+# Livestreams: yt-dlp tags VOD'd streams with `was_live=true`. Streamer
+# voice carries the meaning even when density looks "sparse"; gameplay/music
+# gaps aren't "silent video" in the VLM sense.
+VLM_SKIP_LIVESTREAMS = os.environ.get("VLM_SKIP_LIVESTREAMS", "1").strip().lower() in {"1", "true", "yes", "on"}
+# Absolute transcript size — if there's already this much text, VLM frame
+# descriptions add diminishing returns. 25k chars ≈ 5k tokens, plenty for
+# a meaningful summary. Default sized to match a 35-min talk at normal pace.
+#
+# CRITICAL: this is intentionally the *only* speech-sufficiency gate.
+# A naive duration cap ("skip VLM if video > 90min") would blackhole
+# genuinely silent long content (8h ASMR, hour-long music videos, etc).
+# Long + low-text means VLM is *more* needed, not less.
+VLM_MIN_TEXT_CHARS = int(os.environ.get("VLM_MIN_TEXT_CHARS", "25000"))
 
 # ─── YouTube comments ────────────────────────────────────────────────────────
 # When enabled, the bot asks the whisper service to fetch top YT comments
@@ -2048,6 +2067,12 @@ async def process(job: Job):
         title = dl.get("title", job.video_id)
         duration = dl.get("duration", 0)
         file_path = dl["filename"]
+        # Livestream signal from yt-dlp metadata. Plumbed through the
+        # /api/yt-download response. `was_live=True` means VOD'd livestream
+        # — natural quiet stretches (gameplay, music, audience interaction)
+        # are normal; speech-density-based VLM trigger would misfire here.
+        was_live = bool(dl.get("was_live", False))
+        live_status = str(dl.get("live_status", ""))
         # Comments are present only when include_comments=True was sent AND
         # yt-dlp succeeded in extracting them. Empty list / missing key both
         # mean "no comments to summarise" (e.g. comments disabled on the
@@ -2140,7 +2165,28 @@ async def process(job: Job):
         # the user explicitly asked about visual content (or wants targeted
         # attention to specific things on screen).
         user_forced_vlm = bool(job.user_prompt)
-        run_vlm = job.vlm_enabled and (user_forced_vlm or density < SPEECH_DENSITY_SPARSE)
+
+        # Smart VLM gates — see the VLM_* constants for rationale. Each
+        # guard short-circuits the density check. Logged at INFO so it's
+        # obvious when VLM was skipped and why (otherwise users see a
+        # "speech_density: 5.3 → sparse" log and wonder why VLM didn't fire).
+        vlm_skip_reason: str | None = None
+        if VLM_SKIP_LIVESTREAMS and was_live:
+            vlm_skip_reason = f"livestream (live_status={live_status or 'was_live'})"
+        elif len(transcript.strip()) >= VLM_MIN_TEXT_CHARS:
+            vlm_skip_reason = (f"transcript {len(transcript.strip())} chars "
+                               f">= VLM_MIN_TEXT_CHARS {VLM_MIN_TEXT_CHARS}")
+
+        density_triggers_vlm = density < SPEECH_DENSITY_SPARSE
+        # User force overrides all gates — if they asked about visuals, give
+        # them visuals even on a 5h livestream.
+        run_vlm = job.vlm_enabled and (
+            user_forced_vlm
+            or (density_triggers_vlm and vlm_skip_reason is None)
+        )
+        if density_triggers_vlm and vlm_skip_reason and not user_forced_vlm:
+            log.info("[%s] VLM skipped: %s (density %.1f would have triggered)",
+                     job.video_id, vlm_skip_reason, density)
 
         if run_vlm:
             visual_only = density < SPEECH_DENSITY_SILENT and not user_forced_vlm

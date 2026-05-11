@@ -16,6 +16,10 @@ services:
       # to https://api.openai.com/v1 + your OPENAI_API_KEY equivalent).
       - LLM_VISION_API_URL=${LLM_VISION_API_URL:-http://host.docker.internal:11434/v1}
       - LLM_VISION_MODEL=${LLM_VISION_MODEL:-llava}
+      # 0 = never unload WhisperX from VRAM. Keeps the model resident between
+      # requests; saves the 5-15s cold-load on every subsequent transcription.
+      # Set to 300+ to enable timed unloads if VRAM headroom is tight.
+      - MODEL_IDLE_TIMEOUT=${MODEL_IDLE_TIMEOUT:-0}
     ports:
       - "7860:7860"
     extra_hosts:
@@ -62,7 +66,10 @@ services:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              # `video` injects libnvcuvid (NVDEC) + libnvidia-encode (NVENC)
+              # via NVIDIA Container Toolkit. Without it, ffmpeg's `-hwaccel cuda`
+              # fails at runtime even though the host driver supports it.
+              capabilities: [gpu, video]
     restart: unless-stopped
 
   # ─── Web scraper (for the URL-summary "tldr" reply trigger) ───────────────
@@ -120,6 +127,11 @@ services:
       #   - OpenAI / Anthropic: https://api.openai.com/v1 with OPENAI_API_KEY
       - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:11434/v1}
       - LLM_MODEL=${LLM_MODEL:-llama3.1}
+      # Per-slot context on the LLM server. Bot derives its char budget from
+      # this; raising it lets typical transcripts fit single-pass per style
+      # (1 LLM call instead of map-reduce's 3 calls per chunked style).
+      # Must match the actual `n_ctx_seq` reported by llama-server at startup.
+      - LLM_CONTEXT_SIZE=${LLM_CONTEXT_SIZE:-65536}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

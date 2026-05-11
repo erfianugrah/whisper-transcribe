@@ -37,7 +37,7 @@ services:
   bot:
     environment:
       - LLM_API_URL=${LLM_API_URL:-http://model_proxy:11434/v1}
-      - LLM_MODEL=${LLM_MODEL:-Qwen3.5-4B-Q8_0}
+      - LLM_MODEL=${LLM_MODEL:-gemma-4-26B-A4B-it-Q4_K_M}
     networks:
       default:
       llm:
