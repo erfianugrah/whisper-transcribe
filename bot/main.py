@@ -400,6 +400,14 @@ class Job:
     #   False           : force task=transcribe (preserve source language).
     # Exposed on /transcribe + /summarize slash commands.
     translate: object = "auto"         # "auto" | True | False
+    # User-requested cache bypass. When True:
+    #   - bot's per-video file cache is skipped on read
+    #   - /api/jobs payload sets refresh=true so the server skips its
+    #     Valkey transcript cache
+    #   - successful results still OVERWRITE the cache, so subsequent
+    #     non-refresh runs see the new transcript
+    # Exposed as `refresh: bool` on /summarize and /transcribe.
+    refresh: bool = False
     vlm_enabled: bool = True           # per-channel override; falls back to global VLM_ENABLED
     yt_comments_enabled: bool = True   # per-channel override; falls back to global YT_COMMENTS_ENABLED
     model_override: str | None = None  # per-channel config can override LLM_MODEL
@@ -2163,8 +2171,13 @@ async def process(job: Job):
         if resp.status != 200:
             raise RuntimeError("Whisper service unavailable")
 
-    # 1a. Cache lookup — skip download+transcribe if we have a fresh transcript
-    cached = read_cache(job.video_id)
+    # 1a. Cache lookup — skip download+transcribe if we have a fresh transcript.
+    # `refresh=true` on the Job bypasses this (user explicitly asked for a
+    # fresh run via /summarize refresh:true). The result still overwrites
+    # the cache below so subsequent runs benefit.
+    cached = None if job.refresh else read_cache(job.video_id, job.translate)
+    if job.refresh:
+        log.info("[%s] Cache bypass (refresh=true)", job.video_id)
     file_path = None
     # Comments aren't cached today; cache hits skip the Community Reaction
     # embed. First-time runs (cache miss) populate this from the yt-dlp
@@ -2397,8 +2410,10 @@ async def process(job: Job):
                 "nothing to summarize."
             )
 
-        # Persist to cache (whatever combination of speech / visual we ended up with)
-        write_cache(job.video_id, title, status, transcript, duration)
+        # Persist to cache (whatever combination of speech / visual we ended up with).
+        # Keyed by translate mode so the three variants (auto/translate/native)
+        # don't collide — see _cache_path docstring for the bug this prevents.
+        write_cache(job.video_id, title, status, transcript, duration, job.translate)
 
     # 5. Summarize in multiple styles (concurrent — model handles full context)
     log.info("[%s] Summarizing (%d chars)...", job.video_id, len(transcript))
@@ -2590,9 +2605,15 @@ async def process(job: Job):
         )
 
     # Attach a "Rename speakers" button when diarization labels are present.
+    # The view carries the translate variant so rename hits the correct
+    # cache file (translate=auto/translate/native each have their own file).
     view = None
     if job.diarize and _has_speaker_labels(transcript):
-        view = SpeakerRenameView(job_video_id=job.video_id, channel_id=job.channel.id)
+        view = SpeakerRenameView(
+            job_video_id=job.video_id,
+            channel_id=job.channel.id,
+            translate=job.translate,
+        )
 
     if job.message is not None:
         await job.channel.send(embed=embed, reference=job.message, view=view)
@@ -2630,8 +2651,12 @@ async def process_url(job: Job):
     if http is None:
         raise RuntimeError("HTTP session not initialised")
 
-    # 1. Cache lookup
-    cached = read_cache(job.video_id)
+    # 1. Cache lookup (skipped on refresh=true). Web jobs don't use the
+    # translate dimension (article text stays in source language) so they
+    # always cache under the "auto" key.
+    cached = None if job.refresh else read_cache(job.video_id)
+    if job.refresh:
+        log.info("[%s] Cache bypass (refresh=true)", job.video_id)
     if cached is not None:
         title, status, body, _duration = cached
         log.info("[%s] Cache hit (%d chars, '%s')", job.video_id, len(body), title)
@@ -3370,17 +3395,39 @@ async def summarize(
 #   <transcript body>
 
 
-def _cache_path(video_id: str) -> Path:
-    return CACHE_DIR / f"{video_id}.txt"
+def _translate_to_key(translate: object) -> str:
+    """Map a `translate` payload value to a stable cache-key string.
+
+    Different translate settings produce different transcripts (English vs
+    source-language vs auto-decided) for the same video. The cache must
+    key on this axis or we get the bug where /summarize translate:translate
+    returns the previously-cached /summarize translate:auto result.
+    """
+    if translate is True:
+        return "translate"
+    if translate is False:
+        return "native"
+    return "auto"
 
 
-def write_cache(video_id: str, title: str, status: str, transcript: str, duration: int) -> None:
+def _cache_path(video_id: str, translate: object = "auto") -> Path:
+    """Cache file path, keyed by (video_id, translate). Backward-compat:
+    when translate="auto" we ALSO recognise the legacy `{video_id}.txt`
+    (no translate suffix) in read_cache, since that's what older runs wrote.
+    """
+    key = _translate_to_key(translate)
+    return CACHE_DIR / f"{video_id}.{key}.txt"
+
+
+def write_cache(video_id: str, title: str, status: str, transcript: str,
+                duration: int, translate: object = "auto") -> None:
     """Persist transcript to disk for reuse across retries / future runs."""
     try:
-        _cache_path(video_id).write_text(
+        _cache_path(video_id, translate).write_text(
             f"# title: {title}\n"
             f"# status: {status}\n"
             f"# duration: {duration}\n"
+            f"# translate: {_translate_to_key(translate)}\n"
             f"\n"
             f"{transcript}"
         )
@@ -3407,14 +3454,25 @@ def _derive_duration_from_transcript(transcript: str) -> int:
     return int(h_or_m) * 60 + int(m_or_s)
 
 
-def read_cache(video_id: str) -> tuple[str, str, str, int] | None:
+def read_cache(video_id: str, translate: object = "auto") -> tuple[str, str, str, int] | None:
     """Read cached transcript if present and not expired.
 
     Returns (title, status, transcript, duration) or None.
+
+    Falls back to the legacy `{video_id}.txt` filename when the new
+    translate-keyed path is missing AND the request is for translate="auto"
+    — covers pre-translate-aware cache files from before the multilingual
+    Tier 1 change. Old files expire naturally via CACHE_TTL.
     """
-    path = _cache_path(video_id)
+    path = _cache_path(video_id, translate)
     if not path.exists():
-        return None
+        # Back-compat: old filename without translate suffix. Only relevant
+        # for translate="auto" since that was the only behaviour pre-Tier-1.
+        legacy = CACHE_DIR / f"{video_id}.txt"
+        if translate == "auto" and legacy.exists():
+            path = legacy
+        else:
+            return None
     try:
         if time.time() - path.stat().st_mtime > CACHE_TTL:
             return None
@@ -3436,6 +3494,11 @@ def read_cache(video_id: str) -> tuple[str, str, str, int] | None:
                 duration = int(line[len("# duration: "):].strip())
             except ValueError:
                 duration = 0
+        elif line.startswith("# translate: "):
+            # Recognise so the parser keeps consuming header lines. The
+            # value itself is informational only (the filename carries
+            # the authoritative key).
+            pass
         elif line.strip() == "":
             body_start = sum(len(l) for l in text.splitlines(keepends=True)[:i + 1])
             break
@@ -4617,10 +4680,12 @@ def _extract_speaker_labels(transcript: str) -> list[str]:
 class SpeakerRenameModal(discord.ui.Modal, title="Rename speakers"):
     """Modal with one TextInput per speaker. Submitting kicks off a rerun."""
 
-    def __init__(self, video_id: str, channel_id: int, speakers: list[str]):
+    def __init__(self, video_id: str, channel_id: int, speakers: list[str],
+                 translate: object = "auto"):
         super().__init__(timeout=600)
         self._video_id = video_id
         self._channel_id = channel_id
+        self._translate = translate
         self._speakers = speakers
         self._inputs: list[discord.ui.TextInput] = []
         for sp in speakers:
@@ -4646,7 +4711,8 @@ class SpeakerRenameModal(discord.ui.Modal, title="Rename speakers"):
             return
         await interaction.response.defer(ephemeral=True)
         try:
-            await _apply_rename(interaction, self._video_id, self._channel_id, renames)
+            await _apply_rename(interaction, self._video_id, self._channel_id,
+                                renames, translate=self._translate)
         except Exception as e:
             log.error("Rename apply failed: %s", e)
             await interaction.followup.send(
@@ -4655,18 +4721,25 @@ class SpeakerRenameModal(discord.ui.Modal, title="Rename speakers"):
 
 
 class SpeakerRenameView(discord.ui.View):
-    """Persistent View attached to a brief embed when diarize=True."""
+    """Persistent View attached to a brief embed when diarize=True.
 
-    def __init__(self, job_video_id: str, channel_id: int):
+    Carries the translate variant so we look up the correct cache file —
+    each translate setting (auto/translate/native) has its own file, and
+    the rename only makes sense on the variant the user originally saw.
+    """
+
+    def __init__(self, job_video_id: str, channel_id: int,
+                 translate: object = "auto"):
         super().__init__(timeout=None)  # persistent until restart
         self._video_id = job_video_id
         self._channel_id = channel_id
+        self._translate = translate
 
     @discord.ui.button(label="Rename speakers", style=discord.ButtonStyle.secondary, emoji="🏷️")
     async def rename_button(
         self, interaction: discord.Interaction, button: discord.ui.Button,
     ) -> None:
-        cached = read_cache(self._video_id)
+        cached = read_cache(self._video_id, self._translate)
         if cached is None:
             await interaction.response.send_message(
                 "Transcript no longer in cache — can't rename.", ephemeral=True
@@ -4680,7 +4753,8 @@ class SpeakerRenameView(discord.ui.View):
             )
             return
         await interaction.response.send_modal(
-            SpeakerRenameModal(self._video_id, self._channel_id, speakers)
+            SpeakerRenameModal(self._video_id, self._channel_id, speakers,
+                               translate=self._translate)
         )
 
 
@@ -4689,6 +4763,8 @@ async def _apply_rename(
     video_id: str,
     channel_id: int,
     renames: dict,
+    *,
+    translate: object = "auto",
 ) -> None:
     """Apply rename map to cached transcript + post a fresh brief embed.
 
@@ -4696,8 +4772,12 @@ async def _apply_rename(
     transcript, write back to cache, then re-summarize the brief only
     (key_points/chapters keep their original labels — they'd require
     re-summarisation on the LLM, costly).
+
+    `translate` selects which cache variant to rename — each translate
+    setting (auto/translate/native) has its own file. Defaults to auto
+    for back-compat with older view instances that didn't pass it.
     """
-    cached = read_cache(video_id)
+    cached = read_cache(video_id, translate)
     if cached is None:
         await interaction.followup.send("Transcript expired.", ephemeral=True)
         return
@@ -4706,7 +4786,7 @@ async def _apply_rename(
     # Apply renames atomically (longest first to avoid prefix collisions).
     for old, new in sorted(renames.items(), key=lambda kv: -len(kv[0])):
         transcript = transcript.replace(f"[{old}]", f"[{new}]")
-    write_cache(video_id, title, status, transcript, duration)
+    write_cache(video_id, title, status, transcript, duration, translate)
 
     # Re-summarize brief only (cheapest; gives users immediate feedback).
     duration_str = format_duration(duration)
@@ -4769,6 +4849,7 @@ def _job_from_interaction(
     user_prompt: str = "",
     diarize: bool = False,
     translate: object = "auto",
+    refresh: bool = False,
     vlm_enabled: bool | None = None,
     yt_comments_enabled: bool | None = None,
     model_override: str | None = None,
@@ -4780,6 +4861,8 @@ def _job_from_interaction(
 
     `translate`: "auto" (default) lets the server LID-detect and translate
     non-English; True forces translate; False forces transcribe-as-source.
+    `refresh`: when True, both bot-side and server-side caches are skipped
+    for this run. Result still overwrites the cache on success.
     """
     eff_vlm = VLM_ENABLED if vlm_enabled is None else vlm_enabled
     eff_comments = YT_COMMENTS_ENABLED if yt_comments_enabled is None else yt_comments_enabled
@@ -4793,6 +4876,7 @@ def _job_from_interaction(
             channel=interaction.channel, submitter_id=interaction.user.id,
             submitter_name=str(interaction.user),
             user_prompt=user_prompt, diarize=diarize, translate=translate,
+            refresh=refresh,
             vlm_enabled=eff_vlm,
             yt_comments_enabled=eff_comments,
             model_override=model_override,
@@ -4809,6 +4893,7 @@ def _job_from_interaction(
         channel=interaction.channel, submitter_id=interaction.user.id,
         submitter_name=str(interaction.user),
         user_prompt=user_prompt, diarize=diarize, translate=translate,
+        refresh=refresh,
         vlm_enabled=eff_vlm,
         yt_comments_enabled=eff_comments,
         model_override=model_override,
@@ -4837,6 +4922,8 @@ def _resolve_translate_choice(choice: str) -> object:
     translate=("Translation policy. 'auto' (default) translates non-English "
                "sources to English for cleaner summaries. 'translate' forces "
                "English output. 'native' preserves the source language."),
+    refresh=("Skip cache and re-transcribe from scratch. Use this when a "
+             "previous run was wrong or you changed translate mode."),
 )
 async def cmd_summarize(
     interaction: discord.Interaction,
@@ -4844,6 +4931,7 @@ async def cmd_summarize(
     prompt: str | None = None,
     model: str | None = None,
     translate: Literal["auto", "translate", "native"] = "auto",
+    refresh: bool = False,
 ) -> None:
     await interaction.response.defer()
     ok, reason = _rate_limit_check(interaction.user.id)
@@ -4857,6 +4945,7 @@ async def cmd_summarize(
         interaction, url,
         user_prompt=(prompt or "").strip()[:USER_PROMPT_MAX_CHARS],
         translate=_resolve_translate_choice(translate),
+        refresh=refresh,
         vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
         yt_comments_enabled=chan_cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
         model_override=effective_model,
@@ -4869,9 +4958,9 @@ async def cmd_summarize(
     _rate_limit_record(interaction.user.id)
     await queue.put(job)
     await _ack_queued(job, queue.qsize())
-    log.info("Slash /summarize queued %s from %s (model=%s, prompt=%s, translate=%s)",
+    log.info("Slash /summarize queued %s from %s (model=%s, prompt=%s, translate=%s, refresh=%s)",
              job.video_id, job.submitter_name,
-             effective_model or "default", bool(job.user_prompt), translate)
+             effective_model or "default", bool(job.user_prompt), translate, refresh)
 
 
 @bot.tree.command(name="transcribe", description="Transcribe a video (no summary), with optional speaker diarization")
@@ -4880,12 +4969,14 @@ async def cmd_summarize(
     diarize="Identify and label different speakers (slower; adds rename button)",
     translate=("Translation policy. 'auto' (default) translates non-English "
                "sources to English. 'native' preserves the source language."),
+    refresh="Skip cache and re-transcribe from scratch.",
 )
 async def cmd_transcribe(
     interaction: discord.Interaction,
     url: str,
     diarize: bool = False,
     translate: Literal["auto", "translate", "native"] = "auto",
+    refresh: bool = False,
 ) -> None:
     # /transcribe is just /summarize with diarize on. We still produce
     # the brief/key_points/chapters embeds — the diarize flag flows
@@ -4901,6 +4992,7 @@ async def cmd_transcribe(
         interaction, url,
         diarize=diarize or chan_cfg.get("diarize", False),
         translate=_resolve_translate_choice(translate),
+        refresh=refresh,
         vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
         yt_comments_enabled=chan_cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
         model_override=chan_cfg.get("model"),
@@ -4913,8 +5005,8 @@ async def cmd_transcribe(
     _rate_limit_record(interaction.user.id)
     await queue.put(job)
     await _ack_queued(job, queue.qsize())
-    log.info("Slash /transcribe queued %s from %s (diarize=%s, translate=%s)",
-             job.video_id, job.submitter_name, job.diarize, translate)
+    log.info("Slash /transcribe queued %s from %s (diarize=%s, translate=%s, refresh=%s)",
+             job.video_id, job.submitter_name, job.diarize, translate, refresh)
 
 
 @bot.tree.command(name="status", description="Show queue + service health")

@@ -2513,10 +2513,18 @@ async def _execute_transcription(payload: dict) -> dict:
     # the same video share results. Hash the file in a thread; for multi-GB
     # audio sync I/O would block the event loop for several seconds and
     # stall /api/status / /api/queue polls from other clients.
+    #
+    # `refresh=true` on the payload bypasses the lookup (user explicitly
+    # asked for a fresh run via /summarize refresh:true or curl). We still
+    # WRITE the result to the cache on success so subsequent non-refresh
+    # runs benefit.
     cache_key = await asyncio.to_thread(
         _transcript_cache_key, file_path, model, language, diarize, task
     )
-    cached = await _cache_get_transcript(cache_key)
+    refresh = bool(payload.get("refresh", False))
+    cached = None if refresh else await _cache_get_transcript(cache_key)
+    if refresh:
+        log.info(f"[worker] cache bypass (refresh=true) for {cache_key[:40]}...")
     if cached:
         log.info(f"[worker] transcript cache hit: {cache_key[:40]}...")
         # subtitle_file is intentionally NOT cached (ephemeral path). Null

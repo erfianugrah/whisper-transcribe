@@ -3729,6 +3729,142 @@ def test_bot_job_from_interaction_threads_translate():
     assert "translate=translate" in src
 
 
+# ─── 15. Cache refresh + task-aware cache keys ──────────────────────────────
+
+
+def test_bot_cache_path_is_task_aware():
+    """Without this, /summarize translate:auto and translate:translate of
+    the same video collide on the bot's file cache → second run returns
+    the first run's transcript regardless of mode (the real-world bug
+    that prompted this fix)."""
+    src = BOT_SRC[BOT_SRC.index("def _cache_path"):
+                   BOT_SRC.index("def write_cache")]
+    # New signature accepts translate
+    assert "translate" in src
+    # Filename embeds the translate key
+    assert "{key}" in src or "{translate_to_key" in src
+
+
+def test_bot_translate_to_key_mapping():
+    """Stable string key for cache filenames. Behaviour matters because
+    it's what makes the variants distinct on disk."""
+    import ast
+    tree = ast.parse(BOT_SRC)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_translate_to_key":
+            src = ast.get_source_segment(BOT_SRC, node)
+            break
+    else:
+        raise AssertionError("_translate_to_key not found")
+    ns: dict = {}
+    exec(src, ns)
+    fn = ns["_translate_to_key"]
+    assert fn(True) == "translate"
+    assert fn(False) == "native"
+    assert fn("auto") == "auto"
+    # Defensive: unknown value defaults to auto (so we don't write a
+    # garbage filename if a future caller passes something weird).
+    assert fn("bogus") == "auto"
+    assert fn(None) == "auto"
+
+
+def test_bot_read_cache_legacy_fallback():
+    """Pre-Tier-1 cache files were written as `{video_id}.txt`. New code
+    writes `{video_id}.{translate_key}.txt`. read_cache must fall back
+    to the legacy filename for translate='auto' so existing caches keep
+    working across the rollout."""
+    src = BOT_SRC[BOT_SRC.index("def read_cache"):
+                   BOT_SRC.index("def read_cache") + 2500]
+    # Mentions the legacy filename pattern
+    assert 'f"{video_id}.txt"' in src
+    # And the fallback only applies to translate=auto
+    assert 'translate == "auto"' in src
+
+
+def test_bot_job_has_refresh_field():
+    """Job dataclass must carry refresh so it survives queue submission
+    and reaches process()/process_url."""
+    assert "refresh: bool = False" in BOT_SRC
+
+
+def test_bot_slash_commands_expose_refresh():
+    """Both /summarize and /transcribe accept refresh: bool so users can
+    bust the cache on a per-call basis without a separate slash command."""
+    summarize_src = BOT_SRC[BOT_SRC.index("async def cmd_summarize"):
+                             BOT_SRC.index("async def cmd_transcribe")]
+    transcribe_src = BOT_SRC[BOT_SRC.index("async def cmd_transcribe"):
+                              BOT_SRC.index("async def cmd_transcribe") + 3000]
+    for cmd_src, label in ((summarize_src, "summarize"), (transcribe_src, "transcribe")):
+        assert "refresh: bool = False" in cmd_src, f"/{label} missing refresh"
+        # Threaded into _job_from_interaction
+        assert "refresh=refresh" in cmd_src, f"/{label} not forwarding refresh"
+
+
+def test_bot_process_respects_refresh():
+    """process() and process_url must skip read_cache when job.refresh is
+    True. Without this the slash-command refresh option does nothing
+    user-visible (server gets called anyway, but bot's own file cache
+    still wins on next run)."""
+    # Video pipeline
+    process_src = BOT_SRC[BOT_SRC.index("async def process(job: Job):"):
+                           BOT_SRC.index("async def process_url")]
+    assert "job.refresh" in process_src
+    # Skip on True, read on False (default)
+    assert "None if job.refresh else read_cache" in process_src
+
+    # Web pipeline
+    process_url_src = BOT_SRC[BOT_SRC.index("async def process_url"):
+                               BOT_SRC.index("async def process_url") + 5000]
+    assert "job.refresh" in process_url_src
+    assert "None if job.refresh else read_cache" in process_url_src
+
+
+def test_bot_write_cache_passes_translate():
+    """The video-pipeline write_cache must include job.translate so the
+    file is keyed correctly. Without this, refresh + translate variants
+    overwrite each other on the same `{video_id}.auto.txt`."""
+    # The call sites we control (process and _apply_rename) must pass it.
+    # process(): see line near "Persist to cache"
+    assert "write_cache(job.video_id, title, status, transcript, duration, job.translate)" in BOT_SRC
+
+
+def test_bot_speaker_rename_view_carries_translate():
+    """SpeakerRenameView is constructed at summary-post time and lives
+    until the user clicks. Must remember which translate variant
+    produced it so rename targets the correct cache file."""
+    src = BOT_SRC[BOT_SRC.index("class SpeakerRenameView"):
+                   BOT_SRC.index("async def _apply_rename")]
+    # Constructor + storage
+    assert "translate: object" in src
+    assert "self._translate = translate" in src
+    # Used in lookups
+    assert "read_cache(self._video_id, self._translate)" in src
+
+
+def test_bot_apply_rename_uses_translate_param():
+    """_apply_rename must accept and forward translate so rename hits the
+    same cache variant that the view was attached to."""
+    src = BOT_SRC[BOT_SRC.index("async def _apply_rename"):
+                   BOT_SRC.index("async def _apply_rename") + 3000]
+    assert "translate: object" in src
+    assert "read_cache(video_id, translate)" in src
+    assert "write_cache(video_id, title, status, transcript, duration, translate)" in src
+
+
+def test_app_execute_transcription_respects_refresh():
+    """Server-side: payload.refresh=true must skip the Valkey transcript
+    cache lookup. Result still WRITES on success."""
+    src = APP_SRC[APP_SRC.index("async def _execute_transcription"):]
+    next_def = src.index("\nasync def ") if "\nasync def " in src else len(src)
+    exec_src = src[:next_def]
+    assert 'payload.get("refresh"' in exec_src
+    assert "None if refresh else await _cache_get_transcript" in exec_src
+    # Cache write is NOT gated by refresh — we still populate the cache
+    # so subsequent non-refresh runs benefit.
+    write_section = exec_src[exec_src.index("# Cache successful runs"):]
+    assert "if refresh:" not in write_section
+
+
 # ─── Test runner ─────────────────────────────────────────────────────────────
 
 
