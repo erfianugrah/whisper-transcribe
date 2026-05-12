@@ -113,12 +113,24 @@ submits. Submitter gets a `job_id` immediately and polls
   "language": "Auto-detect",
   "format": "txt",
   "diarize": false,
+  "translate": "auto",
   "cleanup": true,
   "consumer": "my-script"
 }
 ```
 
 Returns 202: `{"job_id": "wbx_a1b2c3d4", "status": "queued", "position": 3}`
+
+**`translate`** (default `"auto"`):
+- `"auto"` — server runs a 30s LID pre-pass and translates non-English
+  sources to English. Good default for LLM-summarisation use cases
+  (CS-FLEURS: Whisper translates code-switched audio cleanly while ASR
+  CER doubles).
+- `true` — force `task=translate` regardless of source.
+- `false` — preserve source language. wav2vec2 alignment runs only when
+  the detected language has a default aligner in whisperX (~40 of
+  Whisper's 100 supported languages); others gracefully skip alignment
+  and return segment-level timestamps only.
 
 ### GET /api/jobs/{id}
 

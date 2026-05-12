@@ -1,6 +1,12 @@
 # Design: multilingual / code-switched audio support
 
-Status: **Proposed** — research complete, decisions made, implementation deferred.
+Status: **Tier 1 implemented** (auto-translate, alignment skip, yue-class
+graceful skip, bot slash commands, MCP option). Tier 2 (true CS transcripts
+via faster-whisper's `multilingual=True`) is a follow-up. Tier 3 is skipped.
+
+This doc is the architectural reference + the record of decisions. See
+`git log -p app.py bot/main.py tests/test_regression.py` for the
+implementation history.
 
 ## Problem
 

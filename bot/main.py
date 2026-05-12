@@ -19,6 +19,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 # Load .env file if present (no external dependency)
 def _load_env_file(path):
@@ -388,6 +389,17 @@ class Job:
     submitter_name: str = ""           # for log lines / mentions
     user_prompt: str = ""              # steering text (see process())
     diarize: bool = False              # opt-in via /transcribe; default off
+    # Translation policy:
+    #   "auto" (default): server runs a 30s LID pre-pass; if source is
+    #                     non-English, translates to English. CS-FLEURS
+    #                     (arXiv:2509.14161) shows whisper handles
+    #                     code-switched audio well as translation but
+    #                     badly as ASR — auto-translate gets us coherent
+    #                     transcripts for the bot's summarisation use case.
+    #   True            : force task=translate regardless of source.
+    #   False           : force task=transcribe (preserve source language).
+    # Exposed on /transcribe + /summarize slash commands.
+    translate: object = "auto"         # "auto" | True | False
     vlm_enabled: bool = True           # per-channel override; falls back to global VLM_ENABLED
     yt_comments_enabled: bool = True   # per-channel override; falls back to global YT_COMMENTS_ENABLED
     model_override: str | None = None  # per-channel config can override LLM_MODEL
@@ -2257,6 +2269,9 @@ async def process(job: Job):
             "cleanup": False,
             "return_file": False,  # bot uses transcript text directly
             "diarize": job.diarize,
+            # Server resolves "auto" via a 30s LID pre-pass and translates
+            # to English for non-English sources. See DESIGN_MULTILINGUAL.md.
+            "translate": job.translate,
             "consumer": "discord-bot",
         }
         if initial_prompt:
@@ -4753,6 +4768,7 @@ def _job_from_interaction(
     *,
     user_prompt: str = "",
     diarize: bool = False,
+    translate: object = "auto",
     vlm_enabled: bool | None = None,
     yt_comments_enabled: bool | None = None,
     model_override: str | None = None,
@@ -4761,6 +4777,9 @@ def _job_from_interaction(
 
     Slash commands are always explicit_request=True — the user typed the
     command and the URL.
+
+    `translate`: "auto" (default) lets the server LID-detect and translate
+    non-English; True forces translate; False forces transcribe-as-source.
     """
     eff_vlm = VLM_ENABLED if vlm_enabled is None else vlm_enabled
     eff_comments = YT_COMMENTS_ENABLED if yt_comments_enabled is None else yt_comments_enabled
@@ -4773,7 +4792,7 @@ def _job_from_interaction(
             url=canonical, video_id=video_id,
             channel=interaction.channel, submitter_id=interaction.user.id,
             submitter_name=str(interaction.user),
-            user_prompt=user_prompt, diarize=diarize,
+            user_prompt=user_prompt, diarize=diarize, translate=translate,
             vlm_enabled=eff_vlm,
             yt_comments_enabled=eff_comments,
             model_override=model_override,
@@ -4789,7 +4808,7 @@ def _job_from_interaction(
         url=full_url, video_id=_derive_video_id(full_url),
         channel=interaction.channel, submitter_id=interaction.user.id,
         submitter_name=str(interaction.user),
-        user_prompt=user_prompt, diarize=diarize,
+        user_prompt=user_prompt, diarize=diarize, translate=translate,
         vlm_enabled=eff_vlm,
         yt_comments_enabled=eff_comments,
         model_override=model_override,
@@ -4798,17 +4817,33 @@ def _job_from_interaction(
     )
 
 
+def _resolve_translate_choice(choice: str) -> object:
+    """Map the slash-command Literal value to a `translate` payload value.
+
+    Slash UI shows three options; payload accepts "auto" | True | False.
+    """
+    if choice == "translate":
+        return True
+    if choice == "native":
+        return False
+    return "auto"
+
+
 @bot.tree.command(name="summarize", description="Transcribe + summarise a video")
 @app_commands.describe(
     url="Video URL (YouTube, Twitch, Vimeo, etc.)",
     prompt="Optional steering: tell the bot what to focus on (forces VLM)",
     model="Override LLM_MODEL for this run (advanced)",
+    translate=("Translation policy. 'auto' (default) translates non-English "
+               "sources to English for cleaner summaries. 'translate' forces "
+               "English output. 'native' preserves the source language."),
 )
 async def cmd_summarize(
     interaction: discord.Interaction,
     url: str,
     prompt: str | None = None,
     model: str | None = None,
+    translate: Literal["auto", "translate", "native"] = "auto",
 ) -> None:
     await interaction.response.defer()
     ok, reason = _rate_limit_check(interaction.user.id)
@@ -4821,6 +4856,7 @@ async def cmd_summarize(
     job = _job_from_interaction(
         interaction, url,
         user_prompt=(prompt or "").strip()[:USER_PROMPT_MAX_CHARS],
+        translate=_resolve_translate_choice(translate),
         vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
         yt_comments_enabled=chan_cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
         model_override=effective_model,
@@ -4833,20 +4869,23 @@ async def cmd_summarize(
     _rate_limit_record(interaction.user.id)
     await queue.put(job)
     await _ack_queued(job, queue.qsize())
-    log.info("Slash /summarize queued %s from %s (model=%s, prompt=%s)",
+    log.info("Slash /summarize queued %s from %s (model=%s, prompt=%s, translate=%s)",
              job.video_id, job.submitter_name,
-             effective_model or "default", bool(job.user_prompt))
+             effective_model or "default", bool(job.user_prompt), translate)
 
 
 @bot.tree.command(name="transcribe", description="Transcribe a video (no summary), with optional speaker diarization")
 @app_commands.describe(
     url="Video URL",
     diarize="Identify and label different speakers (slower; adds rename button)",
+    translate=("Translation policy. 'auto' (default) translates non-English "
+               "sources to English. 'native' preserves the source language."),
 )
 async def cmd_transcribe(
     interaction: discord.Interaction,
     url: str,
     diarize: bool = False,
+    translate: Literal["auto", "translate", "native"] = "auto",
 ) -> None:
     # /transcribe is just /summarize with diarize on. We still produce
     # the brief/key_points/chapters embeds — the diarize flag flows
@@ -4861,6 +4900,7 @@ async def cmd_transcribe(
     job = _job_from_interaction(
         interaction, url,
         diarize=diarize or chan_cfg.get("diarize", False),
+        translate=_resolve_translate_choice(translate),
         vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
         yt_comments_enabled=chan_cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
         model_override=chan_cfg.get("model"),
@@ -4873,8 +4913,8 @@ async def cmd_transcribe(
     _rate_limit_record(interaction.user.id)
     await queue.put(job)
     await _ack_queued(job, queue.qsize())
-    log.info("Slash /transcribe queued %s from %s (diarize=%s)",
-             job.video_id, job.submitter_name, job.diarize)
+    log.info("Slash /transcribe queued %s from %s (diarize=%s, translate=%s)",
+             job.video_id, job.submitter_name, job.diarize, translate)
 
 
 @bot.tree.command(name="status", description="Show queue + service health")

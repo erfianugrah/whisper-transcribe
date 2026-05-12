@@ -746,13 +746,21 @@ def transcribe(file, local_path, model_name, language, output_format, enable_dia
 def _transcribe_inner(file, local_path, model_name, language, output_format,
                       enable_diarization, min_speakers, max_speakers, batch_size,
                       hotwords, initial_prompt, suppress_numerals, request_id,
-                      return_file=True):
+                      return_file=True, task="transcribe"):
     """Inner generator — runs under _transcription_lock.
     Yields 4-tuples: (status, html_view, plain_text, subtitle_file).
 
     `return_file=False` skips subtitle file generation (callers that only need
     the transcript text — e.g. the bot via /api/transcribe — avoid disk I/O
     and the leak window if the response is dropped).
+
+    `task` is either "transcribe" (preserve source language) or "translate"
+    (Whisper outputs English regardless of source). Translate is the right
+    default for code-switched audio per CS-FLEURS (arXiv:2509.14161):
+    translation BLEU barely degrades on mixed-language inputs while
+    transcribe CER doubles. wav2vec2 alignment is skipped in translate
+    mode (the aligner is source-language-specific; English transcript over
+    non-English audio produces garbage word-level timestamps).
     """
     global _previous_subtitle
 
@@ -799,6 +807,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format,
     prompt_str = initial_prompt.strip() if initial_prompt else ""
     log.info(f"[{request_id}] Model: {model_name}")
     log.info(f"[{request_id}] Language: {language}")
+    log.info(f"[{request_id}] Task: {task}")
     log.info(f"[{request_id}] Output format: {output_format}")
     log.info(f"[{request_id}] Diarization: {enable_diarization}")
     log.info(f"[{request_id}] Batch size: {batch_size}")
@@ -892,6 +901,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format,
             audio,
             language=lang,
             batch_size=batch_size,
+            task=task,
             print_progress=False,  # whisperX prints to stdout (not logger); keep off in containers
         )
     except Exception as e:
@@ -924,34 +934,62 @@ def _transcribe_inner(file, local_path, model_name, language, output_format,
         return
 
     # -- Phase 4: Word-level alignment (wav2vec2) --
-    log.info(f"[{request_id}] Running word-level alignment for '{detected_lang}'...")
-    t0_align = time.time()
+    # Skip alignment when:
+    #   (a) task=translate — wav2vec2 aligners are source-language phoneme
+    #       models. The transcript is English but the audio is the source
+    #       language, so the aligner can't match. Word timestamps would be
+    #       meaningless. Whisper segment timestamps survive translate mode
+    #       and that's enough for chapter markers / summarisation.
+    #   (b) detected_lang has no default aligner — whisperx's
+    #       DEFAULT_ALIGN_MODELS_* cover ~40 languages; Whisper supports 100.
+    #       For the uncovered 60 (e.g. yue Cantonese, id Indonesian)
+    #       load_align_model would raise ValueError. Detect upfront so we
+    #       log at INFO ("expected, by design") instead of WARNING.
+    from whisperx.alignment import DEFAULT_ALIGN_MODELS_TORCH, DEFAULT_ALIGN_MODELS_HF
+    align_elapsed = 0.0
     alignment_ok = False
-    try:
-        model_a, metadata = load_align_model(detected_lang)
-        result = whisperx.align(
-            result["segments"],
-            model_a,
-            metadata,
-            audio,
-            DEVICE,
-            return_char_alignments=False,
-            print_progress=False,  # whisperX prints to stdout (not logger); keep off in containers
-        )
-        align_elapsed = time.time() - t0_align
-        alignment_ok = True
-        log.info(f"[{request_id}]   Alignment complete in {align_elapsed:.1f}s")
-    except Exception as e:
-        align_elapsed = time.time() - t0_align
-        log.warning(f"[{request_id}]   Alignment failed (proceeding without): {e}")
-        # result still has segment-level timestamps, just not word-level
+    skip_reason = None
+    if task == "translate":
+        skip_reason = "task=translate (English transcript over non-English audio)"
+    elif (detected_lang not in DEFAULT_ALIGN_MODELS_TORCH
+          and detected_lang not in DEFAULT_ALIGN_MODELS_HF):
+        skip_reason = f"no default aligner for '{detected_lang}' (whisperx covers ~40 of Whisper's 100 languages)"
+
+    if skip_reason:
+        log.info(f"[{request_id}] Skipping alignment: {skip_reason}")
+    else:
+        log.info(f"[{request_id}] Running word-level alignment for '{detected_lang}'...")
+        t0_align = time.time()
+        try:
+            model_a, metadata = load_align_model(detected_lang)
+            result = whisperx.align(
+                result["segments"],
+                model_a,
+                metadata,
+                audio,
+                DEVICE,
+                return_char_alignments=False,
+                print_progress=False,  # whisperX prints to stdout (not logger); keep off in containers
+            )
+            align_elapsed = time.time() - t0_align
+            alignment_ok = True
+            log.info(f"[{request_id}]   Alignment complete in {align_elapsed:.1f}s")
+        except Exception as e:
+            align_elapsed = time.time() - t0_align
+            log.warning(f"[{request_id}]   Alignment failed (proceeding without): {e}")
+            # result still has segment-level timestamps, just not word-level
 
     # Rebuild display after alignment (timestamps may have been refined)
     formatted_lines = []
     for seg in result.get("segments", []):
         ts = format_timestamp_display(seg.get("start", 0))
         formatted_lines.append(f"[{ts}] {seg.get('text', '').strip()}")
-    align_status = f"Aligned in {align_elapsed:.1f}s" if alignment_ok else "Alignment failed (segment-level timestamps only)"
+    if alignment_ok:
+        align_status = f"Aligned in {align_elapsed:.1f}s"
+    elif skip_reason:
+        align_status = f"Alignment skipped: {skip_reason} (segment-level timestamps only)"
+    else:
+        align_status = "Alignment failed (segment-level timestamps only)"
     yield f"{align_status} -- {num_segments} segments", _plain_html("\n".join(formatted_lines)), "\n".join(formatted_lines), None
 
     # -- Phase 5: Speaker diarization (optional) --
@@ -2222,16 +2260,116 @@ def _sha1_file(path: str) -> str:
     return h.hexdigest()
 
 
-def _transcript_cache_key(file_path: str, model: str, language: str, diarize: bool) -> str:
+def _transcript_cache_key(file_path: str, model: str, language: str,
+                          diarize: bool, task: str = "transcribe") -> str:
     """Cache key includes decode settings. Same audio under different paths
     shares cache; same audio with different settings does not.
+
+    `task` is part of the key because transcribe and translate produce
+    different transcripts from the same audio (Whisper task=translate
+    outputs English regardless of source). They must not collide.
 
     Caller is responsible for offloading to a thread — this reads the
     entire file synchronously (multi-GB audio = multi-second I/O block).
     See _execute_transcription for the to_thread wrap.
     """
     file_hash = _sha1_file(file_path)
-    return f"transcripts:{file_hash}:{model}:{language}:{int(bool(diarize))}"
+    return f"transcripts:{file_hash}:{model}:{language}:{int(bool(diarize))}:{task}"
+
+
+def _decode_first_seconds(file_path: str, seconds: int = 30, sr: int = 16000) -> "np.ndarray":
+    """Decode only the first `seconds` of audio via ffmpeg `-t`. Much faster
+    than whisperx.load_audio for long files — a 4hr WAV decodes in ~5-10s
+    end-to-end, but we only need 30s of it for LID. Cuts that to ~200ms.
+
+    Returns a numpy float32 array (matches whisperx.load_audio's contract).
+    """
+    import numpy as np
+    cmd = [
+        "ffmpeg", "-nostdin", "-threads", "0",
+        "-t", str(seconds),     # cap input duration BEFORE -i for faster seek/exit
+        "-i", file_path,
+        "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le",
+        "-ar", str(sr), "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=True)
+    return np.frombuffer(proc.stdout, np.int16).flatten().astype(np.float32) / 32768.0
+
+
+def _quick_detect_language_sync(file_path: str) -> tuple[str, float]:
+    """30s LID pre-pass via faster-whisper. Returns (lang_code, confidence).
+
+    Cheap relative to a full transcription — single encoder forward pass on
+    the first 30s of audio plus the 99-language token softmax. Used by the
+    translate="auto" heuristic in _execute_transcription to decide between
+    task=transcribe (English source) and task=translate (non-English source,
+    including code-switched audio where the dominant language is non-English).
+
+    Reuses the currently-loaded whisper model — if none is loaded, loads
+    turbo (cheap, supports all 100 languages including yue Cantonese).
+    Decodes only the first 30s of audio via ffmpeg's `-t` flag — for a 4hr
+    video this is ~200ms instead of ~10s of full-file decoding.
+
+    Returns ("unknown", 0.0) on any failure; caller treats that as "fall
+    back to language=None whisperx auto-detect" (the pre-existing behaviour).
+    """
+    try:
+        # Ensure a model is loaded; reuse whatever's already resident.
+        if whisper_model is None:
+            load_whisper("turbo")
+        first_30s = _decode_first_seconds(file_path, seconds=30)
+        # faster-whisper signature: (audio=None, features=None, vad_filter,
+        # vad_parameters, language_detection_segments, language_detection_threshold)
+        # → (lang, prob, all_probs)
+        lang, prob, _all = whisper_model.model.detect_language(first_30s)
+        return lang, float(prob)
+    except Exception as e:
+        log.warning(f"[quick-LID] failed: {e}; falling back to whisperx auto-detect")
+        return "unknown", 0.0
+
+
+async def _quick_detect_language(file_path: str) -> tuple[str, float]:
+    """Async wrapper around _quick_detect_language_sync. Offloaded to a
+    thread because both audio I/O and model inference are blocking."""
+    return await asyncio.to_thread(_quick_detect_language_sync, file_path)
+
+
+def _decide_task(translate: object, language: str | None,
+                 quick_lang: str | None = None, quick_conf: float = 0.0) -> str:
+    """Resolve the `translate` payload field to a Whisper `task` value.
+
+    `translate` is one of: True, False, or "auto" (default). Resolution:
+      - True  → "translate" unconditionally
+      - False → "transcribe" unconditionally
+      - "auto":
+          - If `language` was explicitly set (not "Auto-detect"/None/"") →
+            respect it, use "transcribe". User who picked a specific
+            language wants that language's output.
+          - Else if quick-LID confidence < 0.5 → "translate". Threshold
+            matches faster-whisper's `language_detection_threshold` default;
+            below that, LID is "not sure" — code-switched audio often
+            produces low-confidence single-language LID, and translate is
+            the safer default for the summarisation use case (CS-FLEURS:
+            BLEU barely degrades on CS audio).
+          - Else if high-confidence English → "transcribe" (no point
+            translating English to English).
+          - Else (high-confidence non-English) → "translate".
+    """
+    if translate is True:
+        return "translate"
+    if translate is False:
+        return "transcribe"
+    # "auto" (or anything else falsy/unknown — treat as auto)
+    explicit = language and language not in ("Auto-detect", "auto", "")
+    if explicit:
+        return "transcribe"
+    # Confidence check FIRST so that a low-confidence "en" (often CS audio
+    # leaning English) gets translate, not transcribe.
+    if quick_lang == "unknown" or quick_conf < 0.5:
+        return "translate"
+    if quick_lang == "en":
+        return "transcribe"
+    return "translate"
 
 
 async def _cache_get_transcript(key: str) -> dict | None:
@@ -2346,12 +2484,25 @@ async def _execute_transcription(payload: dict) -> dict:
     language = payload.get("language", "Auto-detect")
     diarize = bool(payload.get("diarize", False))
 
+    # Resolve the `translate` payload field → Whisper `task`. The "auto"
+    # path runs a cheap 30s LID pre-pass and translates when source is
+    # non-English (the summarisation use case). Explicit True/False
+    # respects the caller's intent and skips the pre-pass.
+    translate = payload.get("translate", "auto")
+    quick_lang, quick_conf = "unknown", 0.0
+    if translate == "auto" and not (language and language not in ("Auto-detect", "auto", "")):
+        # Only run the pre-pass when we actually need its output.
+        quick_lang, quick_conf = await _quick_detect_language(file_path)
+        log.info(f"[worker] quick-LID: lang={quick_lang} conf={quick_conf:.2f}")
+    task = _decide_task(translate, language, quick_lang, quick_conf)
+    log.info(f"[worker] task={task} (translate={translate!r}, language={language!r})")
+
     # Cache lookup before whisper runs — different consumers transcribing
     # the same video share results. Hash the file in a thread; for multi-GB
     # audio sync I/O would block the event loop for several seconds and
     # stall /api/status / /api/queue polls from other clients.
     cache_key = await asyncio.to_thread(
-        _transcript_cache_key, file_path, model, language, diarize
+        _transcript_cache_key, file_path, model, language, diarize, task
     )
     cached = await _cache_get_transcript(cache_key)
     if cached:
@@ -2360,7 +2511,7 @@ async def _execute_transcription(payload: dict) -> dict:
         # it on cache hit so callers don't try to read a deleted file. If
         # they need an SRT they can re-run with `cleanup=false` on a fresh
         # file or generate one client-side from the transcript text.
-        result = {**cached, "cached": True, "subtitle_file": None}
+        result = {**cached, "cached": True, "subtitle_file": None, "task": task}
         if payload.get("cleanup"):
             _cleanup_payload_file(file_path)
         return result
@@ -2384,18 +2535,22 @@ async def _execute_transcription(payload: dict) -> dict:
         initial_prompt=payload.get("initial_prompt", ""),
         suppress_numerals=payload.get("suppress_numerals", False),
         return_file=return_file,
+        task=task,
     )
     result["cached"] = False
 
     # Cache successful runs only. Whisper returns "Error: ..." on internal
     # failures (CUDA OOM, prompt overflow) — don't poison cache with those.
     # Cache the reproducible fields only — subtitle_file is an ephemeral
-    # /tmp path that won't exist on the next cache hit.
+    # /tmp path that won't exist on the next cache hit. `task` is part of
+    # the cache key so transcribe/translate don't collide; storing it on
+    # the value too lets clients see which task produced a cache hit.
     status = result.get("status", "") or ""
     if status and not status.lower().startswith("error"):
         cacheable = {
             "status": status,
             "transcript": result.get("transcript", ""),
+            "task": task,
         }
         await _cache_set_transcript(cache_key, cacheable)
 
@@ -2687,8 +2842,13 @@ def _run_transcription(file_path, model_name="turbo", language="Auto-detect",
                        output_format="txt", enable_diarization=False,
                        min_speakers=0, max_speakers=0, batch_size=None,
                        hotwords="", initial_prompt="", suppress_numerals=False,
-                       return_file=True):
-    """Run transcription synchronously, return final result dict."""
+                       return_file=True, task="transcribe"):
+    """Run transcription synchronously, return final result dict.
+
+    `task`: "transcribe" preserves the source language; "translate" produces
+    English regardless of source. See _transcribe_inner for the multilingual
+    rationale.
+    """
     if batch_size is None:
         batch_size = DEFAULT_BATCH_SIZE
     # Consume the generator to get the final result
@@ -2699,12 +2859,14 @@ def _run_transcription(file_path, model_name="turbo", language="Auto-detect",
         hotwords, initial_prompt, suppress_numerals,
         f"api-{int(time.time()*1000) % 100000}",
         return_file=return_file,
+        task=task,
     ):
         last_status, last_html, last_text, last_file = status, html, text, subtitle_file
     return {
         "status": last_status,
         "transcript": last_text,
         "subtitle_file": last_file,
+        "task": task,
     }
 
 
@@ -2811,12 +2973,22 @@ async def _legacy_sync_transcribe(body: dict, file_path: str) -> JSONResponse:
     return_file = bool(body.get("return_file", True))
     result_subtitle: str | None = None
 
+    # Resolve translate → task (same heuristic as the queue path). The
+    # legacy path doesn't share the transcript cache, so the quick-LID is
+    # purely informational; we still run it to honour the auto behaviour.
+    translate = body.get("translate", "auto")
+    language = body.get("language", "Auto-detect")
+    quick_lang, quick_conf = "unknown", 0.0
+    if translate == "auto" and not (language and language not in ("Auto-detect", "auto", "")):
+        quick_lang, quick_conf = await _quick_detect_language(file_path)
+    task = _decide_task(translate, language, quick_lang, quick_conf)
+
     try:
         result = await asyncio.to_thread(
             _run_transcription,
             file_path,
             model_name=body.get("model", "turbo"),
-            language=body.get("language", "Auto-detect"),
+            language=language,
             output_format=body.get("format", "txt"),
             enable_diarization=body.get("diarize", False),
             min_speakers=body.get("min_speakers", 0),
@@ -2826,6 +2998,7 @@ async def _legacy_sync_transcribe(body: dict, file_path: str) -> JSONResponse:
             initial_prompt=body.get("initial_prompt", ""),
             suppress_numerals=body.get("suppress_numerals", False),
             return_file=return_file,
+            task=task,
         )
         result_subtitle = result.get("subtitle_file")
         return JSONResponse(result)

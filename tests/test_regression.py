@@ -3507,6 +3507,203 @@ def test_bot_poll_tolerates_transient_errors():
     assert "except RuntimeError:" in helper
 
 
+# ─── 14. Multilingual / code-switched audio support ─────────────────────────
+
+
+# -- Server-side (app.py) -----------------------------------------------------
+
+
+def test_app_decide_task_constants():
+    """Resolution table for translate payload field. Encoded as a function
+    so behaviour is testable. Source-string check guards the function's
+    presence; the import-based tests below exercise its behaviour."""
+    assert "def _decide_task" in APP_SRC
+    assert "def _quick_detect_language" in APP_SRC
+    assert "def _quick_detect_language_sync" in APP_SRC
+
+
+def test_app_decide_task_resolution():
+    """Behaviour of _decide_task across the matrix of inputs."""
+    # We can import the function via the app source — but app.py imports
+    # whisperx, torch, etc. at module-level, so we exec just the function
+    # body in an isolated namespace.
+    import ast
+    tree = ast.parse(APP_SRC)
+    decide_src = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_decide_task":
+            decide_src = ast.get_source_segment(APP_SRC, node)
+            break
+    assert decide_src, "_decide_task not found in app.py"
+    ns: dict = {}
+    exec(decide_src, ns)
+    _decide_task = ns["_decide_task"]
+
+    # translate=True → always translate, regardless of language/conf
+    assert _decide_task(True, "en", "en", 1.0) == "translate"
+    assert _decide_task(True, "Auto-detect", "id", 0.99) == "translate"
+
+    # translate=False → always transcribe
+    assert _decide_task(False, "en", "en", 1.0) == "transcribe"
+    assert _decide_task(False, "Auto-detect", "id", 0.99) == "transcribe"
+
+    # auto + explicit language → respect user, transcribe
+    assert _decide_task("auto", "id", "id", 0.99) == "transcribe"
+    assert _decide_task("auto", "fr", "en", 0.99) == "transcribe"
+
+    # auto + auto-detect + quick-LID says English → transcribe
+    assert _decide_task("auto", "Auto-detect", "en", 0.99) == "transcribe"
+    assert _decide_task("auto", None, "en", 0.99) == "transcribe"
+
+    # auto + auto-detect + quick-LID says non-English (high conf) → translate
+    assert _decide_task("auto", "Auto-detect", "id", 0.99) == "translate"
+    assert _decide_task("auto", "Auto-detect", "yue", 0.85) == "translate"
+    assert _decide_task("auto", "Auto-detect", "zh", 0.9) == "translate"
+
+    # auto + low-confidence LID → translate (CS audio often has low conf)
+    assert _decide_task("auto", "Auto-detect", "en", 0.3) == "translate"
+    assert _decide_task("auto", "Auto-detect", "unknown", 0.0) == "translate"
+
+
+def test_app_transcribe_inner_accepts_task():
+    """_transcribe_inner must accept the `task` kwarg and forward it to
+    m.transcribe(). Without this thread-through, the translate path is a
+    no-op even though the rest of the pipeline thinks it's enabled."""
+    src = APP_SRC[APP_SRC.index("def _transcribe_inner"):
+                   APP_SRC.index("def format_timestamp_display")]
+    assert 'task="transcribe"' in src      # default param
+    assert "task=task" in src                # passed to m.transcribe
+
+
+def test_app_run_transcription_accepts_task():
+    """_run_transcription (sync entry) must forward task to _transcribe_inner."""
+    src = APP_SRC[APP_SRC.index("def _run_transcription"):
+                   APP_SRC.index("async def api_transcribe")]
+    assert 'task="transcribe"' in src   # default
+    assert "task=task" in src             # forwarded
+    assert '"task": task' in src          # surfaced in return dict
+
+
+def test_app_alignment_skipped_for_translate():
+    """task=translate must skip wav2vec2 alignment — the aligner is
+    source-language-specific and would produce garbage word timestamps
+    against an English transcript of non-English audio."""
+    src = APP_SRC[APP_SRC.index("def _transcribe_inner"):
+                   APP_SRC.index("def format_timestamp_display")]
+    assert 'if task == "translate":' in src
+    assert "Skipping alignment" in src
+    # Also: graceful skip for languages without a default aligner (yue, id,
+    # other Whisper-supported languages outside whisperx's ~40 covered).
+    assert "DEFAULT_ALIGN_MODELS_TORCH" in src
+    assert "DEFAULT_ALIGN_MODELS_HF" in src
+    assert "no default aligner" in src
+
+
+def test_app_cache_key_includes_task():
+    """Transcribe and translate produce different transcripts from the
+    same audio. They must NOT collide in the cache."""
+    sig_line = APP_SRC[APP_SRC.index("def _transcript_cache_key"):
+                       APP_SRC.index("def _transcript_cache_key") + 1000]
+    # task is a parameter
+    assert "task: str" in sig_line
+    # Key format includes task at the end
+    assert "{task}" in sig_line
+    # _execute_transcription threads it through
+    exec_src = APP_SRC[APP_SRC.index("async def _execute_transcription"):]
+    next_def = exec_src.index("\nasync def ") if "\nasync def " in exec_src else len(exec_src)
+    exec_src = exec_src[:next_def]
+    assert "_transcript_cache_key, file_path, model, language, diarize, task" in exec_src
+
+
+def test_app_quick_lid_only_runs_when_needed():
+    """The 30s LID pre-pass is the most expensive part of auto-translate
+    (reads the file, runs the encoder). Must NOT run when translate is
+    explicit (True/False) or when language is explicitly set."""
+    exec_src = APP_SRC[APP_SRC.index("async def _execute_transcription"):]
+    next_def = exec_src.index("\nasync def ") if "\nasync def " in exec_src else len(exec_src)
+    exec_src = exec_src[:next_def]
+    # Guard expression: must check translate == "auto" AND no explicit language
+    assert 'translate == "auto"' in exec_src
+    assert "_quick_detect_language(file_path)" in exec_src
+    # The guard must be conditional, not unconditional. Check that the
+    # quick-LID line is preceded by an `if` within a few lines.
+    qlid_idx = exec_src.index("await _quick_detect_language(file_path)")
+    preceding = exec_src[max(0, qlid_idx - 300):qlid_idx]
+    assert "if " in preceding
+
+
+def test_app_legacy_path_also_supports_translate():
+    """The non-queue fallback path (when valkey is unreachable) must also
+    honour translate — operators expect the same behaviour on either path."""
+    src = APP_SRC[APP_SRC.index("async def _legacy_sync_transcribe"):]
+    next_def = src.index("\nasync def ") if "\nasync def " in src else len(src)
+    legacy = src[:next_def]
+    assert 'body.get("translate"' in legacy
+    assert "_decide_task(" in legacy
+    assert "task=task" in legacy
+
+
+# -- Bot (bot/main.py) -------------------------------------------------------
+
+
+def test_bot_job_has_translate_field():
+    """Job dataclass must carry the translate policy so it survives queue
+    serialisation and reaches process()."""
+    assert "translate: object" in BOT_SRC
+    # And default is "auto" (string, not True/False).
+    assert 'translate: object = "auto"' in BOT_SRC
+
+
+def test_bot_passes_translate_to_server():
+    """process() must forward Job.translate to the /api/jobs payload."""
+    src = BOT_SRC[BOT_SRC.index("transcribe_payload = {"):]
+    payload_src = src[:src.index("\n\n")]
+    assert '"translate": job.translate' in payload_src
+
+
+def test_bot_slash_commands_expose_translate():
+    """/summarize and /transcribe must accept a translate option so users
+    can override the auto default."""
+    summarize_src = BOT_SRC[BOT_SRC.index("async def cmd_summarize"):
+                             BOT_SRC.index("async def cmd_transcribe")]
+    transcribe_src = BOT_SRC[BOT_SRC.index("async def cmd_transcribe"):
+                              BOT_SRC.index("async def cmd_transcribe") + 2500]
+    for cmd_src in (summarize_src, transcribe_src):
+        assert 'translate: Literal["auto", "translate", "native"]' in cmd_src
+
+
+def test_bot_resolve_translate_choice_helper():
+    """Mapping from slash-command Literal to payload value must be a
+    dedicated function so it's testable + reusable."""
+    assert "def _resolve_translate_choice" in BOT_SRC
+    # Behaviour: "translate" → True, "native" → False, anything else → "auto"
+    import ast
+    tree = ast.parse(BOT_SRC)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_resolve_translate_choice":
+            src = ast.get_source_segment(BOT_SRC, node)
+            break
+    else:
+        raise AssertionError("_resolve_translate_choice not found")
+    ns: dict = {}
+    exec(src, ns)
+    fn = ns["_resolve_translate_choice"]
+    assert fn("translate") is True
+    assert fn("native") is False
+    assert fn("auto") == "auto"
+    # Defensive: unknown values default to auto, not crash.
+    assert fn("bogus") == "auto"
+
+
+def test_bot_job_from_interaction_threads_translate():
+    """_job_from_interaction must accept + thread translate so slash
+    commands can plumb the choice into the Job."""
+    src = BOT_SRC[BOT_SRC.index("def _job_from_interaction"):
+                   BOT_SRC.index("def _job_from_interaction") + 3000]
+    assert 'translate: object = "auto"' in src
+    assert "translate=translate" in src
+
+
 # ─── Test runner ─────────────────────────────────────────────────────────────
 
 
