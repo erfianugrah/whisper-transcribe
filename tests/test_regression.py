@@ -1181,8 +1181,14 @@ def test_chan_cfg_vlm_enabled_wired():
         f"vlm_enabled must be passed in on_message + cmd_summarize + cmd_transcribe "
         f"(found {occurrences})"
     )
-    # process() reads job.vlm_enabled, not module-level VLM_ENABLED
-    assert "job.vlm_enabled and (user_forced_vlm" in BOT_SRC
+    # process() reads job.vlm_enabled, not module-level VLM_ENABLED.
+    # Use a regex so reflows/parenthesisation (single-line or block) don't
+    # falsely fail this guard — what matters is that job.vlm_enabled gates
+    # the user-force branch in the same boolean expression.
+    import re
+    assert re.search(
+        r"job\.vlm_enabled\s+and\s+\(\s*\n?\s*user_forced_vlm", BOT_SRC
+    ), "process() must gate run_vlm on `job.vlm_enabled and (user_forced_vlm ...)`"
 
 
 def test_no_assert_http():
