@@ -2955,6 +2955,49 @@ def test_sync_function_exists():
     assert callable(bot._sync_slash_commands)
 
 
+def test_discord_guild_id_accepts_csv():
+    """DISCORD_GUILD_ID must accept a comma-separated list so operators
+    running the bot in multiple servers get instant slash command sync in
+    each. Single-ID configs from the original implementation still work.
+
+    Note: bot/.env is loaded at module import time, so we set the env var
+    explicitly to override anything from .env. Empty-string is used in
+    place of `pop()` because dotenv's setdefault would re-populate it on
+    reload otherwise.
+    """
+    # Single ID — old behaviour, still supported
+    os.environ["DISCORD_GUILD_ID"] = "123456789012345678"
+    importlib.reload(bot)
+    assert bot.DISCORD_GUILD_IDS == (123456789012345678,)
+
+    # CSV — multiple guilds with whitespace tolerance
+    os.environ["DISCORD_GUILD_ID"] = "111,222, 333"
+    importlib.reload(bot)
+    assert bot.DISCORD_GUILD_IDS == (111, 222, 333)
+
+    # Empty string — explicit no-instant-sync; falls through to global
+    os.environ["DISCORD_GUILD_ID"] = ""
+    importlib.reload(bot)
+    assert bot.DISCORD_GUILD_IDS == ()
+
+    # Cleanup: restore env. We can't just unset because bot/.env may
+    # populate it on the next reload — set to empty so prod config wins
+    # on the next legit boot but tests don't leak state.
+    os.environ.pop("DISCORD_GUILD_ID", None)
+    importlib.reload(bot)
+
+
+def test_sync_loops_per_guild():
+    """When multiple guild IDs configured, sync must call copy_global_to +
+    tree.sync once per guild. A single bot.tree.sync() at the end would
+    skip the instant path for all but the first."""
+    src = BOT_SRC[BOT_SRC.index("async def _sync_slash_commands"):
+                   BOT_SRC.index("async def _sync_slash_commands") + 2000]
+    assert "for gid in DISCORD_GUILD_IDS" in src
+    assert "bot.tree.copy_global_to(guild=guild)" in src
+    assert "await bot.tree.sync(guild=guild)" in src
+
+
 # ─── Speaker rename helpers ────────────────────────────────────────────────
 
 

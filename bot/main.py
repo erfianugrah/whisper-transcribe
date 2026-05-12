@@ -4816,9 +4816,18 @@ async def _apply_rename(
 
 
 # Optional guild-scoped sync (instant). Set DISCORD_GUILD_ID for fast
-# iteration during development; leave unset for global commands (1h
+# iteration during development; leave unset for global commands (~1h
 # propagation, but works in DMs and across all servers).
-DISCORD_GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "0"))
+#
+# Accepts a comma-separated list so operators running the bot in
+# multiple servers (e.g. testing + community) can get instant sync in
+# all of them without waiting on global propagation. Single-ID values
+# from older configs keep working unchanged.
+DISCORD_GUILD_IDS: tuple[int, ...] = tuple(
+    int(s.strip())
+    for s in (os.environ.get("DISCORD_GUILD_ID", "") or "").split(",")
+    if s.strip()
+)
 
 
 def _derive_video_id(full_url: str) -> str:
@@ -5201,12 +5210,17 @@ async def cmd_serverconfig(
 
 # Sync commands on startup. Called once after the worker is up.
 async def _sync_slash_commands():
-    if DISCORD_GUILD_ID:
-        guild = discord.Object(id=DISCORD_GUILD_ID)
-        bot.tree.copy_global_to(guild=guild)
-        synced = await bot.tree.sync(guild=guild)
-        log.info("Slash commands synced to guild %d (%d commands)",
-                 DISCORD_GUILD_ID, len(synced))
+    """Sync slash commands either globally (~1h propagation) or per-guild
+    (instant). DISCORD_GUILD_ID env var accepts a comma-separated list so
+    operators with multiple servers get instant sync in all of them.
+    """
+    if DISCORD_GUILD_IDS:
+        for gid in DISCORD_GUILD_IDS:
+            guild = discord.Object(id=gid)
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            log.info("Slash commands synced to guild %d (%d commands)",
+                     gid, len(synced))
     else:
         synced = await bot.tree.sync()
         log.info("Slash commands synced globally (%d commands; ~1 hour propagation)",
