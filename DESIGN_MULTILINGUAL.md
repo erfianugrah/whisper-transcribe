@@ -1,12 +1,69 @@
 # Design: multilingual / code-switched audio support
 
-Status: **Tier 1 implemented** (auto-translate, alignment skip, yue-class
-graceful skip, bot slash commands, MCP option). Tier 2 (true CS transcripts
-via faster-whisper's `multilingual=True`) is a follow-up. Tier 3 is skipped.
+Status: **Tier 1 implemented + validated in production** (auto-translate,
+alignment skip, yue-class graceful skip, bot slash commands, MCP option,
+task-aware caches across bot + Valkey, `refresh` slash option). Tier 2
+(true CS transcripts via faster-whisper's `multilingual=True`) is
+deferred. Tier 3 is skipped.
 
 This doc is the architectural reference + the record of decisions. See
 `git log -p app.py bot/main.py tests/test_regression.py` for the
 implementation history.
+
+## Production observation (Viggo Mortensen "9 Languages" test)
+
+After shipping Tier 1, we tested against [the 9-languages video](https://www.youtube.com/watch?v=IG8AxHEU0nQ)
+where the speaker code-switches between English, Spanish, French, Danish,
+Italian, Swedish, Catalan, etc., one short segment per language.
+
+**Surprise finding**: Whisper's `task=translate` only PARTIALLY honoured
+the translate token. Specifically:
+
+- English segments → English (no-op, expected)
+- Spanish, Danish, Italian, Swedish, Catalan segments → **preserved native**,
+  NOT translated
+
+CS-FLEURS reported minimal BLEU degradation in translate mode — but that
+was aggregate over CS audio where the dominant language did the heavy
+lifting. For audio that's deliberately N short segments each in a
+DIFFERENT language, faster-whisper's per-segment decoder occasionally
+ignores the translate task token in favour of the high-confidence per-chunk
+language detection. Documented Whisper quirk, not specific to our
+integration.
+
+**The rescue**: our downstream summarisation LLM (Gemma) is multilingual.
+It read the native-language segments natively and produced a coherent
+English summary that correctly extracted content from ALL 9 languages.
+End-user UX matched expectations.
+
+### What this means for the design
+
+For **LLM-summarisation use cases** (the Discord bot, MCP for video
+summaries) — `translate="auto"` + multilingual LLM is sufficient. The
+chain delivers English output regardless of whether Whisper or the LLM
+does the translation. **No further work needed.**
+
+For **pure-transcript use cases** (verbatim transcripts for search,
+quoting, SRT export, archival) — Whisper's translate quirk matters.
+You'd get a partly-multilingual transcript when you wanted English.
+
+## Future work: explicit LLM translation step (Tier 1.5)
+
+For the pure-transcript case, the cleanest fix is a post-processing step
+between whisper and the cache write:
+
+1. Detect non-English content in the transcript (language tagging from
+   `multilingual=True`, or trivial character-set heuristics).
+2. Call the summarisation LLM with a "translate this transcript to
+   English, preserving timestamps" prompt.
+3. Cache the translated transcript.
+
+Effort: ~1-2 hours. Implement when concrete demand surfaces.
+
+Open trade-off: this adds an LLM round-trip to every translate-mode
+job. For the bot's auto-summarise flow it's irrelevant (the LLM is
+called anyway for the summary), but for `/transcribe` (no-summary)
+runs it adds ~2-5s. Probably worth it.
 
 ## Problem
 
@@ -126,7 +183,7 @@ Tests:
 - Alignment skipped in translate mode (source-string check on the new code path).
 - `yue`-detection no longer throws (graceful skip).
 
-### Tier 2 — true CS transcripts (~1-2 days, separate session)
+### Tier 2 — true CS transcripts (~1-2 days, separate session) — DEFERRED
 
 For users who want non-translated CS output (Tier 1 always translates non-English to English).
 
@@ -136,6 +193,22 @@ For users who want non-translated CS output (Tier 1 always translates non-Englis
 - Alignment: either skip OR integrate MMS-FA via `MahmoudAshraf/ctc-forced-aligner`. **Recommend skip in v1**, add MMS-FA in a follow-up.
 - Cache key gains `multilingual` axis.
 - Bot/MCP get a `multilingual` option similarly to `translate`.
+
+**Why deferred**: production testing on the Viggo 9-languages video
+revealed Tier 1's `translate=true` ALREADY produces effectively-multilingual
+output for heavily-CS audio (Whisper's translate path doesn't reliably
+fire per segment). The downstream multilingual LLM (Gemma) reads the
+native-language segments natively. End-user summarisation UX matches
+the goal without Tier 2. Tier 2 only adds value when:
+
+1. The user wants verbatim source-language transcripts (no summarisation
+   — e.g. SRT export), AND
+2. The output needs to be clean per-chunk language tags rather than
+   relying on Whisper's accidental per-segment language preservation.
+
+See "Future work: explicit LLM translation step (Tier 1.5)" at the top
+of this doc — that's a smaller fix for the pure-transcript case and is
+likely the right next step before tackling Tier 2.
 
 Open Tier 2 risks:
 
