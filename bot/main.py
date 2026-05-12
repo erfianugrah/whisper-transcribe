@@ -4519,12 +4519,21 @@ def _interleave_by_timestamp(speech_text: str, visual_text: str) -> str:
     Both inputs are line-oriented `[H:MM:SS] text`. The merged output is
     chronologically ordered. Speech wins on tie (same second) — visual
     descriptions land between speech segments. Lines without parseable
-    timestamps are appended in order at the end (rare; safety net).
+    timestamps are dropped (rare; the formatter upstream always emits
+    timestamps, but Whisper occasionally produces an empty-text segment
+    that comes out without one in translate mode).
     """
-    speech_lines = [_parse_ts(l) for l in speech_text.splitlines() if l.strip()]
-    visual_lines = [_parse_ts(l) for l in visual_text.splitlines() if l.strip()]
-    speech_pairs = [(s, l) for x in speech_lines for (s, l) in [x] if x is not None]
-    visual_pairs = [(s, l) for x in visual_lines for (s, l) in [x] if x is not None]
+    # Pre-existing bug fix: the previous form `(s, l) for x in lines for
+    # (s, l) in [x] if x is not None` tried to unpack None BEFORE the
+    # filter ran. Filter the None-returning _parse_ts results FIRST.
+    speech_pairs = [
+        parsed for parsed in (_parse_ts(l) for l in speech_text.splitlines() if l.strip())
+        if parsed is not None
+    ]
+    visual_pairs = [
+        parsed for parsed in (_parse_ts(l) for l in visual_text.splitlines() if l.strip())
+        if parsed is not None
+    ]
     # speech tagged 0, visual tagged 1 → stable sort puts speech before visual on tie
     merged = sorted(
         [(s, 0, l) for s, l in speech_pairs] +

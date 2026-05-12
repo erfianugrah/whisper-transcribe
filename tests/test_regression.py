@@ -516,6 +516,26 @@ def test_interleave_chronological():
     assert merged[5] == "[1:00] Final."
 
 
+def test_interleave_handles_lines_without_timestamps():
+    """Regression guard: the comprehension used to unpack None before the
+    None-filter ran, crashing with 'cannot unpack non-iterable NoneType
+    object' when whisper returned a segment without a parseable timestamp.
+    Surfaced in production on translate-mode output for the Viggo
+    Mortensen 9-languages video. Must NOT raise — non-parseable lines
+    are dropped silently."""
+    speech = "[0:05] Hello.\nLine without timestamp\n[0:30] Welcome."
+    visual = "[0:00] Title.\nanother no-ts\n[0:45] Slides."
+    # Did NOT raise (the assertion is that the call completes).
+    merged = bot._interleave_by_timestamp(speech, visual).splitlines()
+    # Only the parseable lines come through, in chronological order.
+    assert merged == [
+        "[0:00] Title.",
+        "[0:05] Hello.",
+        "[0:30] Welcome.",
+        "[0:45] Slides.",
+    ]
+
+
 # ─── 6. Output sanitisation (anti-phishing) ──────────────────────────────────
 
 
