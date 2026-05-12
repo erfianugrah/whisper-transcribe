@@ -3288,9 +3288,18 @@ def test_app_queue_endpoints_registered():
 def test_app_worker_lifespan_wired():
     """Worker tasks must start/stop with the app lifespan, not as bare
     threads — otherwise SIGTERM during a Compose restart leaves workers
-    in limbo and active jobs would be wedged across the restart."""
-    assert "on_startup=[_worker_startup]" in APP_SRC
-    assert "on_shutdown=[_worker_shutdown]" in APP_SRC
+    in limbo and active jobs would be wedged across the restart.
+
+    Modern Starlette (≥0.35) removed `on_startup`/`on_shutdown` kwargs
+    in favour of the `lifespan` context manager — we use that.
+    """
+    assert "lifespan=_lifespan" in APP_SRC
+    assert "@asynccontextmanager" in APP_SRC
+    assert "await _worker_startup()" in APP_SRC
+    assert "await _worker_shutdown()" in APP_SRC
+    # And the OLD kwargs must NOT come back — they crash on modern Starlette.
+    assert "on_startup=" not in APP_SRC
+    assert "on_shutdown=" not in APP_SRC
 
 
 def test_app_crash_recovery_on_startup():

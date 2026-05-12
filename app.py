@@ -4074,14 +4074,24 @@ try:
     # Serve with custom Starlette app: API routes + Gradio mounted at /
     import uvicorn
     from starlette.applications import Starlette
+    from contextlib import asynccontextmanager
 
     # Lifespan: bring up the job queue worker before accepting traffic,
     # tear it down cleanly on SIGTERM. If valkey is unreachable, the worker
     # tasks aren't started and /api/jobs returns 503 — /api/transcribe with
     # wait=true still works via the legacy lock path.
-    app = Starlette(routes=API_ROUTES,
-                    on_startup=[_worker_startup],
-                    on_shutdown=[_worker_shutdown])
+    #
+    # `on_startup`/`on_shutdown` kwargs were removed in modern Starlette
+    # (≥0.35). Use the lifespan context-manager pattern instead.
+    @asynccontextmanager
+    async def _lifespan(app):
+        await _worker_startup()
+        try:
+            yield
+        finally:
+            await _worker_shutdown()
+
+    app = Starlette(routes=API_ROUTES, lifespan=_lifespan)
     app = gr.mount_gradio_app(app, demo, path="/", theme=THEME, css=CSS, js="""
 () => {
     const observer = new MutationObserver(() => {
