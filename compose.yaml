@@ -1,11 +1,48 @@
 services:
+  # ─── Job queue backing store ─────────────────────────────────────────────
+  # Valkey backs the /api/jobs* queue: persistent FIFO list, per-job state
+  # hashes, shared transcript cache. AOF on; one fsync/sec (the `60 1` save
+  # rule is a belt-and-suspenders snapshot for catastrophe scenarios).
+  #
+  # Internal-only by design — no host port published. Whisper talks to it
+  # over the `default` network at `valkey:6379`.
+  valkey:
+    image: valkey/valkey:9-alpine
+    command:
+      - valkey-server
+      - --appendonly
+      - "yes"
+      - --save
+      - "60 1"
+    volumes:
+      - valkey-data:/data
+    networks:
+      - default
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
   whisper:
     image: erfianugrah/whisper-transcribe:latest
     build: .
     pull_policy: missing
+    depends_on:
+      valkey:
+        condition: service_healthy
     environment:
       - DEBUG_MODE=1  # 0/false/no/off for clean production logs
       - HF_TOKEN=${HF_TOKEN:-}  # HuggingFace token for pyannote diarization (optional)
+      # Valkey URL for the job queue + transcript cache. Override only if
+      # running valkey outside the default compose network.
+      - VALKEY_URL=${VALKEY_URL:-redis://valkey:6379/0}
+      # Transcript cache TTL (seconds). 7d default — long enough that the
+      # bot, MCP, and Gradio UI all share results for the same video within
+      # a typical "I want to re-summarise" window.
+      - TRANSCRIPT_CACHE_TTL=${TRANSCRIPT_CACHE_TTL:-604800}
       # Optional yt-dlp cookies (age-gated / bot-challenged videos).
       # Leave unset to disable; see .env.example for the why and how.
       - YT_DLP_COOKIES_FILE=${YT_DLP_COOKIES_FILE:-}
@@ -163,6 +200,7 @@ volumes:
   uploads:        # whisper /data — history.json, anything written by the service
   model-cache:    # HuggingFace + torch.hub model downloads
   bot-cache:      # bot's transcript cache
+  valkey-data:    # job queue state + transcript cache (AOF + periodic snapshots)
 
 networks:
   default:

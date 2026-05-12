@@ -11,3 +11,6 @@ gradio==6.14.0
 # ~600 MB of model weights on first run (downloaded into HF cache).
 # GPU-accelerated when CUDA available; falls back to CPU.
 easyocr==1.7.2
+# Backing store for /api/jobs (queue) and shared transcript cache.
+# valkey-py is API-compatible with redis-py so the same URL scheme works.
+valkey==6.1.1

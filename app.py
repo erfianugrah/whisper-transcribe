@@ -9,6 +9,9 @@ import shutil
 import json
 import threading
 import subprocess
+import asyncio
+import hashlib
+import uuid
 
 # -- Logging setup -------------------------------------------------------------
 # Accepts "1", "true", "yes", "on" (any case) for opt-in; everything else
@@ -2002,6 +2005,480 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
     upload_event.then(fn=_format_history_html, outputs=[history_html])
     transcribe_event.then(fn=_format_history_html, outputs=[history_html])
 
+# ─── Job queue (Valkey-backed) ───────────────────────────────────────────────
+# Server-side queue + shared transcript cache. Backs /api/jobs* — any
+# consumer (Discord bot, MCP, Gradio UI, ad-hoc curl) submits a job and
+# polls for results instead of fighting over a single sync lock with 409s.
+#
+# Schema (Valkey keys):
+#   queue:waiting       LIST   job_ids in FIFO order
+#   jobs:active         SET    job_ids currently running (size ≤ WORKER_CONCURRENCY)
+#   jobs:{job_id}       HASH   {id, status, payload, result, error, ...}
+#   jobs:recent         LIST   bounded to last JOB_RECENT_LIMIT terminal jobs
+#   transcripts:{key}   STRING JSON-encoded shared transcript cache
+#
+# Cache key: sha1(file_bytes) + model + language + diarize. Different
+# decode settings produce different transcripts, so they don't collide.
+# Filename is NOT part of the key — same audio under different paths
+# shares cache (helpful when yt-dlp temp dirs vary across runs).
+#
+# Resilience: if valkey is unreachable we set `_queue_available=False`,
+# /api/jobs* return 503, and /api/transcribe (sync) still works as a
+# fallback. The lock-based path is therefore preserved as a hot spare.
+
+VALKEY_URL = os.environ.get("VALKEY_URL", "redis://valkey:6379/0")
+TRANSCRIPT_CACHE_TTL = int(os.environ.get("TRANSCRIPT_CACHE_TTL", "604800"))   # 7 days
+JOB_TTL = int(os.environ.get("JOB_TTL", "3600"))                               # 1h after terminal
+JOB_RECENT_LIMIT = int(os.environ.get("JOB_RECENT_LIMIT", "100"))
+WORKER_CONCURRENCY = int(os.environ.get("WORKER_CONCURRENCY", "1"))            # single GPU = 1
+
+_valkey = None
+_valkey_async = None
+_queue_available = False
+
+
+def _init_valkey() -> bool:
+    """Connect to Valkey. Mutates module-level clients + `_queue_available`.
+    Returns True on success, False on failure (logged). Called by the
+    lifespan startup hook and by tests via the same path.
+    """
+    global _valkey, _valkey_async, _queue_available
+    try:
+        import valkey as _vk
+        import valkey.asyncio as _vk_async
+        _valkey = _vk.from_url(VALKEY_URL, decode_responses=True)
+        _valkey.ping()
+        _valkey_async = _vk_async.from_url(VALKEY_URL, decode_responses=True)
+        _queue_available = True
+        log.info(f"Valkey connected at {VALKEY_URL}")
+        return True
+    except Exception as e:
+        log.warning(
+            f"Valkey unavailable ({VALKEY_URL}): {e} — "
+            f"/api/jobs disabled; /api/transcribe sync fallback only"
+        )
+        _queue_available = False
+        return False
+
+
+# ── Job state ────────────────────────────────────────────────────────────────
+
+
+JOB_STATUS_QUEUED = "queued"
+JOB_STATUS_RUNNING = "running"
+JOB_STATUS_DONE = "done"
+JOB_STATUS_FAILED = "failed"
+JOB_STATUS_CANCELLED = "cancelled"
+_JOB_TERMINAL = {JOB_STATUS_DONE, JOB_STATUS_FAILED, JOB_STATUS_CANCELLED}
+
+
+class PermanentJobError(Exception):
+    """Marker — job failed in a way that won't recover on retry (missing
+    input file, oversized input). Stored as `permanent: 1` on the job hash
+    so clients can fail fast instead of resubmitting."""
+
+
+def _new_job_id() -> str:
+    """Opaque job id. `wbx_` prefix ties to whisper-transcribe origin."""
+    return f"wbx_{uuid.uuid4().hex[:12]}"
+
+
+def _job_key(job_id: str) -> str:
+    return f"jobs:{job_id}"
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _deserialize_job(data: dict) -> dict:
+    """Decode JSON-encoded fields embedded in a job hash."""
+    out = dict(data)
+    for k in ("payload", "result"):
+        if k in out and out[k]:
+            try:
+                out[k] = json.loads(out[k])
+            except Exception:
+                pass
+    # permanent is stored as "1"/"0" string; coerce to bool for clients.
+    if "permanent" in out:
+        out["permanent"] = out["permanent"] == "1"
+    return out
+
+
+async def _enqueue_job(payload: dict, consumer: str = "unknown") -> dict:
+    """Create + enqueue a transcription job. Returns the initial state dict.
+
+    The caller does NOT need to pre-validate the payload: the worker
+    re-checks on dequeue (file may have moved between submit and run).
+    Validation here is intentionally minimal to keep submit fast.
+    """
+    if not _queue_available:
+        raise RuntimeError("queue backend unavailable")
+    job_id = _new_job_id()
+    now = _now_iso()
+    state = {
+        "id": job_id,
+        "status": JOB_STATUS_QUEUED,
+        "consumer": consumer,
+        "submitted_at": now,
+        "payload": json.dumps(payload),
+    }
+    # Atomic: enqueue + state-hash write happen together so polls never see
+    # a job in the LIST without its hash (or vice versa).
+    pipe = _valkey_async.pipeline()
+    pipe.hset(_job_key(job_id), mapping=state)
+    pipe.rpush("queue:waiting", job_id)
+    await pipe.execute()
+    log.info(f"[queue] enqueued {job_id} from {consumer}: {payload.get('file_path', '?')}")
+    return {**state, "payload": payload}
+
+
+async def _read_job(job_id: str) -> dict | None:
+    """Fetch a job's current state. None if not found / queue down."""
+    if not _queue_available:
+        return None
+    data = await _valkey_async.hgetall(_job_key(job_id))
+    if not data:
+        return None
+    return _deserialize_job(data)
+
+
+async def _job_position(job_id: str) -> int | None:
+    """Position in queue (1-indexed, 1 = next). None if not queued."""
+    if not _queue_available:
+        return None
+    # LPOS is O(N) but N is bounded by the queue depth which we keep small.
+    # decode_responses=True means LPOS returns int or None directly.
+    try:
+        idx = await _valkey_async.lpos("queue:waiting", job_id)
+        return None if idx is None else idx + 1
+    except Exception:
+        return None
+
+
+async def _cancel_job(job_id: str) -> tuple[bool, str]:
+    """Cancel a queued job. Returns (success, reason).
+
+    Running jobs can't be cancelled — whisperX has no checkpoint protocol,
+    so interrupting mid-decode would leak GPU memory. Caller can
+    fire-and-forget on their side if they no longer want the result.
+    """
+    if not _queue_available:
+        return False, "queue backend unavailable"
+    job = await _read_job(job_id)
+    if not job:
+        return False, "not found"
+    status = job.get("status")
+    if status in _JOB_TERMINAL:
+        return False, f"already {status}"
+    if status == JOB_STATUS_RUNNING:
+        return False, "cannot cancel in-flight job"
+    # Status is queued — remove from LIST and mark cancelled. LREM is O(N)
+    # but again N is small.
+    removed = await _valkey_async.lrem("queue:waiting", 1, job_id)
+    if removed:
+        await _valkey_async.hset(_job_key(job_id), mapping={
+            "status": JOB_STATUS_CANCELLED,
+            "completed_at": _now_iso(),
+        })
+        await _valkey_async.expire(_job_key(job_id), JOB_TTL)
+        return True, "cancelled"
+    return False, "race: worker picked it up between read and cancel"
+
+
+async def _queue_info() -> dict:
+    """Snapshot of queue state for /api/queue."""
+    if not _queue_available:
+        return {"depth": 0, "active": [], "recent": [], "available": False}
+    depth = await _valkey_async.llen("queue:waiting")
+    active_ids = await _valkey_async.smembers("jobs:active")
+    recent_ids = await _valkey_async.lrange("jobs:recent", 0, 19)
+    # Fetch hashes in parallel — gather is significantly faster than a
+    # sequential await loop when there are several active/recent jobs.
+    active_jobs = await asyncio.gather(*(_read_job(jid) for jid in active_ids))
+    recent_jobs = await asyncio.gather(*(_read_job(jid) for jid in recent_ids))
+    return {
+        "depth": depth,
+        "active": [j for j in active_jobs if j],
+        "recent": [j for j in recent_jobs if j],
+        "available": True,
+    }
+
+
+# ── Transcript cache ─────────────────────────────────────────────────────────
+
+
+def _sha1_file(path: str) -> str:
+    """Streaming sha1 of a file. 1 MiB blocks — keeps memory flat for the
+    multi-GB audio files common with long-form video downloads."""
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _transcript_cache_key(file_path: str, model: str, language: str, diarize: bool) -> str:
+    """Cache key includes decode settings. Same audio under different paths
+    shares cache; same audio with different settings does not.
+
+    Caller is responsible for offloading to a thread — this reads the
+    entire file synchronously (multi-GB audio = multi-second I/O block).
+    See _execute_transcription for the to_thread wrap.
+    """
+    file_hash = _sha1_file(file_path)
+    return f"transcripts:{file_hash}:{model}:{language}:{int(bool(diarize))}"
+
+
+async def _cache_get_transcript(key: str) -> dict | None:
+    if not _queue_available:
+        return None
+    try:
+        blob = await _valkey_async.get(key)
+    except Exception as e:
+        log.warning(f"transcript cache read failed: {e}")
+        return None
+    if not blob:
+        return None
+    try:
+        return json.loads(blob)
+    except Exception:
+        return None
+
+
+async def _cache_set_transcript(key: str, result: dict) -> None:
+    if not _queue_available:
+        return
+    try:
+        await _valkey_async.set(key, json.dumps(result), ex=TRANSCRIPT_CACHE_TTL)
+    except Exception as e:
+        log.warning(f"transcript cache write failed: {e}")
+
+
+# ── Worker loop ──────────────────────────────────────────────────────────────
+
+
+_worker_tasks: list = []
+
+
+async def _job_worker(worker_id: int):
+    """Single-worker loop. BLPOP from queue:waiting → run → repeat. One
+    instance per GPU. A poisoned job logs + records failure but never
+    crashes the worker.
+    """
+    log.info(f"[worker {worker_id}] started")
+    while True:
+        try:
+            popped = await _valkey_async.blpop("queue:waiting", timeout=5)
+            if not popped:
+                continue
+            _key, job_id = popped
+            await _run_one_job(job_id)
+        except asyncio.CancelledError:
+            log.info(f"[worker {worker_id}] cancelled")
+            raise
+        except Exception as e:
+            log.error(f"[worker {worker_id}] outer loop error: {e}")
+            traceback.print_exc()
+            await asyncio.sleep(2)  # tiny backoff so we don't tight-loop on the same error
+
+
+async def _run_one_job(job_id: str):
+    """Dispatch one job end-to-end. Handles cache lookup, state transitions,
+    failure recording, file cleanup. Never raises — failures are recorded
+    on the job hash so clients see them via /api/jobs/{id}."""
+    job = await _read_job(job_id)
+    if not job:
+        log.warning(f"[worker] {job_id} popped but hash missing — dropping")
+        return
+    # Already-terminal guard. Two paths can land us here:
+    #   1. Cancelled between BLPOP and this read (rare — cancel's LREM would
+    #      normally fail because we already popped, but the race exists).
+    #   2. Duplicate enqueue from crash recovery scaling out beyond one
+    #      whisper container (we don't today, but defense-in-depth is cheap).
+    # Either way: skip silently, the result is already authoritative.
+    if job.get("status") in _JOB_TERMINAL:
+        log.info(f"[worker] {job_id} already {job.get('status')} — skipping")
+        return
+    payload = job.get("payload") or {}
+    await _valkey_async.sadd("jobs:active", job_id)
+    await _valkey_async.hset(_job_key(job_id), mapping={
+        "status": JOB_STATUS_RUNNING,
+        "started_at": _now_iso(),
+    })
+    log.info(f"[worker] running {job_id}: {payload.get('file_path', '?')}")
+    try:
+        result = await _execute_transcription(payload)
+        await _valkey_async.hset(_job_key(job_id), mapping={
+            "status": JOB_STATUS_DONE,
+            "result": json.dumps(result),
+            "completed_at": _now_iso(),
+        })
+        log.info(f"[worker] done {job_id}: {str(result.get('status', ''))[:80]}")
+    except Exception as e:
+        log.error(f"[worker] failed {job_id}: {e}")
+        traceback.print_exc()
+        permanent = isinstance(e, PermanentJobError)
+        await _valkey_async.hset(_job_key(job_id), mapping={
+            "status": JOB_STATUS_FAILED,
+            "error": str(e),
+            "permanent": "1" if permanent else "0",
+            "completed_at": _now_iso(),
+        })
+    finally:
+        await _valkey_async.srem("jobs:active", job_id)
+        await _valkey_async.lpush("jobs:recent", job_id)
+        await _valkey_async.ltrim("jobs:recent", 0, JOB_RECENT_LIMIT - 1)
+        await _valkey_async.expire(_job_key(job_id), JOB_TTL)
+
+
+async def _execute_transcription(payload: dict) -> dict:
+    """Run the actual whisper transcription, with cache-hit short-circuit."""
+    file_path = (payload.get("file_path") or "").strip()
+    if not file_path or not os.path.isfile(file_path):
+        raise PermanentJobError(f"file not found: {file_path}")
+
+    model = payload.get("model", "turbo")
+    language = payload.get("language", "Auto-detect")
+    diarize = bool(payload.get("diarize", False))
+
+    # Cache lookup before whisper runs — different consumers transcribing
+    # the same video share results. Hash the file in a thread; for multi-GB
+    # audio sync I/O would block the event loop for several seconds and
+    # stall /api/status / /api/queue polls from other clients.
+    cache_key = await asyncio.to_thread(
+        _transcript_cache_key, file_path, model, language, diarize
+    )
+    cached = await _cache_get_transcript(cache_key)
+    if cached:
+        log.info(f"[worker] transcript cache hit: {cache_key[:40]}...")
+        # subtitle_file is intentionally NOT cached (ephemeral path). Null
+        # it on cache hit so callers don't try to read a deleted file. If
+        # they need an SRT they can re-run with `cleanup=false` on a fresh
+        # file or generate one client-side from the transcript text.
+        result = {**cached, "cached": True, "subtitle_file": None}
+        if payload.get("cleanup"):
+            _cleanup_payload_file(file_path)
+        return result
+
+    return_file = bool(payload.get("return_file", True))
+
+    # Run whisper in a thread so the asyncio loop stays responsive
+    # (status endpoints, queue polls, healthcheck). The transcription
+    # itself is CPU/GPU bound and synchronous.
+    result = await asyncio.to_thread(
+        _run_transcription,
+        file_path,
+        model_name=model,
+        language=language,
+        output_format=payload.get("format", "txt"),
+        enable_diarization=diarize,
+        min_speakers=payload.get("min_speakers", 0),
+        max_speakers=payload.get("max_speakers", 0),
+        batch_size=payload.get("batch_size"),
+        hotwords=payload.get("hotwords", ""),
+        initial_prompt=payload.get("initial_prompt", ""),
+        suppress_numerals=payload.get("suppress_numerals", False),
+        return_file=return_file,
+    )
+    result["cached"] = False
+
+    # Cache successful runs only. Whisper returns "Error: ..." on internal
+    # failures (CUDA OOM, prompt overflow) — don't poison cache with those.
+    # Cache the reproducible fields only — subtitle_file is an ephemeral
+    # /tmp path that won't exist on the next cache hit.
+    status = result.get("status", "") or ""
+    if status and not status.lower().startswith("error"):
+        cacheable = {
+            "status": status,
+            "transcript": result.get("transcript", ""),
+        }
+        await _cache_set_transcript(cache_key, cacheable)
+
+    # Reclaim the subtitle file when caller said it didn't want one. Same
+    # rationale as the legacy /api/transcribe path: avoid the leak window if
+    # the response is dropped + skip the disk write on a per-call basis.
+    if not return_file:
+        subtitle_file = result.get("subtitle_file")
+        if subtitle_file and os.path.isfile(subtitle_file):
+            try:
+                os.remove(subtitle_file)
+                log.info(f"[worker] cleaned subtitle file (return_file=false): {subtitle_file}")
+            except OSError as e:
+                log.warning(f"[worker] subtitle cleanup failed: {e}")
+
+    if payload.get("cleanup"):
+        _cleanup_payload_file(file_path)
+
+    return result
+
+
+def _cleanup_payload_file(file_path: str) -> None:
+    """Remove the source file + its yt-dlp parent dir if empty. Synchronous
+    — file system, not network — so safe to call from async paths."""
+    if not os.path.isfile(file_path):
+        return
+    try:
+        parent = os.path.dirname(file_path)
+        os.remove(file_path)
+        if parent.startswith("/tmp/yt-dlp-") and not os.listdir(parent):
+            os.rmdir(parent)
+        log.info(f"[worker] cleaned up {file_path}")
+    except Exception as e:
+        log.warning(f"[worker] cleanup failed for {file_path}: {e}")
+
+
+async def _recover_active_jobs():
+    """On startup, re-queue any job that was running at last shutdown.
+
+    Single-worker single-GPU = safe to retry; whisperx is idempotent.
+    Without this, a crash mid-transcription leaves the job stuck in
+    'running' forever and clients poll it indefinitely.
+    """
+    if not _queue_available:
+        return
+    active = await _valkey_async.smembers("jobs:active")
+    if not active:
+        return
+    log.warning(f"[recovery] {len(active)} job(s) running at last shutdown — re-queueing")
+    for job_id in active:
+        await _valkey_async.srem("jobs:active", job_id)
+        await _valkey_async.hset(_job_key(job_id), mapping={"status": JOB_STATUS_QUEUED})
+        await _valkey_async.hdel(_job_key(job_id), "started_at")
+        # LPUSH (not RPUSH) so recovered jobs run first — they were already
+        # at the front before the crash, fairness-wise.
+        await _valkey_async.lpush("queue:waiting", job_id)
+
+
+async def _worker_startup():
+    """Lifespan startup. Connects to valkey, recovers stale active jobs,
+    spawns WORKER_CONCURRENCY worker tasks."""
+    if not _init_valkey():
+        return
+    await _recover_active_jobs()
+    for i in range(max(1, WORKER_CONCURRENCY)):
+        task = asyncio.create_task(_job_worker(i))
+        _worker_tasks.append(task)
+    log.info(f"[queue] {len(_worker_tasks)} worker(s) started")
+
+
+async def _worker_shutdown():
+    """Lifespan shutdown. Cancels workers; in-flight job (if any) will be
+    re-queued by _recover_active_jobs on the next start."""
+    for task in _worker_tasks:
+        task.cancel()
+    for task in _worker_tasks:
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    _worker_tasks.clear()
+
+
 # -- HTTP API (for MCP server / programmatic access) --------------------------
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -2009,9 +2486,18 @@ from starlette.routing import Route
 
 
 async def api_status(request: Request):
-    """GET /api/status — GPU info, ready state, capabilities."""
+    """GET /api/status — GPU info, ready state, capabilities.
+
+    `busy` reflects whether a transcription is currently running. Clients
+    (e.g. the Discord bot) poll this before submitting to /api/transcribe
+    so they can wait for the GPU instead of burning retry budget against
+    repeated 409s. The 409 contract on /api/transcribe is unchanged — this
+    is purely an opportunistic pre-flight check (race-safe because callers
+    still handle 409 on the actual submit).
+    """
     return JSONResponse({
         "status": "ready",
+        "busy": _transcription_lock.locked(),
         "gpu": GPU_INFO_STR,
         "device": DEVICE,
         "compute_type": COMPUTE_TYPE,
@@ -2225,6 +2711,12 @@ def _run_transcription(file_path, model_name="turbo", language="Auto-detect",
 async def api_transcribe(request: Request):
     """POST /api/transcribe — transcribe a local file.
 
+    DEPRECATED: prefer POST /api/jobs (async, queued, persistent). This
+    endpoint is preserved for backwards compatibility with ad-hoc curl
+    users; the Discord bot and MCP server have migrated to /api/jobs.
+    Default behaviour now returns 202 + job_id (same as /api/jobs).
+    Pass `wait: true` in the body for legacy sync behaviour.
+
     Body fields:
       file_path:     str   (required) path on the whisper container's filesystem
       model:         str   (default "turbo")
@@ -2243,23 +2735,83 @@ async def api_transcribe(request: Request):
                      dropped by the client).
       cleanup:       bool  (default false) remove file_path + its parent
                      yt-dlp tmp dir on completion (success or failure).
+      wait:          bool  (default false) — legacy sync mode. When true,
+                     blocks until the job completes and returns the result
+                     inline (same shape as before). When false (default),
+                     returns 202 + {job_id} and caller polls /api/jobs/{id}.
 
-    Returns: {"status": "...", "transcript": "...", "subtitle_file": "..."}
-    `subtitle_file` is null when return_file=false.
+    Returns:
+      wait=true:  {"status": "...", "transcript": "...", "subtitle_file": "..."}
+      wait=false: 202 + {"job_id": "...", "status": "queued", "position": N}
     """
     body = await request.json()
-    file_path = body.get("file_path", "").strip()
+    file_path = (body.get("file_path") or "").strip()
     if not file_path or not os.path.isfile(file_path):
         return JSONResponse({"error": f"file not found: {file_path}"}, status_code=400)
 
+    wait = bool(body.get("wait", False))
+
+    # Queue path: when valkey is reachable, route through the queue so all
+    # consumers serialise on the same FIFO instead of fighting over a lock.
+    if _queue_available:
+        # Build the payload from the legacy /api/transcribe body shape. The
+        # worker accepts the same keys, so this is a passthrough.
+        consumer = (body.get("consumer") or
+                    request.headers.get("x-consumer") or
+                    "api-transcribe")
+        try:
+            state = await _enqueue_job(body, consumer=consumer)
+        except Exception as e:
+            log.error(f"[API] enqueue failed: {e}")
+            return JSONResponse({"error": f"enqueue failed: {e}"}, status_code=500)
+        job_id = state["id"]
+        if not wait:
+            position = await _job_position(job_id)
+            return JSONResponse({
+                "job_id": job_id,
+                "status": JOB_STATUS_QUEUED,
+                "position": position,
+            }, status_code=202)
+        # Sync mode: poll until terminal, then return the result inline.
+        return await _wait_and_return_job(job_id)
+
+    # Fallback: legacy lock-based sync path when queue is unavailable.
+    # Preserves the 409 contract for ad-hoc curl users who hit a whisper
+    # service running without valkey.
+    return await _legacy_sync_transcribe(body, file_path)
+
+
+async def _wait_and_return_job(job_id: str) -> JSONResponse:
+    """Block on a job until terminal, return its result in the legacy
+    /api/transcribe response shape. Used by `wait=true` callers."""
+    while True:
+        job = await _read_job(job_id)
+        if not job:
+            return JSONResponse({"error": "job vanished"}, status_code=500)
+        status = job.get("status")
+        if status == JOB_STATUS_DONE:
+            return JSONResponse(job.get("result") or {})
+        if status == JOB_STATUS_FAILED:
+            permanent = job.get("permanent", False)
+            return JSONResponse(
+                {"error": job.get("error", "unknown"), "permanent": permanent},
+                status_code=500,
+            )
+        if status == JOB_STATUS_CANCELLED:
+            return JSONResponse({"error": "cancelled"}, status_code=499)
+        await asyncio.sleep(1)
+
+
+async def _legacy_sync_transcribe(body: dict, file_path: str) -> JSONResponse:
+    """Pre-queue lock-based path. Kept for the case where valkey is down —
+    whisper degrades to single-consumer-at-a-time but still functions."""
     if not _transcription_lock.acquire(blocking=False):
         return JSONResponse({"error": "busy — another transcription is running"}, status_code=409)
 
     return_file = bool(body.get("return_file", True))
-    result_subtitle: str | None = None  # captured for error-path cleanup
+    result_subtitle: str | None = None
 
     try:
-        import asyncio
         result = await asyncio.to_thread(
             _run_transcription,
             file_path,
@@ -2283,11 +2835,8 @@ async def api_transcribe(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
         _transcription_lock.release()
-        _reset_idle_timer()  # reset countdown after API job ends
+        _reset_idle_timer()
 
-        # Reclaim the subtitle file when caller said it didn't want one
-        # (we may still have generated one if return_file flipped between
-        # run start and cleanup, or to handle older clients explicitly).
         if not return_file and result_subtitle and os.path.isfile(result_subtitle):
             try:
                 os.remove(result_subtitle)
@@ -2295,17 +2844,111 @@ async def api_transcribe(request: Request):
             except OSError as e:
                 log.warning(f"[API] Subtitle cleanup failed: {e}")
 
-        # Cleanup temp source file if requested
         if body.get("cleanup") and os.path.isfile(file_path):
             try:
                 parent = os.path.dirname(file_path)
                 os.remove(file_path)
-                # Remove parent if it's a yt-dlp temp dir and now empty
                 if parent.startswith("/tmp/yt-dlp-") and not os.listdir(parent):
                     os.rmdir(parent)
                 log.info(f"[API] Cleaned up temp file: {file_path}")
             except Exception as e:
                 log.warning(f"[API] Cleanup failed for {file_path}: {e}")
+
+
+# ── /api/jobs* (server-side queue) ───────────────────────────────────────────
+
+
+async def api_jobs_submit(request: Request):
+    """POST /api/jobs — submit a transcription job. Returns 202 + job_id.
+
+    Same body shape as POST /api/transcribe. The submitter doesn't block;
+    poll GET /api/jobs/{id} for status and result. Lets multiple consumers
+    (Discord bot, MCP, Gradio UI, curl) serialise on a single FIFO instead
+    of each implementing their own busy-wait against 409s.
+
+    Optional `consumer` field (or `X-Consumer` header) tags the job for
+    /api/queue visibility. Free-form string.
+    """
+    if not _queue_available:
+        return JSONResponse(
+            {"error": "queue backend unavailable; use /api/transcribe with wait=true"},
+            status_code=503,
+        )
+    body = await request.json()
+    file_path = (body.get("file_path") or "").strip()
+    if not file_path:
+        return JSONResponse({"error": "file_path is required"}, status_code=400)
+    # We intentionally do NOT check os.path.isfile here — the worker re-checks
+    # at dequeue time. Submission can race with download cleanup and we'd
+    # rather let the worker emit a PermanentJobError than fail the submit.
+
+    consumer = (body.get("consumer") or
+                request.headers.get("x-consumer") or
+                "unknown")
+    try:
+        state = await _enqueue_job(body, consumer=consumer)
+    except Exception as e:
+        return JSONResponse({"error": f"enqueue failed: {e}"}, status_code=500)
+    position = await _job_position(state["id"])
+    return JSONResponse({
+        "job_id": state["id"],
+        "status": state["status"],
+        "submitted_at": state["submitted_at"],
+        "position": position,
+    }, status_code=202)
+
+
+async def api_jobs_get(request: Request):
+    """GET /api/jobs/{job_id} — fetch job state + result.
+
+    Response shape varies by status:
+      queued:    {status, position, submitted_at}
+      running:   {status, started_at}
+      done:      {status, result, completed_at}
+      failed:    {status, error, permanent, completed_at}
+      cancelled: {status, completed_at}
+    """
+    if not _queue_available:
+        return JSONResponse({"error": "queue backend unavailable"}, status_code=503)
+    job_id = request.path_params["job_id"]
+    job = await _read_job(job_id)
+    if not job:
+        return JSONResponse({"error": "job not found"}, status_code=404)
+    # Add live position for queued jobs (depth-dependent, can't be cached).
+    if job.get("status") == JOB_STATUS_QUEUED:
+        job["position"] = await _job_position(job_id)
+    return JSONResponse(job)
+
+
+async def api_jobs_cancel(request: Request):
+    """DELETE /api/jobs/{job_id} — cancel a queued job.
+
+    Only queued jobs can be cancelled — in-flight transcription has no
+    safe interruption point in whisperX. Callers who no longer want a
+    running job's result can just stop polling.
+    """
+    if not _queue_available:
+        return JSONResponse({"error": "queue backend unavailable"}, status_code=503)
+    job_id = request.path_params["job_id"]
+    ok, reason = await _cancel_job(job_id)
+    if ok:
+        return JSONResponse({"ok": True, "job_id": job_id, "status": JOB_STATUS_CANCELLED})
+    if reason == "not found":
+        return JSONResponse({"error": reason}, status_code=404)
+    if reason.startswith("already") or reason == "cannot cancel in-flight job":
+        return JSONResponse({"error": reason}, status_code=409)
+    return JSONResponse({"error": reason}, status_code=500)
+
+
+async def api_queue_info(request: Request):
+    """GET /api/queue — queue depth, active jobs, recent terminal jobs.
+
+    Operators (and the Discord bot's `/status` slash command) use this
+    to show users their position in line. Bounded — `recent` is the
+    last 20 terminal jobs, `active` is the workers currently busy
+    (1 today, more when WORKER_CONCURRENCY > 1).
+    """
+    return JSONResponse(await _queue_info())
 
 
 # ─── VLM frame description ────────────────────────────────────────────────────
@@ -3244,6 +3887,11 @@ API_ROUTES = [
     Route("/api/transcribe", api_transcribe, methods=["POST"]),
     Route("/api/describe", api_describe, methods=["POST"]),
     Route("/api/cleanup", api_cleanup, methods=["POST"]),
+    # Server-side job queue (Valkey-backed). New default — bot/MCP use these.
+    Route("/api/jobs", api_jobs_submit, methods=["POST"]),
+    Route("/api/jobs/{job_id}", api_jobs_get, methods=["GET"]),
+    Route("/api/jobs/{job_id}", api_jobs_cancel, methods=["DELETE"]),
+    Route("/api/queue", api_queue_info, methods=["GET"]),
 ]
 
 
@@ -3254,7 +3902,13 @@ try:
     import uvicorn
     from starlette.applications import Starlette
 
-    app = Starlette(routes=API_ROUTES)
+    # Lifespan: bring up the job queue worker before accepting traffic,
+    # tear it down cleanly on SIGTERM. If valkey is unreachable, the worker
+    # tasks aren't started and /api/jobs returns 503 — /api/transcribe with
+    # wait=true still works via the legacy lock path.
+    app = Starlette(routes=API_ROUTES,
+                    on_startup=[_worker_startup],
+                    on_shutdown=[_worker_shutdown])
     app = gr.mount_gradio_app(app, demo, path="/", theme=THEME, css=CSS, js="""
 () => {
     const observer = new MutationObserver(() => {

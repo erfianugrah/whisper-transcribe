@@ -83,7 +83,11 @@ llm-compose. Override anything you want in `.env`.
 |----------|--------|-------------|
 | `/api/status` | GET | GPU info, service status, VLM availability |
 | `/api/yt-download` | POST | Download audio (and optionally video) from any yt-dlp-supported URL |
-| `/api/transcribe` | POST | Transcribe a local file |
+| `/api/jobs` | POST | Submit a transcription job (async, queued) — **preferred** |
+| `/api/jobs/{id}` | GET | Job status + result |
+| `/api/jobs/{id}` | DELETE | Cancel a queued job (running jobs can't be cancelled) |
+| `/api/queue` | GET | Queue depth, active jobs, recent terminal jobs |
+| `/api/transcribe` | POST | Transcribe (deprecated sync wrapper around `/api/jobs`) |
 | `/api/describe` | POST | Extract frames + describe via VLM (silent-video fallback) |
 | `/api/cleanup` | POST | Remove a yt-dlp temp file (best-effort) |
 
@@ -95,7 +99,12 @@ llm-compose. Override anything you want in `.env`.
 
 Returns: `{"filename": "...", "title": "...", "duration": 123}`
 
-### POST /api/transcribe
+### POST /api/jobs (preferred)
+
+Async job submission. All consumers (bot, MCP, Gradio UI, ad-hoc curl)
+share a single Valkey-backed FIFO — no more 409 races on concurrent
+submits. Submitter gets a `job_id` immediately and polls
+`GET /api/jobs/{id}` until terminal.
 
 ```json
 {
@@ -104,11 +113,56 @@ Returns: `{"filename": "...", "title": "...", "duration": 123}`
   "language": "Auto-detect",
   "format": "txt",
   "diarize": false,
+  "cleanup": true,
+  "consumer": "my-script"
+}
+```
+
+Returns 202: `{"job_id": "wbx_a1b2c3d4", "status": "queued", "position": 3}`
+
+### GET /api/jobs/{id}
+
+Status snapshot. Shape varies by state:
+
+```json
+// queued
+{"status": "queued", "position": 2, "submitted_at": "2026-05-12T13:57:00Z"}
+
+// running
+{"status": "running", "started_at": "..."}
+
+// done
+{"status": "done", "result": {"status": "Done -- 4321 segments",
+                              "transcript": "...", "subtitle_file": null,
+                              "cached": false},
+ "completed_at": "..."}
+
+// failed
+{"status": "failed", "error": "CUDA OOM", "permanent": false, "completed_at": "..."}
+```
+
+### POST /api/transcribe (legacy)
+
+**Deprecated** — prefer `/api/jobs`. Returns 202 + `job_id` by default
+(same shape as `/api/jobs`). Pass `"wait": true` in the body for the
+legacy sync behaviour where the call blocks until completion and the
+response is the result inline.
+
+```json
+{
+  "file_path": "/tmp/yt-dlp-xxx/id.wav",
+  "model": "turbo",
+  "wait": true,
   "cleanup": true
 }
 ```
 
-Returns: `{"status": "Done -- ...", "transcript": "...", "subtitle_file": "..."}`
+When `wait=true` returns `{"status": "Done -- ...", "transcript": "...",
+"subtitle_file": "..."}` exactly as before. When `wait=false` (default),
+returns 202 + `{"job_id": "...", ...}` — caller polls `/api/jobs/{id}`.
+
+If Valkey is unreachable, this endpoint falls through to a single-slot
+lock-based path and returns 409 when busy (pre-queue behaviour).
 
 ## MCP Server (optional)
 
@@ -141,6 +195,11 @@ directly — same surface area.
 | `VLM_FRAME_CONCURRENCY` | `4` | Parallel frame description requests |
 | `ALIGN_MODEL_CACHE_SIZE` | `4` | LRU cap for wav2vec2 alignment models |
 | `YT_DLP_COOKIES_FILE` | — | Optional cookies.txt path for age-gated / bot-flagged videos |
+| `VALKEY_URL` | `redis://valkey:6379/0` | Job queue backing store |
+| `TRANSCRIPT_CACHE_TTL` | `604800` | Shared transcript cache TTL (seconds; default 7d) |
+| `JOB_TTL` | `3600` | How long terminal job hashes stick around (seconds) |
+| `JOB_RECENT_LIMIT` | `100` | Cap on `jobs:recent` list (for `/api/queue`) |
+| `WORKER_CONCURRENCY` | `1` | Number of parallel transcription workers (single GPU → 1) |
 
 ### Discord bot
 | Variable | Default | Description |
@@ -177,6 +236,7 @@ directly — same surface area.
 | `WAYBACK_TIMEOUT` | `8` | Seconds to wait on archive.org's /available endpoint |
 | `MAX_JOBS_PER_USER_PER_HOUR` | `20` | Per-user sliding-window rate limit |
 | `MAX_QUEUE_SIZE` | `40` | Global queue cap |
+| `JOB_POLL_INTERVAL` | `3` | Seconds between `/api/jobs/{id}` polls while a transcription runs |
 
 See `.env.example` and `bot/.env.example` for the full list.
 
@@ -187,7 +247,13 @@ See `.env.example` and `bot/.env.example` for the full list.
 [whisper service]──────┤                                          GPU (~32GB)
   whisperX + alignment │
   + diarization +      ├─ HTTP API (:7860/api/*)
-  yt-dlp + ffmpeg      │
+  yt-dlp + ffmpeg      │     │
+                       │     └─ /api/jobs ─── enqueue ──┐
+                       │                                ▼
+                       │                          [valkey] ←─── queue: jobs + transcript cache
+                       │                                ▲
+                       │     ┌─ async worker pool ──────┘
+                       │     │     BLPOP → run → store result
                        └─ /api/describe ──┐
                                           │
                                           ▼  HTTP
@@ -200,6 +266,14 @@ See `.env.example` and `bot/.env.example` for the full list.
 [crawl4ai] (Playwright)│  /md
 [flaresolverr]         ┘  CF-challenge fallback
 ```
+
+Job queue: all consumers (Discord bot, MCP server, Gradio UI, ad-hoc curl)
+submit through `POST /api/jobs` and poll `GET /api/jobs/{id}`. The
+async worker pool inside the whisper container `BLPOP`s from Valkey,
+runs whisperx, writes the result back. Persistent (AOF) so a crash
+mid-transcription doesn't lose state — recovered jobs run first on
+restart. Transcript cache (sha1 of file content + decode settings) means
+re-summarising the same video skips whisper entirely.
 
 The bot is the only component talking to Discord. Discord connections are
 **outbound only** — no port forwarding, public IP, or DNS needed. Other Discord
@@ -216,5 +290,6 @@ alignment ~360MB). Crawl4AI and FlareSolverr each run their own Chromium
 |---------|-------|---------|
 | `whisper` | built locally | Transcription + VLM frame description |
 | `bot` | built locally | Discord interface |
+| `valkey` | `valkey/valkey:9-alpine` | Job queue + transcript cache (AOF-persisted) |
 | `crawl4ai` | `unclecode/crawl4ai:0.7.4` | Article scraper (readability → Markdown) |
 | `flaresolverr` | `ghcr.io/flaresolverr/flaresolverr:v3.4.6` | Cloudflare-challenge fallback |

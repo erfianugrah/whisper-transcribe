@@ -169,6 +169,19 @@ CACHE_DIR.mkdir(exist_ok=True)
 MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 RETRY_BACKOFF = [int(x) for x in _csv_env_list("RETRY_BACKOFF", "10,30,90")]
 
+# ─── Server-side job queue ────────────────────────────────────────────────────
+# Whisper now exposes a Valkey-backed FIFO queue at /api/jobs*. The bot
+# submits via POST /api/jobs (returns 202 + job_id) and polls
+# GET /api/jobs/{id} until the job is terminal. The queue serialises
+# across all consumers (us, MCP, Gradio UI, ad-hoc curl) so there's no
+# busy-wait dance against 409s.
+#
+# JOB_POLL_INTERVAL — seconds between status polls while a job is queued
+# or running. 3s is a good tradeoff: fast enough that ⏳ → 🎧 transitions
+# feel snappy, slow enough that we don't hammer /api/jobs/{id} for a
+# multi-hour transcription.
+JOB_POLL_INTERVAL = int(os.environ.get("JOB_POLL_INTERVAL", "3"))
+
 # ─── Summary tuning ───────────────────────────────────────────────────────────
 # Discord embed description hard cap is 4096 chars; leave safety margin so the
 # model's overshoot still fits in a single embed before send_long_embed splits.
@@ -277,10 +290,11 @@ YT_COMMENT_MIN_CHARS = int(os.environ.get("YT_COMMENT_MIN_CHARS", "40"))
 # Top-N substantive comments fed to the LLM after filtering+sorting.
 YT_COMMENT_SUMMARY_TOP_N = int(os.environ.get("YT_COMMENT_SUMMARY_TOP_N", "30"))
 
-# Per-call timeout for /api/transcribe. Long videos on slow models can
-# exceed the global session timeout (900s). Picked to be roughly equal
-# to VLM_TIMEOUT so audio + video pipelines align: a long-running job
-# that fails one side fails both sides predictably.
+# Upper bound on submit-and-poll-against-/api/jobs. Long videos on slow
+# models can exceed the global session timeout (900s); this caps the total
+# time the bot waits for whisper before giving up the poll loop and letting
+# the worker either retry or fail the job. The server keeps running it
+# regardless — we just stop listening.
 TRANSCRIBE_TIMEOUT = int(os.environ.get("TRANSCRIBE_TIMEOUT", "1800"))
 
 # ─── Exa search tuning ────────────────────────────────────────────────────────
@@ -1924,6 +1938,128 @@ PROCESSING_EMOJI = (
 )
 
 
+async def _submit_and_poll_transcribe(payload: dict, job: "Job") -> dict:
+    """Submit a transcription job to the server-side queue, poll until done,
+    return the result dict.
+
+    Maps server-side terminal status to bot exceptions:
+      done       → returns the result dict
+      failed (permanent=true)  → PermanentError (no retry)
+      failed (permanent=false) → RuntimeError (worker retries)
+      cancelled  → PermanentError (someone cancelled out-of-band)
+
+    Reactions:
+      queued → ⏳ already set by the caller before submit
+      running → ⏳ swapped to 🎧 (PROCESSING_EMOJI_VIDEO) the first time
+                we see status=running; caller already does this before
+                calling, so this is just a safety net.
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+
+    # Submit
+    async with http.post(
+        f"{WHISPER_API}/api/jobs",
+        json=payload,
+        timeout=aiohttp.ClientTimeout(total=30),
+    ) as resp:
+        if resp.status == 503:
+            # Valkey is down on the whisper side. The legacy /api/transcribe
+            # path still works but we don't fall through automatically —
+            # the operator should be aware and fix the queue.
+            raise RuntimeError("Whisper queue backend unavailable")
+        if resp.status != 202:
+            try:
+                body = await resp.json()
+            except Exception:
+                body = {"error": await resp.text()}
+            err = str(body.get("error", resp.status))
+            if (400 <= resp.status < 500) or body.get("permanent") \
+                    or _is_permanent_remote_error(err):
+                raise PermanentError(f"Job submit rejected ({resp.status}): {err}")
+            raise RuntimeError(f"Job submit failed ({resp.status}): {err}")
+        sub = await resp.json()
+
+    job_id = sub.get("job_id")
+    if not job_id:
+        raise RuntimeError(f"Job submit returned no job_id: {sub}")
+    log.info("[%s] queued as %s (position=%s)",
+             job.video_id, job_id, sub.get("position"))
+
+    # Poll until terminal. /api/jobs/{id} is cheap (single HGETALL on
+    # valkey) so 3s ticks are fine even at sustained load. TRANSCRIBE_TIMEOUT
+    # is the upper bound on total poll duration — past that we give up on
+    # the job (the server keeps running it; we just stop listening).
+    deadline = time.monotonic() + TRANSCRIBE_TIMEOUT
+    prev_status = None
+    transient_errors = 0
+    while time.monotonic() < deadline:
+        # Transient network blips (whisper restarting, momentary DNS
+        # flake) must NOT kill the poll — the job is still running on the
+        # server. We catch generic Exception (aiohttp.ClientError,
+        # asyncio.TimeoutError, OSError) and retry within the deadline.
+        # If errors persist for too long we eventually escalate.
+        try:
+            async with http.get(
+                f"{WHISPER_API}/api/jobs/{job_id}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 404:
+                    raise RuntimeError(f"job {job_id} vanished from server")
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(
+                        f"poll {job_id} failed ({resp.status}): {body[:200]}"
+                    )
+                data = await resp.json()
+        except RuntimeError:
+            # 404 / non-200 is authoritative — re-raise.
+            raise
+        except Exception as e:
+            transient_errors += 1
+            # 20 consecutive transient errors at 3s poll interval ≈ 1 min
+            # of total outage — escalate so we don't tie up the worker
+            # for hours on a wedged whisper.
+            if transient_errors >= 20:
+                raise RuntimeError(
+                    f"poll {job_id} keeps failing: {e}"
+                ) from e
+            log.debug("[%s] poll blip #%d (%s); retrying",
+                      job.video_id, transient_errors, e)
+            await asyncio.sleep(JOB_POLL_INTERVAL)
+            continue
+        transient_errors = 0  # reset on success
+
+        status = data.get("status")
+        if status != prev_status:
+            log.info("[%s] job %s -> %s", job.video_id, job_id, status)
+            prev_status = status
+
+        if status == "done":
+            result = data.get("result") or {}
+            if data.get("cached") or result.get("cached"):
+                log.info("[%s] (transcript came from server cache)", job.video_id)
+            return result
+        if status == "failed":
+            err = data.get("error", "unknown")
+            if data.get("permanent"):
+                raise PermanentError(f"Transcription failed: {err}")
+            raise RuntimeError(f"Transcription failed: {err}")
+        if status == "cancelled":
+            raise PermanentError(f"job {job_id} cancelled")
+        # queued or running — keep polling.
+        await asyncio.sleep(JOB_POLL_INTERVAL)
+
+    # Hit TRANSCRIBE_TIMEOUT before the job reached a terminal state. The
+    # server keeps running it; we just stop listening. RuntimeError (not
+    # PermanentError) so the worker retries — the next attempt's poll might
+    # catch the same job (now done) or the worker bumps it forward.
+    raise RuntimeError(
+        f"poll {job_id} exceeded TRANSCRIBE_TIMEOUT ({TRANSCRIBE_TIMEOUT}s); "
+        f"server still has the job — check /api/jobs/{job_id}"
+    )
+
+
 async def worker():
     """Sequential worker — one job at a time. Video jobs are GPU-bound (whisper);
     web jobs share the same LLM proxy used by video summaries, so even though
@@ -1940,6 +2076,9 @@ async def worker():
         job = await queue.get()
         last_error = None
         silent_drop = False
+        # GPU contention is now handled server-side by the queue at
+        # /api/jobs — busy-wait branches are gone. This loop only handles
+        # truly transient errors (network blips, LLM timeouts, etc.).
         for attempt in range(MAX_RETRIES + 1):
             try:
                 if attempt > 0:
@@ -2118,31 +2257,22 @@ async def process(job: Job):
             "cleanup": False,
             "return_file": False,  # bot uses transcript text directly
             "diarize": job.diarize,
+            "consumer": "discord-bot",
         }
         if initial_prompt:
             transcribe_payload["initial_prompt"] = initial_prompt
 
-        async with http.post(
-            f"{WHISPER_API}/api/transcribe",
-            json=transcribe_payload,
-            timeout=aiohttp.ClientTimeout(total=TRANSCRIBE_TIMEOUT),
-        ) as resp:
-            if resp.status == 409:
-                raise RuntimeError("Whisper busy — another transcription running")
-            if resp.status != 200:
-                try:
-                    body = await resp.json()
-                except Exception:
-                    body = {"error": await resp.text()}
-                err = str(body.get("error", resp.status))
-                if (400 <= resp.status < 500) or body.get("permanent") \
-                        or _is_permanent_remote_error(err):
-                    # Cleanup the file ourselves since we asked /api/transcribe not to.
-                    await _cleanup_remote_file(file_path)
-                    raise PermanentError(f"Transcription rejected ({resp.status}): {err}")
-                await _cleanup_remote_file(file_path)
-                raise RuntimeError(f"Transcription failed: {err}")
-            result = await resp.json()
+        # Submit to the server-side queue + poll until terminal. The queue
+        # serialises across all consumers (us, MCP, Gradio, ad-hoc curl) so
+        # there's no busy-wait dance against 409s any more.
+        try:
+            result = await _submit_and_poll_transcribe(transcribe_payload, job)
+        except PermanentError:
+            await _cleanup_remote_file(file_path)
+            raise
+        except Exception:
+            await _cleanup_remote_file(file_path)
+            raise
 
         transcript = result["transcript"]
         status = result.get("status", "")
@@ -4328,7 +4458,7 @@ def _interleave_by_timestamp(speech_text: str, visual_text: str) -> str:
 async def _cleanup_remote_file(file_path: str) -> None:
     """Best-effort cleanup of a file on the whisper container.
 
-    Used when we asked /api/transcribe with cleanup=False (so the VLM had a
+    Used when we asked /api/jobs with cleanup=False (so the VLM had a
     chance to use the file) and now no longer need it. Idempotent on the
     server side; swallows errors here since failure just leaves a temp file
     that gets reaped at container restart.

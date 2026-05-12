@@ -1149,14 +1149,17 @@ def test_chunk_preamble_anchors_timestamps():
 
 
 def test_transcribe_call_has_explicit_timeout():
-    """/api/transcribe POST overrides the 900s session default — long videos
-    on slow models would otherwise time out before completing."""
+    """Submit + poll cycle bounded by TRANSCRIBE_TIMEOUT — long videos
+    on slow models would otherwise hang the bot worker indefinitely if the
+    server-side job got wedged."""
     assert "TRANSCRIBE_TIMEOUT" in BOT_SRC
-    # Verify the constant exists and is sane
+    # Constant exists and is sane (>= 10 min)
     assert hasattr(bot, "TRANSCRIBE_TIMEOUT")
     assert bot.TRANSCRIBE_TIMEOUT >= 600
-    # And that the call site uses it
-    assert "ClientTimeout(total=TRANSCRIBE_TIMEOUT)" in BOT_SRC
+    # Used as the upper bound on the submit/poll loop deadline
+    assert "time.monotonic() + TRANSCRIBE_TIMEOUT" in BOT_SRC
+    # And the loop honours the deadline
+    assert "while time.monotonic() < deadline" in BOT_SRC
 
 
 def test_send_long_embed_total_size_guard():
@@ -3204,6 +3207,7 @@ def test_env_overrides_respected():
     os.environ["LLM_MAX_TOKENS_BRIEF"] = "100"
     os.environ["VIDEO_DOMAINS"] = "foo.com,bar.com"
     os.environ["EXA_NUM_RESULTS"] = "10"
+    os.environ["JOB_POLL_INTERVAL"] = "5"
 
     importlib.reload(bot)
     try:
@@ -3213,14 +3217,294 @@ def test_env_overrides_respected():
         assert bot.LLM_MAX_TOKENS_BRIEF == 100
         assert bot.VIDEO_DOMAINS == {"foo.com", "bar.com"}
         assert bot.EXA_NUM_RESULTS == 10
+        assert bot.JOB_POLL_INTERVAL == 5
     finally:
         # Cleanup: restore env AND reload bot back to its default state, so
         # subsequent tests see the production VIDEO_URL_PATTERN. Without this
         # reload the mutated regex leaks across the rest of the suite.
         for k in ("MAX_RETRIES", "RETRY_BACKOFF", "LLM_TEMPERATURE",
-                  "LLM_MAX_TOKENS_BRIEF", "VIDEO_DOMAINS", "EXA_NUM_RESULTS"):
+                  "LLM_MAX_TOKENS_BRIEF", "VIDEO_DOMAINS", "EXA_NUM_RESULTS",
+                  "JOB_POLL_INTERVAL"):
             os.environ.pop(k, None)
         importlib.reload(bot)
+
+
+# ─── 13. Server-side job queue (/api/jobs* on whisper, async bot client) ────
+
+
+# -- Server (app.py) -----------------------------------------------------------
+
+
+def test_app_has_valkey_imports():
+    """app.py must import the new deps at module level so they're loaded
+    once at startup, not inside hot paths."""
+    assert "import hashlib" in APP_SRC
+    assert "import uuid" in APP_SRC
+    assert "import asyncio" in APP_SRC
+
+
+def test_app_queue_constants_env_overridable():
+    """Queue knobs must read from env so operators can tune without code
+    changes."""
+    for knob in (
+        'VALKEY_URL = os.environ.get("VALKEY_URL"',
+        'TRANSCRIPT_CACHE_TTL = int(os.environ.get("TRANSCRIPT_CACHE_TTL"',
+        'JOB_TTL = int(os.environ.get("JOB_TTL"',
+        'JOB_RECENT_LIMIT = int(os.environ.get("JOB_RECENT_LIMIT"',
+        'WORKER_CONCURRENCY = int(os.environ.get("WORKER_CONCURRENCY"',
+    ):
+        assert knob in APP_SRC, f"missing env knob: {knob}"
+
+
+def test_app_queue_states():
+    """All five terminal/non-terminal states must be defined as constants
+    so handlers can compare against them rather than string-literal-typing."""
+    for state in (
+        'JOB_STATUS_QUEUED = "queued"',
+        'JOB_STATUS_RUNNING = "running"',
+        'JOB_STATUS_DONE = "done"',
+        'JOB_STATUS_FAILED = "failed"',
+        'JOB_STATUS_CANCELLED = "cancelled"',
+    ):
+        assert state in APP_SRC
+
+
+def test_app_permanent_job_error_class():
+    """Server-side permanent failures (file not found, oversized input)
+    must be distinguished from transient ones (CUDA OOM, network blip)
+    via PermanentJobError → stored as `permanent: 1` on the job hash."""
+    assert "class PermanentJobError" in APP_SRC
+    assert 'isinstance(e, PermanentJobError)' in APP_SRC
+
+
+def test_app_queue_endpoints_registered():
+    """All four new endpoints must be wired into API_ROUTES."""
+    assert 'Route("/api/jobs", api_jobs_submit, methods=["POST"])' in APP_SRC
+    assert 'Route("/api/jobs/{job_id}", api_jobs_get, methods=["GET"])' in APP_SRC
+    assert 'Route("/api/jobs/{job_id}", api_jobs_cancel, methods=["DELETE"])' in APP_SRC
+    assert 'Route("/api/queue", api_queue_info, methods=["GET"])' in APP_SRC
+
+
+def test_app_worker_lifespan_wired():
+    """Worker tasks must start/stop with the app lifespan, not as bare
+    threads — otherwise SIGTERM during a Compose restart leaves workers
+    in limbo and active jobs would be wedged across the restart."""
+    assert "on_startup=[_worker_startup]" in APP_SRC
+    assert "on_shutdown=[_worker_shutdown]" in APP_SRC
+
+
+def test_app_crash_recovery_on_startup():
+    """Active jobs from a previous run must be re-queued at startup. Without
+    this, a crash mid-transcription leaves the job stuck in `running` and
+    clients poll it forever."""
+    assert "async def _recover_active_jobs" in APP_SRC
+    assert "_recover_active_jobs()" in APP_SRC
+    # Recovery must push to the FRONT (LPUSH) so recovered jobs run before
+    # newly-submitted ones — they were already at the head pre-crash.
+    recovery_section = APP_SRC[APP_SRC.index("async def _recover_active_jobs"):
+                                APP_SRC.index("async def _worker_startup")]
+    assert "lpush(\"queue:waiting\"" in recovery_section
+
+
+def test_app_transcript_cache_key_includes_settings():
+    """Cache must key on file content + decode settings — different model
+    or language must NOT collide."""
+    src = APP_SRC[APP_SRC.index("def _transcript_cache_key"):
+                  APP_SRC.index("def _transcript_cache_key") + 1000]
+    # Filename intentionally NOT in the key — same audio at different paths
+    # shares cache.
+    assert "_sha1_file(file_path)" in src
+    # All three setting axes must contribute.
+    assert "{model}" in src
+    assert "{language}" in src
+    assert "diarize" in src
+
+
+def test_app_cache_only_writes_successful_runs():
+    """Whisper's "Error: ..." status must NOT be cached — otherwise a
+    transient CUDA OOM would poison the cache for 7 days."""
+    src = APP_SRC[APP_SRC.index("async def _execute_transcription"):]
+    next_def = src.index("\nasync def ") if "\nasync def " in src else len(src)
+    exec_src = src[:next_def]
+    # The conditional must be present; cache write is gated.
+    assert "not status.lower().startswith(\"error\")" in exec_src
+    assert "_cache_set_transcript" in exec_src
+
+
+def test_app_transcribe_routes_through_queue():
+    """When valkey is available, /api/transcribe must enqueue + (optionally)
+    poll, NOT take the lock directly. The lock path is a fallback for when
+    valkey is down."""
+    src = APP_SRC[APP_SRC.index("async def api_transcribe"):
+                   APP_SRC.index("async def _wait_and_return_job")]
+    assert "if _queue_available" in src
+    assert "_enqueue_job(body" in src
+    # Async-by-default: wait=true is opt-in.
+    assert 'body.get("wait", False)' in src
+    # 202 is the new default response on submit
+    assert "status_code=202" in src
+
+
+def test_app_transcribe_legacy_fallback_preserved():
+    """When valkey is unavailable, the legacy lock-based sync path must
+    still work — operators can run whisper standalone without valkey."""
+    assert "async def _legacy_sync_transcribe" in APP_SRC
+    legacy = APP_SRC[APP_SRC.index("async def _legacy_sync_transcribe"):]
+    next_def = legacy.index("\nasync def ") if "\nasync def " in legacy else len(legacy)
+    legacy_body = legacy[:next_def]
+    # Still uses the lock — that's the whole point of the fallback path.
+    assert "_transcription_lock.acquire" in legacy_body
+    # And returns 409 like before so curl users see the same error.
+    assert "status_code=409" in legacy_body
+
+
+def test_app_cancel_blocks_running_jobs():
+    """Cancellation must be queued-only — running jobs can't be cancelled
+    safely (whisperX has no checkpoint protocol, would leak GPU memory)."""
+    src = APP_SRC[APP_SRC.index("async def _cancel_job"):
+                  APP_SRC.index("async def _queue_info")]
+    assert "cannot cancel in-flight job" in src
+    assert "JOB_STATUS_RUNNING" in src
+
+
+# -- Bot (bot/main.py) ---------------------------------------------------------
+
+
+def test_bot_uses_api_jobs_not_api_transcribe():
+    """The bot must submit through the queue, not hit /api/transcribe
+    directly. /api/transcribe is for legacy curl users only."""
+    src = BOT_SRC
+    # The helper exists
+    assert "async def _submit_and_poll_transcribe" in src
+    # process() uses it (not a direct POST to /api/transcribe)
+    process_src = src[src.index("async def process(job: Job):"):
+                       src.index("async def process_url")]
+    assert "_submit_and_poll_transcribe(" in process_src
+    assert "/api/transcribe" not in process_src
+    # The submit helper POSTs to /api/jobs and polls /api/jobs/{id}
+    helper_src = src[src.index("async def _submit_and_poll_transcribe"):
+                      src.index("async def _submit_and_poll_transcribe") + 4000]
+    assert "/api/jobs" in helper_src
+    assert "/api/jobs/{job_id}" in helper_src
+
+
+def test_bot_tactical_busy_wait_removed():
+    """The WhisperBusyError + wait_for_whisper_idle tactical fix from the
+    previous PR must be GONE. The server-side queue handles GPU contention
+    so there's no need for client-side polling."""
+    assert "class WhisperBusyError" not in BOT_SRC
+    assert "async def wait_for_whisper_idle" not in BOT_SRC
+    assert "WHISPER_BUSY_TIMEOUT" not in BOT_SRC
+    assert "WHISPER_BUSY_POLL_INTERVAL" not in BOT_SRC
+    # And the worker is back to a plain for-loop (busy branch is gone)
+    assert "except WhisperBusyError" not in BOT_SRC
+
+
+def test_bot_job_poll_interval_env_overridable():
+    """Bot must read poll interval from env so ops can tune snappiness."""
+    assert 'JOB_POLL_INTERVAL = int(os.environ.get("JOB_POLL_INTERVAL"' in BOT_SRC
+
+
+def test_bot_poll_helper_maps_states_to_exceptions():
+    """The submit/poll helper must convert server-side terminal states to
+    bot-side exception types so the worker retry/permanent logic still works."""
+    src = BOT_SRC[BOT_SRC.index("async def _submit_and_poll_transcribe"):]
+    next_def = src.index("\nasync def ") if "\nasync def " in src else len(src)
+    helper_src = src[:next_def]
+    # failed + permanent → PermanentError (no retry)
+    assert 'data.get("permanent")' in helper_src
+    assert "PermanentError" in helper_src
+    # cancelled → PermanentError (don't auto-retry someone else's cancel)
+    assert '"cancelled"' in helper_src
+    # 503 → RuntimeError so worker can retry (queue might come back)
+    assert "resp.status == 503" in helper_src
+
+
+def test_bot_passes_consumer_tag():
+    """Bot submits with consumer='discord-bot' so /api/queue can identify
+    the source. Useful for operator visibility."""
+    src = BOT_SRC[BOT_SRC.index("transcribe_payload = {"):]
+    next_blank = src.index("\n\n")
+    payload_src = src[:next_blank]
+    assert '"consumer": "discord-bot"' in payload_src
+
+
+# -- Both layers ---------------------------------------------------------------
+
+
+def test_app_status_keeps_busy_field():
+    """The /api/status busy field from the tactical fix is still useful for
+    operators / Gradio UI — it must NOT be removed during the queue migration."""
+    assert '"busy": _transcription_lock.locked()' in APP_SRC
+
+
+def test_app_queue_info_uses_asyncio_gather():
+    """Regression guard: _queue_info used to wrap an async generator in a
+    list comprehension — `[j for j in (await _read_job(jid) for jid in ids)]`
+    — which is a runtime TypeError because list comprehensions can't iterate
+    async generators. Must use asyncio.gather instead."""
+    # The broken pattern (await inside genexpr passed to list comp) is gone.
+    assert "for jid in active_ids) if j]" not in APP_SRC
+    assert "for jid in recent_ids) if j]" not in APP_SRC
+    # And gather is used to fetch hashes in parallel.
+    snip = APP_SRC[APP_SRC.index("async def _queue_info"):
+                   APP_SRC.index("async def _queue_info") + 1500]
+    assert "asyncio.gather" in snip
+
+
+def test_app_sha1_offloaded_to_thread():
+    """_sha1_file does sync I/O on multi-GB audio files — must be wrapped in
+    asyncio.to_thread or it blocks the event loop and stalls /api/status /
+    /api/queue polls from other clients for several seconds."""
+    snip = APP_SRC[APP_SRC.index("async def _execute_transcription"):]
+    next_def = snip.index("\nasync def ") if "\nasync def " in snip else len(snip)
+    exec_src = snip[:next_def]
+    # The hash + cache-key derivation is done in a thread.
+    assert "asyncio.to_thread(" in exec_src
+    assert "_transcript_cache_key" in exec_src
+    # And specifically — the cache key derivation is the to_thread'd call.
+    assert "to_thread(\n        _transcript_cache_key" in exec_src \
+        or "to_thread(_transcript_cache_key" in exec_src
+
+
+def test_app_subtitle_file_not_cached():
+    """Regression guard: subtitle_file is an ephemeral /tmp path generated
+    by whisperX. Storing it in the transcript cache leaves callers with a
+    stale path on cache hit (file long since cleaned). Cache must store
+    only the reproducible fields (status, transcript)."""
+    snip = APP_SRC[APP_SRC.index("async def _execute_transcription"):]
+    next_def = snip.index("\nasync def ") if "\nasync def " in snip else len(snip)
+    exec_src = snip[:next_def]
+    # The cache write must use a stripped-down dict, not the full result.
+    assert "cacheable = {" in exec_src
+    # And cache hits must null out subtitle_file in the returned dict.
+    assert '"subtitle_file": None' in exec_src
+
+
+def test_app_worker_terminal_state_guard():
+    """Defensive: _run_one_job must skip jobs already in a terminal state
+    when popped. Catches the cancel-after-pop race and prevents duplicate
+    work if crash recovery ever scales beyond one container."""
+    snip = APP_SRC[APP_SRC.index("async def _run_one_job"):
+                   APP_SRC.index("async def _execute_transcription")]
+    assert "_JOB_TERMINAL" in snip
+    assert "already" in snip
+
+
+def test_bot_poll_tolerates_transient_errors():
+    """Network blips (whisper restart, DNS flake) must NOT kill the poll —
+    the job continues on the server regardless. Bot retries within the
+    deadline, escalates only on sustained outage."""
+    snip = BOT_SRC[BOT_SRC.index("async def _submit_and_poll_transcribe"):]
+    next_def = snip.index("\nasync def ") if "\nasync def " in snip else len(snip)
+    helper = snip[:next_def]
+    # Generic-Exception catch for transient errors
+    assert "except Exception as e:" in helper
+    # Counter so we eventually give up on sustained failures
+    assert "transient_errors" in helper
+    # RuntimeError (404 / non-200) must NOT be silently retried —
+    # it's authoritative and re-raised.
+    assert "except RuntimeError:" in helper
 
 
 # ─── Test runner ─────────────────────────────────────────────────────────────
