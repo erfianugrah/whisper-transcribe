@@ -3285,6 +3285,22 @@ def test_app_queue_endpoints_registered():
     assert 'Route("/api/queue", api_queue_info, methods=["GET"])' in APP_SRC
 
 
+def test_app_worker_handles_blpop_timeout_silently():
+    """valkey-py raises TimeoutError on BLPOP when its client socket
+    read-deadline fires before the server returns nil-on-empty. This is
+    normal behaviour on an idle queue — must be caught silently, NOT
+    logged as an error every 5 seconds."""
+    snip = APP_SRC[APP_SRC.index("async def _job_worker"):
+                   APP_SRC.index("async def _run_one_job")]
+    # Specific catch for the valkey TimeoutError + built-in TimeoutError
+    assert "_vk_exc.TimeoutError" in snip
+    # And it must NOT fall through to the generic Exception logger
+    timeout_branch = snip[snip.index("except (_vk_exc.TimeoutError"):
+                          snip.index("except Exception")]
+    assert "continue" in timeout_branch
+    assert "log.error" not in timeout_branch
+
+
 def test_app_worker_lifespan_wired():
     """Worker tasks must start/stop with the app lifespan, not as bare
     threads — otherwise SIGTERM during a Compose restart leaves workers

@@ -2408,6 +2408,14 @@ async def _job_worker(worker_id: int):
     instance per GPU. A poisoned job logs + records failure but never
     crashes the worker.
     """
+    # valkey-py raises valkey.exceptions.TimeoutError (a subclass of
+    # the built-in TimeoutError) when its temporary socket read-deadline
+    # for BLPOP fires before the server returns nil-on-empty. On a
+    # completely idle queue this is normal behaviour, NOT an error — we
+    # catch it specifically and continue silently. The wider `Exception`
+    # catch below is reserved for actual problems (valkey down, protocol
+    # error, poisoned response).
+    import valkey.exceptions as _vk_exc  # local import — symbol only used here
     log.info(f"[worker {worker_id}] started")
     while True:
         try:
@@ -2419,6 +2427,10 @@ async def _job_worker(worker_id: int):
         except asyncio.CancelledError:
             log.info(f"[worker {worker_id}] cancelled")
             raise
+        except (_vk_exc.TimeoutError, TimeoutError):
+            # Expected on idle queue — the client's socket read-deadline
+            # for the BLPOP fired. Just loop and BLPOP again.
+            continue
         except Exception as e:
             log.error(f"[worker {worker_id}] outer loop error: {e}")
             traceback.print_exc()
