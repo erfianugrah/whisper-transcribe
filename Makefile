@@ -237,6 +237,11 @@ def _passthrough_decorator(*a, **k):
     return _wrap
 app_commands.command = _passthrough_decorator
 app_commands.describe = _passthrough_decorator
+app_commands.autocomplete = _passthrough_decorator
+app_commands.Choice = type('Choice', (), {'__init__': lambda s,name='',value='': setattr(s,'name',name) or setattr(s,'value',value)})
+class _R:
+    def __class_getitem__(cls, item): return int
+app_commands.Range = _R
 sys.modules['discord.app_commands'] = app_commands
 discord.app_commands = app_commands
 # discord.ui stub

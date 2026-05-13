@@ -66,6 +66,18 @@ def _setup_stubs():
         return _wrap
     app_commands.command = _passthrough_decorator
     app_commands.describe = _passthrough_decorator
+    app_commands.autocomplete = _passthrough_decorator
+    # Choice is constructed at decoration time inside our autocomplete fns and
+    # also at call time. Stub captures kwargs so tests can inspect output.
+    app_commands.Choice = type("Choice", (), {
+        "__init__": lambda self, name="", value="": setattr(self, "name", name) or setattr(self, "value", value),
+    })
+
+    # Range is used as a type annotation: app_commands.Range[int, 1, 25].
+    class _Range:
+        def __class_getitem__(cls, item):
+            return int  # collapse to plain int for type checks
+    app_commands.Range = _Range
     app_commands.CommandTree = type("CT", (), {"__init__": lambda s, *a, **k: None})
     sys.modules["discord.app_commands"] = app_commands
     discord.app_commands = app_commands
@@ -1195,14 +1207,26 @@ def test_send_long_embed_total_size_guard():
 
 
 def test_chan_cfg_vlm_enabled_wired():
-    """Per-channel vlm_enabled override flows from chan_cfg into Job."""
-    # On-message path
-    assert 'chan_cfg.get("vlm_enabled", VLM_ENABLED)' in BOT_SRC
-    # Slash-command paths (cmd_summarize + cmd_transcribe)
-    occurrences = BOT_SRC.count('chan_cfg.get("vlm_enabled", VLM_ENABLED)')
-    assert occurrences >= 3, (
-        f"vlm_enabled must be passed in on_message + cmd_summarize + cmd_transcribe "
-        f"(found {occurrences})"
+    """Per-channel vlm_enabled override flows from the effective config into Job.
+
+    The variable name changed from `chan_cfg` to `cfg` when per-user config
+    (`_effective_config`) was layered on top of per-channel config — the
+    behaviour is identical (channel wins on conflict), only the binding name
+    changed. The guard here is that vlm_enabled is read from a merged-config
+    dict at every Job construction site, not hardcoded.
+    """
+    # cfg.get("vlm_enabled", VLM_ENABLED) at every Job construction site:
+    # on_message + cmd_summarize + cmd_transcribe + reply-trigger video path.
+    occurrences = BOT_SRC.count('cfg.get("vlm_enabled", VLM_ENABLED)')
+    assert occurrences >= 4, (
+        f"vlm_enabled must be passed from cfg in on_message, reply-trigger, "
+        f"cmd_summarize, cmd_transcribe (found {occurrences})"
+    )
+    # Effective config helper exists and merges user + channel — guard against
+    # someone re-introducing `get_channel_config` at Job construction without
+    # also wiring user config.
+    assert "def _effective_config(" in BOT_SRC, (
+        "_effective_config must exist as the canonical merge helper"
     )
     # process() reads job.vlm_enabled, not module-level VLM_ENABLED.
     # Use a regex so reflows/parenthesisation (single-line or block) don't
@@ -3926,6 +3950,259 @@ def test_app_execute_transcription_respects_refresh():
     # so subsequent non-refresh runs benefit.
     write_section = exec_src[exec_src.index("# Cache successful runs"):]
     assert "if refresh:" not in write_section
+
+
+# ─── Inflight tracking + new helpers ─────────────────────────────────────────
+
+
+def _make_test_job(video_id="abc123", kind="video", url="https://example.com",
+                   submitter_id=1, channel_id=42, submitter_name="alice"):
+    """Build a Job that satisfies the discriminated-union invariant.
+    Stubs a Discord interaction object — enough for _inflight_register.
+    """
+    import types as _types
+    interaction = _types.SimpleNamespace(
+        user=_types.SimpleNamespace(id=submitter_id),
+        channel=_types.SimpleNamespace(id=channel_id),
+        followup=_types.SimpleNamespace(send=lambda *a, **k: None),
+    )
+    job = bot.Job(
+        url=url, video_id=video_id,
+        channel=_types.SimpleNamespace(id=channel_id),
+        submitter_id=submitter_id,
+        submitter_name=submitter_name,
+        kind=kind,
+        interaction=interaction,
+    )
+    return job
+
+
+def test_inflight_register_creates_entry():
+    """After _inflight_register, the entry is queryable by video_id and user."""
+    bot._inflight.clear()
+    job = _make_test_job(video_id="vid1", submitter_id=99)
+    bot._inflight_register(job)
+    assert "vid1" in bot._inflight
+    entry = bot._inflight["vid1"]
+    assert entry.bot_video_id == "vid1"
+    assert entry.submitter_id == 99
+    assert entry.phase == bot.PHASE_QUEUED
+    assert entry.started_at is None
+    assert entry.queued_at > 0
+
+
+def test_inflight_phase_transition_sets_started_at():
+    """Transitioning out of queued sets started_at exactly once."""
+    bot._inflight.clear()
+    job = _make_test_job(video_id="vid2")
+    bot._inflight_register(job)
+    bot._inflight_phase(job, bot.PHASE_DOWNLOADING)
+    e = bot._inflight["vid2"]
+    assert e.phase == bot.PHASE_DOWNLOADING
+    assert e.started_at is not None
+    first = e.started_at
+    # Second transition shouldn't reset started_at.
+    time.sleep(0.01)
+    bot._inflight_phase(job, bot.PHASE_TRANSCRIBING)
+    assert bot._inflight["vid2"].started_at == first
+
+
+def test_inflight_phase_carries_extra_fields():
+    """Title / duration / server_job_id can be set via _inflight_phase kwargs."""
+    bot._inflight.clear()
+    job = _make_test_job(video_id="vid3")
+    bot._inflight_register(job)
+    bot._inflight_phase(
+        job, bot.PHASE_TRANSCRIBING,
+        title="Some Title", duration=180, server_job_id="srv-abc",
+    )
+    e = bot._inflight["vid3"]
+    assert e.title == "Some Title"
+    assert e.duration == 180
+    assert e.server_job_id == "srv-abc"
+
+
+def test_inflight_phase_ignores_unknown_field():
+    """_inflight_phase silently drops unknown kwargs — guard against typos
+    propagating, but don't crash either."""
+    bot._inflight.clear()
+    job = _make_test_job(video_id="vid4")
+    bot._inflight_register(job)
+    bot._inflight_phase(job, bot.PHASE_DOWNLOADING, bogus="x")
+    assert "vid4" in bot._inflight
+    assert not hasattr(bot._inflight["vid4"], "bogus")
+
+
+def test_inflight_phase_noop_on_missing_entry():
+    """Defensive: phase update on a removed entry mustn't crash."""
+    bot._inflight.clear()
+    job = _make_test_job(video_id="vid5")
+    bot._inflight_phase(job, bot.PHASE_SUMMARIZING)  # never registered
+    assert "vid5" not in bot._inflight
+
+
+def test_inflight_remove_records_runtime():
+    """Completed entries with started_at >=1s feed the rolling average."""
+    bot._inflight.clear()
+    bot._completed_durations.clear()
+    job = _make_test_job(video_id="vid6", kind="video")
+    bot._inflight_register(job)
+    bot._inflight_phase(job, bot.PHASE_DOWNLOADING)
+    # Pretend the job ran for 5 seconds.
+    bot._inflight["vid6"].started_at = time.time() - 5.0
+    bot._inflight_remove("vid6", kind="video")
+    assert "vid6" not in bot._inflight
+    dq = bot._completed_durations["video"]
+    assert len(dq) == 1
+    assert 4.5 < dq[0] < 6.0
+
+
+def test_inflight_remove_skips_sub_second():
+    """<1s runtimes (cache hits) shouldn't skew the rolling average."""
+    bot._inflight.clear()
+    bot._completed_durations.clear()
+    job = _make_test_job(video_id="vid7", kind="web")
+    bot._inflight_register(job)
+    bot._inflight["vid7"].started_at = time.time() - 0.1
+    bot._inflight_remove("vid7", kind="web")
+    assert "web" not in bot._completed_durations or not bot._completed_durations["web"]
+
+
+def test_inflight_user_filters_by_user_id():
+    """Only the submitter's own entries are returned, sorted running-first."""
+    bot._inflight.clear()
+    a = _make_test_job(video_id="vA", submitter_id=1)
+    b = _make_test_job(video_id="vB", submitter_id=1)
+    c = _make_test_job(video_id="vC", submitter_id=2)
+    for j in (a, b, c):
+        bot._inflight_register(j)
+    # Make vB running.
+    bot._inflight_phase(b, bot.PHASE_DOWNLOADING)
+    user1 = bot._inflight_user(1)
+    assert {e.bot_video_id for e in user1} == {"vA", "vB"}
+    # Running comes first.
+    assert user1[0].bot_video_id == "vB"
+    user2 = bot._inflight_user(2)
+    assert [e.bot_video_id for e in user2] == ["vC"]
+
+
+def test_avg_runtime_returns_none_below_two_samples():
+    """Need at least 2 samples before the rolling average is meaningful."""
+    bot._completed_durations.clear()
+    bot._completed_durations["video"].append(10.0)
+    assert bot._avg_runtime("video") is None
+    bot._completed_durations["video"].append(20.0)
+    assert bot._avg_runtime("video") == 15.0
+
+
+def test_format_relative_units():
+    """_format_relative picks the right unit at the second/minute/hour boundaries."""
+    assert bot._format_relative(0) == "0s"
+    assert bot._format_relative(45) == "45s"
+    assert bot._format_relative(60) == "1m00s"
+    assert bot._format_relative(125) == "2m05s"
+    assert bot._format_relative(3600) == "1h00m"
+    assert bot._format_relative(7320) == "2h02m"
+    # Negative inputs are clamped to 0.
+    assert bot._format_relative(-5) == "0s"
+
+
+def test_classify_cache_kind_yt_vs_hash():
+    """11-char URL-safe id → video; anything else → web."""
+    # YouTube-style: 11 chars, A-Za-z0-9_- only. The stem includes the
+    # translate suffix, e.g. "dQw4w9WgXcQ.auto".
+    assert bot._classify_cache_kind("dQw4w9WgXcQ.auto") == "video"
+    assert bot._classify_cache_kind("_-AbC123xyz.translate") == "video"  # 11 chars
+    # Hash-style: hex digest.
+    assert bot._classify_cache_kind("abcdef0123456789.auto") == "web"
+    # Too short to be YT.
+    assert bot._classify_cache_kind("short.auto") == "web"
+
+
+def test_parse_cache_header_extracts_metadata():
+    """Header lines stop at the first blank; only `# key: value` lines parsed."""
+    text = (
+        "# title: Some Video\n"
+        "# status: Done\n"
+        "# duration: 600\n"
+        "# translate: auto\n"
+        "\n"
+        "transcript body goes here\n"
+        "# this is not a header\n"
+    )
+    hdr = bot._parse_cache_header(text)
+    assert hdr["title"] == "Some Video"
+    assert hdr["status"] == "Done"
+    assert hdr["duration"] == "600"
+    assert hdr["translate"] == "auto"
+    assert len(hdr) == 4
+
+
+def test_parse_cache_header_handles_no_header():
+    """File with no header lines still returns {} cleanly."""
+    assert bot._parse_cache_header("just transcript\n") == {}
+
+
+def test_effective_config_channel_wins_over_user():
+    """Channel config takes precedence over user config on key conflicts."""
+    # Stub both readers so we don't touch disk.
+    orig_user = bot.get_user_config
+    orig_chan = bot.get_channel_config
+    try:
+        bot.get_user_config = lambda uid: {"model": "user-default", "diarize": True}
+        bot.get_channel_config = lambda cid: {"model": "channel-policy"}
+        merged = bot._effective_config(1, 2)
+        assert merged["model"] == "channel-policy"
+        # Channel didn't set diarize → user value carries through.
+        assert merged["diarize"] is True
+    finally:
+        bot.get_user_config = orig_user
+        bot.get_channel_config = orig_chan
+
+
+def test_effective_config_empty_returns_empty_dict():
+    """Both layers empty → empty dict, no exceptions."""
+    orig_user = bot.get_user_config
+    orig_chan = bot.get_channel_config
+    try:
+        bot.get_user_config = lambda uid: {}
+        bot.get_channel_config = lambda cid: {}
+        assert bot._effective_config(1, 2) == {}
+    finally:
+        bot.get_user_config = orig_user
+        bot.get_channel_config = orig_chan
+
+
+def test_help_topics_cover_documented_areas():
+    """`/help topic:` must cover every advertised topic."""
+    expected = {"overview", "triggers", "admin", "limits", "errors", "translate"}
+    assert expected <= set(bot._HELP_TOPICS.keys())
+    # Topics should be non-empty strings.
+    for k, v in bot._HELP_TOPICS.items():
+        assert isinstance(v, str) and len(v) > 50, f"topic {k!r} body too short"
+
+
+def test_phase_constants_distinct():
+    """Phase strings must be distinct so the worker can switch on them."""
+    phases = {
+        bot.PHASE_QUEUED, bot.PHASE_DOWNLOADING, bot.PHASE_TRANSCRIBING,
+        bot.PHASE_SCRAPING, bot.PHASE_SUMMARIZING,
+    }
+    assert len(phases) == 5
+
+
+def test_slash_commands_registered():
+    """All advertised slash commands must be defined as cmd_* functions."""
+    expected = {
+        "cmd_summarize", "cmd_transcribe", "cmd_status", "cmd_find",
+        "cmd_config", "cmd_serverconfig",
+        # New commands
+        "cmd_web", "cmd_litmus", "cmd_progress", "cmd_cancel",
+        "cmd_queue", "cmd_help", "cmd_recent", "cmd_redo", "cmd_myconfig",
+    }
+    actual = {name for name in dir(bot) if name.startswith("cmd_") and callable(getattr(bot, name))}
+    missing = expected - actual
+    assert not missing, f"missing slash command handlers: {missing}"
 
 
 # ─── Test runner ─────────────────────────────────────────────────────────────

@@ -524,6 +524,128 @@ def _rate_limit_record(user_id: int) -> None:
     _user_jobs[user_id].append(time.time())
 
 
+# ─── Inflight job tracking ────────────────────────────────────────────────────
+# Lightweight in-memory map of jobs that are queued or running on the bot side.
+# Single asyncio loop owns this — no lock needed (cooperative scheduling).
+# Backs the `/progress`, `/cancel`, and `/queue` slash commands and gives the
+# bot enough context to render ETA + phase to the submitter.
+#
+# Lifecycle (one entry per Job):
+#   _inflight_register(job)  ← from _ack_queued (after queue.put)
+#   _inflight_phase(...)     ← at each react site in worker / process_* paths
+#   _inflight_remove(...)    ← at terminal react site (✅ / ❌ / silent drop)
+#
+# `cancel_requested` is a soft flag — the worker checks it at phase transitions
+# and aborts cleanly before hitting expensive steps. The whisper service has
+# its own DELETE /api/jobs/{id} which we forward when the server job_id is
+# known; once server-side transcription has started, we can no longer cancel
+# (whisperX has no safe interruption point), and the user is told so.
+
+PHASE_QUEUED = "queued"
+PHASE_DOWNLOADING = "downloading"
+PHASE_TRANSCRIBING = "transcribing"
+PHASE_SCRAPING = "scraping"
+PHASE_SUMMARIZING = "summarizing"
+
+
+@dataclass
+class InflightEntry:
+    """Live state for one in-flight job. Stored in _inflight by bot_video_id."""
+    bot_video_id: str
+    url: str
+    kind: str                    # video / web / litmus
+    submitter_id: int
+    submitter_name: str
+    channel_id: int
+    queued_at: float
+    started_at: float | None = None      # set when worker picks up
+    phase: str = PHASE_QUEUED
+    server_job_id: str | None = None     # whisper-side job id (after submit)
+    title: str | None = None             # post-download (video) / post-scrape
+    duration: int | None = None          # seconds; post-download
+    cancel_requested: bool = False       # /cancel sets this
+
+
+_inflight: dict[str, InflightEntry] = {}
+
+# Rolling per-kind average of completed-job durations, used to estimate ETA
+# while a job is queued. Capped to recent N. Keyed by kind so video jobs (a
+# few minutes typically) don't get conflated with web jobs (a few seconds).
+_completed_durations: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=20))
+
+
+def _inflight_register(job: "Job") -> None:
+    """Register a freshly-queued job. No-op on duplicates (replaces)."""
+    _inflight[job.video_id] = InflightEntry(
+        bot_video_id=job.video_id,
+        url=job.url,
+        kind=job.kind,
+        submitter_id=job.submitter_id,
+        submitter_name=job.submitter_name,
+        channel_id=getattr(job.channel, "id", 0),
+        queued_at=time.time(),
+        phase=PHASE_QUEUED,
+    )
+
+
+def _inflight_phase(job: "Job", phase: str, **fields) -> None:
+    """Update phase + arbitrary fields on the inflight entry. No-op if missing
+    (defensive — race-free in single-threaded asyncio but guards manual calls
+    against a removed entry).
+    """
+    entry = _inflight.get(job.video_id)
+    if entry is None:
+        return
+    entry.phase = phase
+    for k, v in fields.items():
+        if hasattr(entry, k):
+            setattr(entry, k, v)
+    # First time we transition out of "queued" is the actual start.
+    if phase != PHASE_QUEUED and entry.started_at is None:
+        entry.started_at = time.time()
+
+
+def _inflight_remove(video_id: str, *, kind: str | None = None) -> None:
+    """Drop a finished job. Records the runtime for ETA estimation when the
+    job has a started_at + kind (so cached/instant returns don't skew the avg).
+    """
+    entry = _inflight.pop(video_id, None)
+    if entry is None:
+        return
+    if entry.started_at is not None:
+        runtime = time.time() - entry.started_at
+        # Sub-second runtimes are cache-hit replies; skip — they'd skew ETA low.
+        if runtime >= 1.0:
+            _completed_durations[kind or entry.kind].append(runtime)
+
+
+def _inflight_user(user_id: int) -> list[InflightEntry]:
+    """All entries owned by a given Discord user, queued-first then started."""
+    entries = [e for e in _inflight.values() if e.submitter_id == user_id]
+    # Stable order: running first (started_at not None), then queued, oldest first.
+    entries.sort(key=lambda e: (e.started_at is None, e.queued_at))
+    return entries
+
+
+def _avg_runtime(kind: str) -> float | None:
+    """Rolling-average runtime for a kind. None when we have <2 samples."""
+    dq = _completed_durations.get(kind)
+    if not dq or len(dq) < 2:
+        return None
+    return sum(dq) / len(dq)
+
+
+def _format_relative(seconds: float) -> str:
+    """Human-readable elapsed/ETA. Always positive (callers pass abs)."""
+    s = int(round(max(0.0, seconds)))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    h, rem = divmod(s, 3600)
+    return f"{h}h{rem // 60:02d}m"
+
+
 # ─── Per-channel config ───────────────────────────────────────────────────────
 
 
@@ -629,6 +751,73 @@ def set_guild_config(guild_id: int, **fields) -> dict:
     return entry
 
 
+# ─── Per-user config (own defaults) ──────────────────────────────────────────
+
+
+# Per-user overrides — a third layer of config under channel + guild. Useful
+# for users who consistently want a particular translate mode or model
+# regardless of which channel they post in. Precedence at job-build time:
+#   explicit slash arg > channel config > user config > env default.
+# Storage shape mirrors channels.json: {user_id_str: {field: value, ...}}.
+USERS_CONFIG_PATH = CACHE_DIR / "users.json"
+_users_lock = threading.Lock()
+
+
+def _load_users_config() -> dict:
+    if not USERS_CONFIG_PATH.exists():
+        return {}
+    try:
+        return json_mod.loads(USERS_CONFIG_PATH.read_text())
+    except (OSError, json_mod.JSONDecodeError) as e:
+        log.warning("users.json read failed (%s) — treating as empty", e)
+        return {}
+
+
+def _save_users_config(cfg: dict) -> None:
+    with _users_lock:
+        try:
+            USERS_CONFIG_PATH.write_text(json_mod.dumps(cfg, indent=2, sort_keys=True))
+        except OSError as e:
+            log.error("users.json write failed: %s", e)
+
+
+def get_user_config(user_id: int) -> dict:
+    """Look up a user's overrides. Returns {} if no entry."""
+    return _load_users_config().get(str(user_id), {})
+
+
+def set_user_config(user_id: int, **fields) -> dict:
+    """Update a user's config; returns the merged result. field=None removes."""
+    cfg = _load_users_config()
+    entry = dict(cfg.get(str(user_id), {}))
+    for k, v in fields.items():
+        if v is None:
+            entry.pop(k, None)
+        else:
+            entry[k] = v
+    if entry:
+        cfg[str(user_id)] = entry
+    else:
+        cfg.pop(str(user_id), None)
+    _save_users_config(cfg)
+    return entry
+
+
+def _effective_config(user_id: int, channel_id: int) -> dict:
+    """Merge user + channel configs. Channel wins on conflict (channel is
+    'more specific' than user — a channel admin's policy outranks a user's
+    personal preference). Explicit slash args still take precedence over
+    both at the call site (callers do `arg or cfg.get(...)`).
+
+    Returns a flat dict with keys: model, diarize, vlm_enabled, yt_comments_enabled.
+    Missing keys mean 'use env default'.
+    """
+    user = get_user_config(user_id) if user_id else {}
+    chan = get_channel_config(channel_id) if channel_id else {}
+    # Per-channel config wins; per-user fills the gaps.
+    return {**user, **chan}
+
+
 def resolve_summary_channel(job_channel: "discord.TextChannel") -> "discord.TextChannel":
     """Pick the right channel for detail embeds (Key Points + Chapters).
 
@@ -685,12 +874,17 @@ def resolve_summary_channel(job_channel: "discord.TextChannel") -> "discord.Text
 
 async def _ack_queued(job: Job, position: int) -> None:
     """Acknowledge that a job has been queued."""
+    # Register the job in the inflight map before reacting so /progress and
+    # /cancel see it immediately even if the user fires those commands
+    # between the queue.put and the worker pick-up.
+    _inflight_register(job)
     if job.message is not None:
         await safe_react(job.message, "\u23f3")  # ⏳
     elif job.interaction is not None:
         try:
             await job.interaction.followup.send(
-                f"Queued `{job.video_id}` (position {position} in queue).",
+                f"Queued `{job.video_id}` (position {position} in queue). "
+                f"Track with `/progress`, cancel with `/cancel`.",
                 ephemeral=False,
             )
         except discord.HTTPException as e:
@@ -974,8 +1168,10 @@ async def on_message(message: discord.Message):
     seen = set()
     all_urls: list[str] = []  # for user-prompt extraction (strip URLs from text)
 
-    # Per-channel config: model + diarize + vlm overrides
-    chan_cfg = get_channel_config(message.channel.id)
+    # Per-channel + per-user config: model / diarize / vlm overrides.
+    # Channel config takes precedence over user config (channel admin's
+    # policy outranks a personal preference).
+    cfg = _effective_config(message.author.id, message.channel.id)
 
     def _new_job(url, video_id):
         return Job(
@@ -983,12 +1179,12 @@ async def on_message(message: discord.Message):
             channel=message.channel,
             submitter_id=message.author.id,
             submitter_name=str(message.author),
-            diarize=chan_cfg.get("diarize", False),
-            vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
-            yt_comments_enabled=chan_cfg.get(
+            diarize=cfg.get("diarize", False),
+            vlm_enabled=cfg.get("vlm_enabled", VLM_ENABLED),
+            yt_comments_enabled=cfg.get(
                 "yt_comments_enabled", YT_COMMENTS_ENABLED
             ),
-            model_override=chan_cfg.get("model"),
+            model_override=cfg.get("model"),
             # Auto-paste — not an explicit user request. NotAVideoError
             # will silently drop instead of falling through to web,
             # because users posting reddit/twitter text-post URLs
@@ -1138,7 +1334,7 @@ async def _handle_reply_trigger(
             pass
         return
 
-    chan_cfg = get_channel_config(message.channel.id)
+    cfg = _effective_config(message.author.id, message.channel.id)
 
     # Rate-limit + queue-cap apply equally to web/video/litmus jobs.
     # Atomic batch: reject the whole reply if it would push past either cap.
@@ -1167,7 +1363,7 @@ async def _handle_reply_trigger(
                 channel=message.channel,
                 submitter_id=message.author.id,
                 submitter_name=str(message.author),
-                model_override=chan_cfg.get("model"),
+                model_override=cfg.get("model"),
                 kind="litmus",
                 explicit_request=True,
                 message=message,
@@ -1191,12 +1387,12 @@ async def _handle_reply_trigger(
                 channel=message.channel,
                 submitter_id=message.author.id,
                 submitter_name=str(message.author),
-                diarize=chan_cfg.get("diarize", False),
-                vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
-                yt_comments_enabled=chan_cfg.get(
+                diarize=cfg.get("diarize", False),
+                vlm_enabled=cfg.get("vlm_enabled", VLM_ENABLED),
+                yt_comments_enabled=cfg.get(
                     "yt_comments_enabled", YT_COMMENTS_ENABLED
                 ),
-                model_override=chan_cfg.get("model"),
+                model_override=cfg.get("model"),
                 kind="video",
                 explicit_request=True,  # user typed tldr → wants a summary
                 message=message,
@@ -1207,7 +1403,7 @@ async def _handle_reply_trigger(
                 channel=message.channel,
                 submitter_id=message.author.id,
                 submitter_name=str(message.author),
-                model_override=chan_cfg.get("model"),
+                model_override=cfg.get("model"),
                 kind="web",
                 explicit_request=True,
                 message=message,
@@ -2005,6 +2201,8 @@ async def _submit_and_poll_transcribe(payload: dict, job: "Job") -> dict:
         raise RuntimeError(f"Job submit returned no job_id: {sub}")
     log.info("[%s] queued as %s (position=%s)",
              job.video_id, job_id, sub.get("position"))
+    # Surface the server-side job id so /cancel can forward DELETE later.
+    _inflight_phase(job, PHASE_TRANSCRIBING, server_job_id=job_id)
 
     # Poll until terminal. /api/jobs/{id} is cheap (single HGETALL on
     # valkey) so 3s ticks are fine even at sustained load. TRANSCRIBE_TIMEOUT
@@ -2096,10 +2294,22 @@ async def worker():
         job = await queue.get()
         last_error = None
         silent_drop = False
+        cancelled_pre_run = False
+        # Pre-run cancel check — user may have hit /cancel while the job was
+        # waiting. Drop without invoking the handler.
+        _entry_pre = _inflight.get(job.video_id)
+        if _entry_pre is not None and _entry_pre.cancel_requested:
+            log.info("[%s] Cancelled before run (user-requested)", job.video_id)
+            cancelled_pre_run = True
+        # When not cancelled, started_at gets set by the handler's first
+        # phase transition (download/scrape react). Brief gap between
+        # queue.get() and that react is at most a few hundred ms.
         # GPU contention is now handled server-side by the queue at
         # /api/jobs — busy-wait branches are gone. This loop only handles
         # truly transient errors (network blips, LLM timeouts, etc.).
         for attempt in range(MAX_RETRIES + 1):
+            if cancelled_pre_run:
+                break
             try:
                 if attempt > 0:
                     delay = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
@@ -2144,7 +2354,15 @@ async def worker():
                 last_error = e
                 log.warning("[%s] Attempt %d failed: %s", job.video_id, attempt + 1, e)
 
-        if silent_drop:
+        if cancelled_pre_run:
+            # User cancelled while queued. Clear reactions and ack the user.
+            for emoji in PROCESSING_EMOJI:
+                await _job_remove_react(job, emoji)
+            try:
+                await _job_reply(job, f"⏹️ `{job.video_id}` cancelled before run.")
+            except Exception:
+                pass
+        elif silent_drop:
             # Remove the ⏳ reaction so the message looks clean
             for emoji in PROCESSING_EMOJI:
                 await _job_remove_react(job, emoji)
@@ -2160,6 +2378,10 @@ async def worker():
                 f"Failed to process `{job.video_id}` ({attempts}): "
                 f"{type(last_error).__name__}: {last_error}",
             )
+        # Terminal: drop from inflight whether success, error, silent drop,
+        # or cancellation. Records runtime for the rolling ETA average when
+        # the job actually ran.
+        _inflight_remove(job.video_id, kind=job.kind)
         queue.task_done()
 
 
@@ -2195,6 +2417,7 @@ async def process(job: Job):
         log.info("[%s] Downloading%s%s...", job.video_id,
                  " (audio+video)" if job.vlm_enabled else "",
                  f" + comments(top {YT_COMMENTS_MAX})" if job.yt_comments_enabled else "")
+        _inflight_phase(job, PHASE_DOWNLOADING)
         download_payload = {
             "url": job.url,
             "keep_video": job.vlm_enabled,
@@ -2231,6 +2454,8 @@ async def process(job: Job):
         title = dl.get("title", job.video_id)
         duration = dl.get("duration", 0)
         file_path = dl["filename"]
+        # Now that we know what the video actually is, surface it in /progress.
+        _inflight_phase(job, PHASE_DOWNLOADING, title=title, duration=duration)
         # Livestream signal from yt-dlp metadata. Plumbed through the
         # /api/yt-download response. `was_live=True` means VOD'd livestream
         # — natural quiet stretches (gameplay, music, audience interaction)
@@ -2274,6 +2499,7 @@ async def process(job: Job):
 
         log.info("[%s] Transcribing '%s' (%ds)...", job.video_id, title, duration)
         await _job_react(job, PROCESSING_EMOJI_VIDEO)  # 🎧
+        _inflight_phase(job, PHASE_TRANSCRIBING)
 
         transcribe_payload = {
             "file_path": file_path,
@@ -2418,6 +2644,7 @@ async def process(job: Job):
     # 5. Summarize in multiple styles (concurrent — model handles full context)
     log.info("[%s] Summarizing (%d chars)...", job.video_id, len(transcript))
     await _job_react(job, "\U0001f9e0")  # 🧠
+    _inflight_phase(job, PHASE_SUMMARIZING, title=title, duration=duration)
 
     # Build reference block for summary prompts (terminology/spelling ONLY).
     # Wrapped in <reference>...</reference> so the LLM clearly sees this as
@@ -2667,6 +2894,7 @@ async def process_url(job: Job):
         # _fetch_via_crawl4ai.
         log.info("[%s] Scraping %s ...", job.video_id, job.url)
         await _job_react(job, PROCESSING_EMOJI_WEB)  # 📰 — distinguishes web from audio fetch
+        _inflight_phase(job, PHASE_SCRAPING)
         title, body = await fetch_article(job.url)
         status = f"scraped {len(body)} chars"
         log.info("[%s] Scraped: %s (%d chars)", job.video_id, title, len(body))
@@ -2739,6 +2967,7 @@ async def process_url(job: Job):
 
     log.info("[%s] Summarizing article (%d chars)...", job.video_id, len(body))
     await _job_react(job, "\U0001f9e0")  # 🧠
+    _inflight_phase(job, PHASE_SUMMARIZING, title=title)
 
     _token = _model_override.set(job.model_override) if job.model_override else None
     try:
@@ -2982,10 +3211,12 @@ async def process_litmus(job: Job):
 
     # Scraping reaction — same 📰 emoji as the web flow
     await _job_react(job, PROCESSING_EMOJI_WEB)
+    _inflight_phase(job, PHASE_SCRAPING)
 
     log.info("[%s] Litmus: scraping %s", job.video_id, job.url)
     title, body = await fetch_article(job.url)
     log.info("[%s] Litmus: scraped %d chars", job.video_id, len(body))
+    _inflight_phase(job, PHASE_SCRAPING, title=title)
 
     # Regex pre-pass + metadata fetches concurrently
     signals = _regex_signals(body)
@@ -3011,6 +3242,7 @@ async def process_litmus(job: Job):
     qualitative: str | None = None
     if LITMUS_SKIP_LLM_BELOW < score < LITMUS_SKIP_LLM_ABOVE:
         await _job_react(job, "\U0001f9e0")  # 🧠
+        _inflight_phase(job, PHASE_SUMMARIZING)
         log.info("[%s] Litmus: ambiguous → calling LLM for qualitative read",
                  job.video_id)
         from urllib.parse import urlparse
@@ -4871,6 +5103,7 @@ def _job_from_interaction(
     vlm_enabled: bool | None = None,
     yt_comments_enabled: bool | None = None,
     model_override: str | None = None,
+    kind: str = "video",
 ) -> Job | None:
     """Build a Job from an interaction. Returns None on URL parse failure.
 
@@ -4881,9 +5114,34 @@ def _job_from_interaction(
     non-English; True forces translate; False forces transcribe-as-source.
     `refresh`: when True, both bot-side and server-side caches are skipped
     for this run. Result still overwrites the cache on success.
+    `kind`: "video" (default), "web", or "litmus" — picks the worker
+    handler. For "web" / "litmus" the URL doesn't need to be a video and
+    the video_id is derived from a URL hash instead of YT/platform IDs.
     """
     eff_vlm = VLM_ENABLED if vlm_enabled is None else vlm_enabled
     eff_comments = YT_COMMENTS_ENABLED if yt_comments_enabled is None else yt_comments_enabled
+
+    # Web + litmus paths accept any http(s) URL; video_id is a URL hash so
+    # cache keys don't collide with video-platform IDs.
+    if kind in ("web", "litmus"):
+        any_url = _ANY_URL_RE.search(url)
+        if not any_url:
+            return None
+        canonical = any_url.group(0).rstrip("),.;]")
+        return Job(
+            url=canonical, video_id=_hash_url(canonical),
+            channel=interaction.channel, submitter_id=interaction.user.id,
+            submitter_name=str(interaction.user),
+            user_prompt=user_prompt, diarize=diarize, translate=translate,
+            refresh=refresh,
+            vlm_enabled=eff_vlm,
+            yt_comments_enabled=eff_comments,
+            model_override=model_override,
+            kind=kind,
+            explicit_request=True,
+            interaction=interaction,
+        )
+
     # Try YouTube first for canonical video_id
     m = YT_PATTERN.search(url)
     if m:
@@ -4932,6 +5190,64 @@ def _resolve_translate_choice(choice: str) -> object:
     return "auto"
 
 
+# ─── Model autocomplete ──────────────────────────────────────────────────────
+# Cache /v1/models so autocomplete doesn't slam the LLM proxy. Refresh on
+# expiry (rare — operators don't swap models frequently). Failing fetches
+# don't block — autocomplete just returns no suggestions, model: stays
+# free-text. The LLM proxy validates the model name at request time anyway.
+
+_MODEL_CACHE_TTL = 300  # seconds
+_model_cache: dict[str, object] = {"models": [], "ts": 0.0}
+
+
+async def _fetch_model_list() -> list[str]:
+    """Live model list from the LLM proxy. Memoised for _MODEL_CACHE_TTL."""
+    now = time.time()
+    cached_ts = _model_cache.get("ts", 0.0)
+    if isinstance(cached_ts, float) and now - cached_ts < _MODEL_CACHE_TTL:
+        models = _model_cache.get("models")
+        if isinstance(models, list):
+            return models
+    if http is None:
+        return []
+    try:
+        async with http.get(
+            f"{LLM_API}/models",
+            timeout=aiohttp.ClientTimeout(total=3),
+        ) as resp:
+            if resp.status != 200:
+                return _model_cache.get("models", []) or []  # serve stale
+            data = await resp.json()
+        # OpenAI-compatible: {"data": [{"id": "..."}, ...]}
+        models = [
+            str(m.get("id"))
+            for m in data.get("data", [])
+            if isinstance(m, dict) and m.get("id")
+        ]
+        _model_cache["models"] = models
+        _model_cache["ts"] = now
+        return models
+    except Exception as e:
+        log.debug("model list fetch failed: %s", e)
+        return _model_cache.get("models", []) or []
+
+
+async def _model_autocomplete(
+    interaction: discord.Interaction, current: str,
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete model: from the LLM proxy's /v1/models endpoint."""
+    models = await _fetch_model_list()
+    current_lc = (current or "").lower()
+    out: list[app_commands.Choice[str]] = []
+    for m in models:
+        if current_lc and current_lc not in m.lower():
+            continue
+        out.append(app_commands.Choice(name=m[:100], value=m[:100]))
+        if len(out) >= 25:
+            break
+    return out
+
+
 @bot.tree.command(name="summarize", description="Transcribe + summarise a video")
 @app_commands.describe(
     url="Video URL (YouTube, Twitch, Vimeo, etc.)",
@@ -4943,6 +5259,7 @@ def _resolve_translate_choice(choice: str) -> object:
     refresh=("Skip cache and re-transcribe from scratch. Use this when a "
              "previous run was wrong or you changed translate mode."),
 )
+@app_commands.autocomplete(model=_model_autocomplete)
 async def cmd_summarize(
     interaction: discord.Interaction,
     url: str,
@@ -4957,15 +5274,15 @@ async def cmd_summarize(
         await interaction.followup.send(f"❌ {reason}", ephemeral=True)
         return
 
-    chan_cfg = get_channel_config(interaction.channel.id)
-    effective_model = model or chan_cfg.get("model")
+    cfg = _effective_config(interaction.user.id, interaction.channel.id)
+    effective_model = model or cfg.get("model")
     job = _job_from_interaction(
         interaction, url,
         user_prompt=(prompt or "").strip()[:USER_PROMPT_MAX_CHARS],
         translate=_resolve_translate_choice(translate),
         refresh=refresh,
-        vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
-        yt_comments_enabled=chan_cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
+        vlm_enabled=cfg.get("vlm_enabled", VLM_ENABLED),
+        yt_comments_enabled=cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
         model_override=effective_model,
     )
     if job is None:
@@ -4985,6 +5302,7 @@ async def cmd_summarize(
 @app_commands.describe(
     url="Video URL",
     diarize="Identify and label different speakers (slower; adds rename button)",
+    prompt="Optional steering: tell the bot what to focus on (forces VLM)",
     translate=("Translation policy. 'auto' (default) translates non-English "
                "sources to English. 'native' preserves the source language."),
     refresh="Skip cache and re-transcribe from scratch.",
@@ -4993,27 +5311,30 @@ async def cmd_transcribe(
     interaction: discord.Interaction,
     url: str,
     diarize: bool = False,
+    prompt: str | None = None,
     translate: Literal["auto", "translate", "native"] = "auto",
     refresh: bool = False,
 ) -> None:
     # /transcribe is just /summarize with diarize on. We still produce
     # the brief/key_points/chapters embeds — the diarize flag flows
-    # through to whisper for labelling.
+    # through to whisper for labelling. `prompt` matches /summarize
+    # symmetry: forces VLM enrichment and steers the summary LLM.
     await interaction.response.defer()
     ok, reason = _rate_limit_check(interaction.user.id)
     if not ok:
         await interaction.followup.send(f"❌ {reason}", ephemeral=True)
         return
 
-    chan_cfg = get_channel_config(interaction.channel.id)
+    cfg = _effective_config(interaction.user.id, interaction.channel.id)
     job = _job_from_interaction(
         interaction, url,
-        diarize=diarize or chan_cfg.get("diarize", False),
+        diarize=diarize or cfg.get("diarize", False),
+        user_prompt=(prompt or "").strip()[:USER_PROMPT_MAX_CHARS],
         translate=_resolve_translate_choice(translate),
         refresh=refresh,
-        vlm_enabled=chan_cfg.get("vlm_enabled", VLM_ENABLED),
-        yt_comments_enabled=chan_cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
-        model_override=chan_cfg.get("model"),
+        vlm_enabled=cfg.get("vlm_enabled", VLM_ENABLED),
+        yt_comments_enabled=cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
+        model_override=cfg.get("model"),
     )
     if job is None:
         await interaction.followup.send(
@@ -5023,12 +5344,99 @@ async def cmd_transcribe(
     _rate_limit_record(interaction.user.id)
     await queue.put(job)
     await _ack_queued(job, queue.qsize())
-    log.info("Slash /transcribe queued %s from %s (diarize=%s, translate=%s, refresh=%s)",
-             job.video_id, job.submitter_name, job.diarize, translate, refresh)
+    log.info("Slash /transcribe queued %s from %s (diarize=%s, prompt=%s, translate=%s, refresh=%s)",
+             job.video_id, job.submitter_name, job.diarize,
+             bool(job.user_prompt), translate, refresh)
+
+
+@bot.tree.command(name="web", description="Summarise a web article (non-video URL)")
+@app_commands.describe(
+    url="Article URL",
+    prompt="Optional steering: focus the summary on a specific angle",
+    model="Override LLM_MODEL for this run (advanced)",
+    refresh="Skip cache and re-scrape from scratch.",
+)
+@app_commands.autocomplete(model=_model_autocomplete)
+async def cmd_web(
+    interaction: discord.Interaction,
+    url: str,
+    prompt: str | None = None,
+    model: str | None = None,
+    refresh: bool = False,
+) -> None:
+    """Slash equivalent of the `tldr` reply trigger — scrapes any web URL
+    via Crawl4AI/FlareSolverr/Reddit-fetch and summarises. If the URL
+    happens to be a clear video URL we still route through the web pipeline
+    (use /summarize for video). Cache hits return instantly."""
+    await interaction.response.defer()
+    ok, reason = _rate_limit_check(interaction.user.id)
+    if not ok:
+        await interaction.followup.send(f"❌ {reason}", ephemeral=True)
+        return
+
+    cfg = _effective_config(interaction.user.id, interaction.channel.id)
+    effective_model = model or cfg.get("model")
+    job = _job_from_interaction(
+        interaction, url,
+        user_prompt=(prompt or "").strip()[:USER_PROMPT_MAX_CHARS],
+        model_override=effective_model,
+        kind="web",
+    )
+    if job is None:
+        await interaction.followup.send(
+            f"❌ Couldn't parse a URL from: {url}", ephemeral=True
+        )
+        return
+    _rate_limit_record(interaction.user.id)
+    await queue.put(job)
+    await _ack_queued(job, queue.qsize())
+    log.info("Slash /web queued %s from %s (model=%s, prompt=%s, refresh=%s)",
+             job.video_id, job.submitter_name,
+             effective_model or "default", bool(job.user_prompt), refresh)
+
+
+@bot.tree.command(name="litmus", description="AI litmus test — forensic signals on a web article")
+@app_commands.describe(
+    url="Article URL",
+    model="Override LLM_MODEL for the qualitative read (advanced)",
+)
+@app_commands.autocomplete(model=_model_autocomplete)
+async def cmd_litmus(
+    interaction: discord.Interaction,
+    url: str,
+    model: str | None = None,
+) -> None:
+    """Slash equivalent of the `litmus` reply trigger. Surfaces stylistic +
+    metadata signals that an article may be LLM-generated. Forensic output,
+    no verdict. Always runs the web-fetch path even on video URLs (the
+    bot inspects the page, not the audio)."""
+    await interaction.response.defer()
+    ok, reason = _rate_limit_check(interaction.user.id)
+    if not ok:
+        await interaction.followup.send(f"❌ {reason}", ephemeral=True)
+        return
+
+    cfg = _effective_config(interaction.user.id, interaction.channel.id)
+    job = _job_from_interaction(
+        interaction, url,
+        model_override=model or cfg.get("model"),
+        kind="litmus",
+    )
+    if job is None:
+        await interaction.followup.send(
+            f"❌ Couldn't parse a URL from: {url}", ephemeral=True
+        )
+        return
+    _rate_limit_record(interaction.user.id)
+    await queue.put(job)
+    await _ack_queued(job, queue.qsize())
+    log.info("Slash /litmus queued %s from %s (model=%s)",
+             job.video_id, job.submitter_name, model or "default")
 
 
 @bot.tree.command(name="status", description="Show queue + service health")
-async def cmd_status(interaction: discord.Interaction) -> None:
+@app_commands.describe(verbose="Also list the bot's queued + running jobs (titles, phases)")
+async def cmd_status(interaction: discord.Interaction, verbose: bool = False) -> None:
     await interaction.response.defer(ephemeral=True)
     if http is None: raise RuntimeError("HTTP session not initialised")
     try:
@@ -5045,45 +5453,579 @@ async def cmd_status(interaction: discord.Interaction) -> None:
         f"**Whisper**: {wstatus.get('status', '?')} on {wstatus.get('device', '?')}\n"
         f"**Vision**: {wstatus.get('vision', {}).get('model', 'unconfigured')}"
     )
+
+    if verbose and _inflight:
+        # Sorted: running first, then queued in submission order.
+        entries = sorted(
+            _inflight.values(),
+            key=lambda e: (e.started_at is None, e.queued_at),
+        )
+        lines = ["", f"**Active + queued ({len(entries)}):**"]
+        for i, e in enumerate(entries[:15], 1):
+            label = e.title or e.bot_video_id
+            elapsed = _format_relative(time.time() - (e.started_at or e.queued_at))
+            marker = "▶" if e.started_at else "⏳"
+            lines.append(
+                f"`{i}.` {marker} **{truncate(label, 60)}** "
+                f"({e.kind}, {e.phase}, {elapsed})"
+            )
+        if len(entries) > 15:
+            lines.append(f"... and {len(entries) - 15} more")
+        msg += "\n" + "\n".join(lines)
+
     await interaction.followup.send(msg, ephemeral=True)
 
 
+@bot.tree.command(name="progress", description="Show your in-flight jobs with phase + ETA")
+async def cmd_progress(interaction: discord.Interaction) -> None:
+    """User-scoped view of every job they have queued or running. Shows
+    title once available, current phase, elapsed time, and an ETA when
+    one is computable (post-download for video; rolling average for
+    queued jobs)."""
+    await interaction.response.defer(ephemeral=True)
+    entries = _inflight_user(interaction.user.id)
+    if not entries:
+        await interaction.followup.send(
+            "You have no jobs queued or running. Use `/summarize`, "
+            "`/transcribe`, `/web`, or `/litmus` to start one.",
+            ephemeral=True,
+        )
+        return
+
+    avg_queued_eta = _avg_runtime("video") or _avg_runtime("web") or 0.0
+    now = time.time()
+    lines = [f"**Your jobs ({len(entries)}):**"]
+    for i, e in enumerate(entries, 1):
+        label = e.title or e.bot_video_id
+        if e.started_at is not None:
+            elapsed = _format_relative(now - e.started_at)
+            # ETA: phase-dependent
+            eta_str = ""
+            if e.phase == PHASE_TRANSCRIBING and e.duration:
+                # WhisperX ~10x realtime on consumer GPU; quote conservatively
+                remaining = max(0.0, e.duration / 8.0 - (now - e.started_at))
+                if remaining > 1.0:
+                    eta_str = f", ETA ~{_format_relative(remaining)}"
+            elif e.phase in (PHASE_SUMMARIZING,):
+                # Summarisation is bounded by LLM_TIMEOUT; rolling avg from
+                # observed runtimes gives a better estimate than guessing.
+                avg = _avg_runtime(e.kind) or 0.0
+                if avg > 0:
+                    remaining = max(0.0, avg - (now - e.started_at))
+                    if remaining > 1.0:
+                        eta_str = f", ETA ~{_format_relative(remaining)}"
+            phase_emoji = {
+                PHASE_DOWNLOADING: "⬇️",
+                PHASE_TRANSCRIBING: "🎧",
+                PHASE_SCRAPING: "📰",
+                PHASE_SUMMARIZING: "🧠",
+            }.get(e.phase, "▶")
+            lines.append(
+                f"`{i}.` {phase_emoji} **{truncate(label, 70)}**\n"
+                f"     {e.phase} • elapsed {elapsed}{eta_str} • `{e.bot_video_id}`"
+            )
+        else:
+            # Queued. Position is its index among queued entries in _inflight.
+            queued_ahead = sum(
+                1 for x in _inflight.values()
+                if x.started_at is None and x.queued_at < e.queued_at
+            )
+            position = queued_ahead + 1
+            wait = _format_relative(now - e.queued_at)
+            eta_str = ""
+            if avg_queued_eta > 0:
+                eta_str = f", ETA ~{_format_relative(position * avg_queued_eta)}"
+            lines.append(
+                f"`{i}.` ⏳ **{truncate(label, 70)}**\n"
+                f"     queued (position {position}) • waiting {wait}{eta_str} • "
+                f"`{e.bot_video_id}`"
+            )
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+async def _cancel_autocomplete(
+    interaction: discord.Interaction, current: str,
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete /cancel job: from the user's own inflight entries."""
+    entries = _inflight_user(interaction.user.id)
+    current_lc = (current or "").lower()
+    choices: list[app_commands.Choice[str]] = []
+    for e in entries[:25]:
+        label_src = e.title or e.bot_video_id
+        if current_lc and current_lc not in label_src.lower() and current_lc not in e.bot_video_id.lower():
+            continue
+        marker = "running" if e.started_at else "queued"
+        label = f"[{marker}] {truncate(label_src, 80)}"
+        choices.append(app_commands.Choice(name=label[:100], value=e.bot_video_id))
+    return choices
+
+
+@bot.tree.command(name="cancel", description="Cancel one of your queued or running jobs")
+@app_commands.describe(job="Pick from your active jobs (autocomplete)")
+@app_commands.autocomplete(job=_cancel_autocomplete)
+async def cmd_cancel(interaction: discord.Interaction, job: str) -> None:
+    """Soft-cancel a bot-side queued job (worker checks the flag before
+    invoking the handler). For jobs that have already entered server-side
+    transcription, forwards DELETE /api/jobs/{server_job_id} — the whisper
+    service refuses to cancel in-flight transcription (no safe interrupt
+    point in whisperX), so we surface the right error message in that case.
+    """
+    await interaction.response.defer(ephemeral=True)
+    entry = _inflight.get(job)
+    if entry is None:
+        await interaction.followup.send(
+            f"❌ Job `{job}` not found in the queue (might have just finished).",
+            ephemeral=True,
+        )
+        return
+    if entry.submitter_id != interaction.user.id:
+        await interaction.followup.send(
+            "❌ You can only cancel your own jobs.", ephemeral=True
+        )
+        return
+
+    # Case 1: still queued on the bot side — set the soft flag.
+    if entry.phase == PHASE_QUEUED:
+        entry.cancel_requested = True
+        await interaction.followup.send(
+            f"⏹️ Will cancel `{job}` before it runs.", ephemeral=True
+        )
+        log.info("[%s] /cancel requested by %s (still queued bot-side)",
+                 job, interaction.user)
+        return
+
+    # Case 2: server-side transcription has started; forward to whisper.
+    if entry.server_job_id and entry.phase == PHASE_TRANSCRIBING:
+        if http is None:
+            await interaction.followup.send(
+                "❌ HTTP session not ready; try again in a moment.",
+                ephemeral=True,
+            )
+            return
+        try:
+            async with http.delete(
+                f"{WHISPER_API}/api/jobs/{entry.server_job_id}",
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                body = await resp.json()
+                if resp.status == 200:
+                    entry.cancel_requested = True
+                    await interaction.followup.send(
+                        f"⏹️ Cancelled `{job}` (server-side queue).",
+                        ephemeral=True,
+                    )
+                    log.info("[%s] /cancel forwarded DELETE for server job %s",
+                             job, entry.server_job_id)
+                    return
+                msg = body.get("error", f"http {resp.status}")
+                if "in-flight" in msg or resp.status == 409:
+                    await interaction.followup.send(
+                        f"❌ Too late — `{job}` is already transcribing and "
+                        "whisperX has no safe interruption point. Wait for "
+                        "it to finish or fail.",
+                        ephemeral=True,
+                    )
+                    return
+                await interaction.followup.send(
+                    f"❌ Couldn't cancel: {msg}", ephemeral=True,
+                )
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ Cancel request failed: {e}", ephemeral=True,
+            )
+        return
+
+    # Case 3: phase is downloading / scraping / summarising on the bot side.
+    # No safe interruption point — the underlying HTTP request is in-flight.
+    await interaction.followup.send(
+        f"❌ Too late — `{job}` is in the `{entry.phase}` phase. "
+        "Wait for it to finish or fail.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="queue", description="List everything in the bot queue (server-wide)")
+async def cmd_queue(interaction: discord.Interaction) -> None:
+    """Server-wide queue listing. Same fields as `/status verbose:true` but
+    formatted as a standalone command for users who think 'queue', not
+    'status verbose'."""
+    await interaction.response.defer(ephemeral=True)
+    if not _inflight:
+        await interaction.followup.send(
+            f"Queue empty. (`{queue.qsize()}/{MAX_QUEUE_SIZE}`)",
+            ephemeral=True,
+        )
+        return
+    entries = sorted(
+        _inflight.values(),
+        key=lambda e: (e.started_at is None, e.queued_at),
+    )
+    now = time.time()
+    lines = [f"**Bot queue ({len(entries)} job{'s' if len(entries) != 1 else ''}):**"]
+    for i, e in enumerate(entries[:20], 1):
+        label = e.title or e.bot_video_id
+        elapsed = _format_relative(now - (e.started_at or e.queued_at))
+        marker = "▶" if e.started_at else "⏳"
+        owner = e.submitter_name.split("#")[0] if e.submitter_name else "?"
+        lines.append(
+            f"`{i}.` {marker} **{truncate(label, 60)}** "
+            f"(`{e.kind}`, {e.phase}, {elapsed}, @{owner})"
+        )
+    if len(entries) > 20:
+        lines.append(f"... and {len(entries) - 20} more")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+_HELP_TOPICS: dict[str, str] = {
+    "overview": (
+        "**TL;DW Bot — quick overview**\n\n"
+        "Paste a video URL → bot transcribes + summarises automatically.\n"
+        "Reply `tldr` to a message with a URL → summarises any article.\n"
+        "Reply `litmus` → forensic AI-writing test on an article.\n\n"
+        "**Slash commands:**\n"
+        "• `/summarize url:` — video → 3 embeds (brief / key points / chapters)\n"
+        "• `/transcribe url: diarize:true` — adds speaker labels + Rename button\n"
+        "• `/web url:` — article summary (slash equivalent of `tldr` reply)\n"
+        "• `/litmus url:` — AI litmus test (slash equivalent of `litmus` reply)\n"
+        "• `/progress` — your active jobs with phase + ETA\n"
+        "• `/cancel job:` — cancel a queued/transcribing job of yours\n"
+        "• `/queue` — full bot queue (server-wide)\n"
+        "• `/status` — queue depth + whisper/vision health\n"
+        "• `/find query:` — search past summaries\n"
+        "• `/help topic:` — more help on triggers, admin, limits, errors\n"
+    ),
+    "triggers": (
+        "**Reply triggers (no URL needed in your reply)**\n\n"
+        "Reply with one of these words to a message containing a URL:\n"
+        "• `tldr` / `summarize` / `summarise` — summary flow (video or web auto-detect)\n"
+        "• `litmus` — AI litmus test (forensic signals, no verdict)\n\n"
+        "**Chained replies:** `tldr litmus` or `litmus tldr` (order preserved) fires both. "
+        "Reply body must be only keywords + punctuation — sentences like "
+        "\"give me a tldr\" intentionally don't trigger.\n\n"
+        "**Auto-trigger on paste:** any URL whose shape clearly points at a "
+        "video (YouTube watch/shorts, Twitch VODs, Vimeo, TikTok, etc.) "
+        "starts a job. Text-post URLs on video domains don't auto-trigger; "
+        "use `/web` or reply `tldr` for those."
+    ),
+    "admin": (
+        "**Admin commands** (require permission)\n\n"
+        "**Per-channel** (`Manage Channel`):\n"
+        "• `/config model:` — override LLM for /summarize in this channel\n"
+        "• `/config diarize:true` — enable speaker diarization by default\n"
+        "• `/config vlm:false` — disable vision-language frame analysis\n"
+        "• `/config yt_comments:false` — skip the Community Reaction embed\n"
+        "• `/config show:true` (or no args) — print current config\n"
+        "• `/config model:` (empty value) — clear that override\n\n"
+        "**Per-server** (`Manage Server`):\n"
+        "• `/serverconfig summary_channel:#name` — route Key Points + Chapters to a separate channel\n"
+        "• `/serverconfig clear:true` — wipe all server overrides\n"
+        "• `/serverconfig show:true` (or no args) — print current server config\n\n"
+        "Configs persist across restarts (stored under bot's cache dir)."
+    ),
+    "limits": (
+        "**Rate limits**\n\n"
+        f"• `{MAX_JOBS_PER_USER_PER_HOUR}` jobs per user per hour (sliding window).\n"
+        f"• `{MAX_QUEUE_SIZE}` total jobs in queue (server-wide cap).\n"
+        "• Chained replies count per kind: `tldr litmus` = 2 slots, atomic.\n"
+        "• Multiple URLs in one message = one slot each.\n\n"
+        "Hitting the cap reacts 🚫 and replies with the retry timer. "
+        "Trusted users can bypass via `RATE_LIMIT_BYPASS_USERS` env (queue cap "
+        "still enforced — admins can't crash the bot either).\n\n"
+        "Check your own usage with `/status`. Track live jobs with `/progress`."
+    ),
+    "errors": (
+        "**Reactions during processing**\n\n"
+        "• ⏳ queued (worker hasn't picked it up yet)\n"
+        "• 🎧 downloading + transcribing video\n"
+        "• 📰 scraping article / litmus fetch\n"
+        "• 🧠 summarising (LLM call)\n"
+        "• ✅ done — embed has been posted\n"
+        "• 🚫 rate limit hit\n"
+        "• ❌ permanent failure (private video, hard CAPTCHA, geo-blocked, etc.)\n\n"
+        "For age-restricted videos, see `bot/.env.example` → `YT_DLP_COOKIES_FILE`. "
+        "If you want richer signal than emojis, use `/progress`."
+    ),
+    "translate": (
+        "**Translation policy** (`/summarize translate:`)\n\n"
+        "• `auto` (default) — server runs a 30s LID pre-pass; non-English "
+        "sources get translated to English. Best for downstream summarisation "
+        "since the model is most fluent in English.\n"
+        "• `translate` — force task=translate regardless of source.\n"
+        "• `native` — preserve the source language (no translation).\n\n"
+        "Each mode caches separately, so switching modes re-runs from scratch. "
+        "Add `refresh:true` to bypass cache entirely."
+    ),
+}
+
+
+@bot.tree.command(name="help", description="Explain what the bot does and how to use it")
+@app_commands.describe(topic="Which area of help to show")
+async def cmd_help(
+    interaction: discord.Interaction,
+    topic: Literal[
+        "overview", "triggers", "admin", "limits", "errors", "translate",
+    ] = "overview",
+) -> None:
+    """In-Discord help. Ephemeral so it doesn't clutter the channel."""
+    body = _HELP_TOPICS.get(topic) or _HELP_TOPICS["overview"]
+    await interaction.response.send_message(body, ephemeral=True)
+
+
+def _parse_cache_header(text: str) -> dict[str, str]:
+    """Extract the leading `# key: value` lines from a cache file. Stops at
+    the first blank line. Used by /find, /recent, /redo to surface metadata
+    without reading the full transcript."""
+    hdr: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            break
+        if not line.startswith("# "):
+            break
+        kv = line[2:]
+        if ":" not in kv:
+            continue
+        k, _, v = kv.partition(":")
+        hdr[k.strip()] = v.strip()
+    return hdr
+
+
+# Heuristic: YT-style video_id is exactly 11 chars from the URL-safe base64
+# alphabet (A-Za-z0-9_-). Anything else is treated as a hash (web/litmus
+# don't cache litmus today, but the hashed video_id pattern matches /web).
+_YT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+
+def _classify_cache_kind(stem: str) -> str:
+    """Infer the kind for a cached file given the file stem (video_id).
+    11-char YT-style ID → video; otherwise a URL hash → web. Litmus isn't
+    cached today, so it never shows up here.
+    """
+    # Stem looks like `{video_id}.{translate_key}` — split off the translate
+    # suffix to recover the video_id only.
+    base = stem.rsplit(".", 1)[0]
+    return "video" if _YT_ID_RE.match(base) else "web"
+
+
 @bot.tree.command(name="find", description="Search past summaries by keyword")
-@app_commands.describe(query="Keywords to search for (case-insensitive substring)")
-async def cmd_find(interaction: discord.Interaction, query: str) -> None:
+@app_commands.describe(
+    query="Keywords to search for (case-insensitive substring)",
+    kind="Filter results by job kind",
+    since_days="Only show results from the last N days",
+    limit="Max results to return (1-25, default 10)",
+)
+async def cmd_find(
+    interaction: discord.Interaction,
+    query: str,
+    kind: Literal["any", "video", "web"] = "any",
+    since_days: int | None = None,
+    limit: app_commands.Range[int, 1, 25] = 10,
+) -> None:
     await interaction.response.defer(ephemeral=True)
     q = query.lower().strip()
     if len(q) < 3:
         await interaction.followup.send("Query must be ≥3 characters.", ephemeral=True)
         return
+    cutoff = time.time() - (since_days * 86400) if since_days else 0.0
 
-    matches = []
+    matches: list[tuple[str, str, str, float, str]] = []
     for f in CACHE_DIR.glob("*.txt"):
         try:
+            mtime = f.stat().st_mtime
+            if cutoff and mtime < cutoff:
+                continue
+            file_kind = _classify_cache_kind(f.stem)
+            if kind != "any" and kind != file_kind:
+                continue
             text = f.read_text()
         except OSError:
             continue
-        if q in text.lower():
-            # Pull the title from header line: "# title: ..."
-            title = ""
-            for line in text.splitlines()[:5]:
-                if line.startswith("# title: "):
-                    title = line[len("# title: "):]
-                    break
-            video_id = f.stem
-            url = f"https://www.youtube.com/watch?v={video_id}"  # YT-style; non-YT works too
-            matches.append((video_id, title or video_id, url))
-            if len(matches) >= 10:
-                break
+        if q not in text.lower():
+            continue
+        hdr = _parse_cache_header(text)
+        title = hdr.get("title", "") or f.stem
+        # video_id is the part before the translate-key suffix.
+        video_id = f.stem.rsplit(".", 1)[0]
+        if file_kind == "video":
+            url = f"https://www.youtube.com/watch?v={video_id}"
+        else:
+            # We don't have the original URL stored for web hashes — point
+            # at the cache file name as a placeholder. /redo can re-fetch.
+            url = f"#{video_id}"
+        matches.append((video_id, title, url, mtime, file_kind))
+
+    # Sort newest first so /find behaves like a "what did we recently summarise about X" query.
+    matches.sort(key=lambda m: m[3], reverse=True)
+    matches = matches[:limit]
 
     if not matches:
         await interaction.followup.send(f"No matches for `{query}`.", ephemeral=True)
         return
 
-    lines = [f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} for `{query}`:"]
-    for vid, title, url in matches:
-        lines.append(f"- [{truncate(title, 80)}]({url}) (`{vid}`)")
+    lines = [
+        f"Found {len(matches)} match{'es' if len(matches) != 1 else ''} for "
+        f"`{query}` (kind=`{kind}`{f', last {since_days}d' if since_days else ''}):"
+    ]
+    now = time.time()
+    for vid, title, url, mtime, file_kind in matches:
+        age = _format_relative(now - mtime)
+        if url.startswith("#"):
+            lines.append(f"- **{truncate(title, 80)}** (`{vid}` · {file_kind} · {age} ago)")
+        else:
+            lines.append(
+                f"- [{truncate(title, 80)}]({url}) "
+                f"(`{vid}` · {file_kind} · {age} ago)"
+            )
     await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="recent", description="Show the most recently cached summaries")
+@app_commands.describe(
+    kind="Filter by job kind",
+    limit="How many recent jobs to list (1-25, default 10)",
+)
+async def cmd_recent(
+    interaction: discord.Interaction,
+    kind: Literal["any", "video", "web"] = "any",
+    limit: app_commands.Range[int, 1, 25] = 10,
+) -> None:
+    """List cached transcripts/summaries by modification time. Server-wide
+    view of recent activity — useful as a 'what did we just summarise?'
+    glance. Use /find to keyword-search the same cache."""
+    await interaction.response.defer(ephemeral=True)
+    items: list[tuple[float, str, str, str]] = []
+    for f in CACHE_DIR.glob("*.txt"):
+        try:
+            mtime = f.stat().st_mtime
+            file_kind = _classify_cache_kind(f.stem)
+            if kind != "any" and kind != file_kind:
+                continue
+            # Read only the header (cheap — small prefix). full read is fine
+            # too; cache files are bounded and the bot doesn't ship a huge
+            # archive. Header lines stop at the first blank line.
+            with f.open("r") as fh:
+                head = ""
+                for _ in range(8):
+                    line = fh.readline()
+                    if not line.strip():
+                        break
+                    head += line
+            hdr = _parse_cache_header(head)
+            title = hdr.get("title", "") or f.stem
+            items.append((mtime, f.stem.rsplit(".", 1)[0], title, file_kind))
+        except OSError:
+            continue
+    items.sort(key=lambda x: x[0], reverse=True)
+    items = items[:limit]
+    if not items:
+        await interaction.followup.send(
+            "No cached summaries yet.", ephemeral=True,
+        )
+        return
+    now = time.time()
+    lines = [f"**Recent summaries ({len(items)}):**"]
+    for mtime, vid, title, file_kind in items:
+        age = _format_relative(now - mtime)
+        if file_kind == "video":
+            url = f"https://www.youtube.com/watch?v={vid}"
+            lines.append(
+                f"- [{truncate(title, 80)}]({url}) "
+                f"(`{vid}` · {file_kind} · {age} ago)"
+            )
+        else:
+            lines.append(
+                f"- **{truncate(title, 80)}** "
+                f"(`{vid}` · {file_kind} · {age} ago)"
+            )
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+async def _recent_video_autocomplete(
+    interaction: discord.Interaction, current: str,
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete /redo video_id: from the cache. Newest-first, capped at 25.
+    Free-text typing is still allowed — autocomplete is just a discovery aid.
+    """
+    current_lc = (current or "").lower()
+    items: list[tuple[float, str, str]] = []
+    for f in CACHE_DIR.glob("*.txt"):
+        try:
+            stem = f.stem.rsplit(".", 1)[0]
+            if not _YT_ID_RE.match(stem):
+                continue
+            mtime = f.stat().st_mtime
+            with f.open("r") as fh:
+                head = "".join(fh.readline() for _ in range(6))
+            title = _parse_cache_header(head).get("title", stem)
+            if current_lc and current_lc not in title.lower() and current_lc not in stem.lower():
+                continue
+            items.append((mtime, stem, title))
+        except OSError:
+            continue
+    items.sort(key=lambda x: x[0], reverse=True)
+    return [
+        app_commands.Choice(name=truncate(f"{title} ({vid})", 100), value=vid)
+        for _, vid, title in items[:25]
+    ]
+
+
+@bot.tree.command(name="redo", description="Re-run a cached video summary with different options")
+@app_commands.describe(
+    video_id="Pick from your cached videos (autocomplete)",
+    prompt="Optional steering text (forces VLM)",
+    model="Override LLM_MODEL for this run",
+    translate="Translation policy",
+    refresh="Skip cache and re-transcribe (default true for /redo)",
+)
+@app_commands.autocomplete(
+    video_id=_recent_video_autocomplete, model=_model_autocomplete,
+)
+async def cmd_redo(
+    interaction: discord.Interaction,
+    video_id: str,
+    prompt: str | None = None,
+    model: str | None = None,
+    translate: Literal["auto", "translate", "native"] = "auto",
+    refresh: bool = True,
+) -> None:
+    """Re-run a cached video job with different options without retyping
+    the URL. Defaults `refresh=true` because the common case is "the model
+    got something wrong, retry"; pass refresh:false to re-summarise from
+    the existing transcript (saves the download+transcribe phases)."""
+    await interaction.response.defer()
+    if not _YT_ID_RE.match(video_id):
+        await interaction.followup.send(
+            f"❌ `{video_id}` isn't a YouTube-style id; use `/summarize url:` "
+            "with the full URL for web jobs.",
+            ephemeral=True,
+        )
+        return
+    ok, reason = _rate_limit_check(interaction.user.id)
+    if not ok:
+        await interaction.followup.send(f"❌ {reason}", ephemeral=True)
+        return
+    canonical = f"https://www.youtube.com/watch?v={video_id}"
+    cfg = _effective_config(interaction.user.id, interaction.channel.id)
+    effective_model = model or cfg.get("model")
+    job = _job_from_interaction(
+        interaction, canonical,
+        user_prompt=(prompt or "").strip()[:USER_PROMPT_MAX_CHARS],
+        translate=_resolve_translate_choice(translate),
+        refresh=refresh,
+        vlm_enabled=cfg.get("vlm_enabled", VLM_ENABLED),
+        yt_comments_enabled=cfg.get("yt_comments_enabled", YT_COMMENTS_ENABLED),
+        model_override=effective_model,
+    )
+    if job is None:
+        await interaction.followup.send(
+            f"❌ Couldn't build a job for `{video_id}`.", ephemeral=True,
+        )
+        return
+    _rate_limit_record(interaction.user.id)
+    await queue.put(job)
+    await _ack_queued(job, queue.qsize())
+    log.info("Slash /redo queued %s from %s (model=%s, prompt=%s, translate=%s, refresh=%s)",
+             job.video_id, job.submitter_name,
+             effective_model or "default", bool(job.user_prompt), translate, refresh)
 
 
 @bot.tree.command(name="config", description="Configure this channel's bot defaults (admin)")
@@ -5094,6 +6036,7 @@ async def cmd_find(interaction: discord.Interaction, query: str) -> None:
     yt_comments="Fetch + summarise YouTube comments (extra Community Reaction embed)",
     show="Just print the current config without changing it",
 )
+@app_commands.autocomplete(model=_model_autocomplete)
 async def cmd_config(
     interaction: discord.Interaction,
     model: str | None = None,
@@ -5215,6 +6158,63 @@ async def cmd_serverconfig(
     )
     log.info("Guild %s config updated by %s: summary_channel=%s",
              interaction.guild_id, interaction.user, summary_channel.id)
+
+
+@bot.tree.command(name="myconfig", description="Set your own defaults — applies in any channel where you use the bot")
+@app_commands.describe(
+    model="Your default LLM model (empty = clear override)",
+    diarize="Default to speaker diarization on /transcribe",
+    clear="Wipe all your overrides",
+    show="Just print current overrides",
+)
+@app_commands.autocomplete(model=_model_autocomplete)
+async def cmd_myconfig(
+    interaction: discord.Interaction,
+    model: str | None = None,
+    diarize: bool | None = None,
+    clear: bool = False,
+    show: bool = False,
+) -> None:
+    """Per-user defaults. Apply in any channel where the bot picks up a
+    URL or a slash command from this user. Channel config (`/config`) wins
+    on conflict — that's intentional, a channel admin's policy outranks a
+    personal preference.
+    """
+    if clear:
+        # Wipe by setting all known fields to None.
+        set_user_config(interaction.user.id, model=None, diarize=None)
+        await interaction.response.send_message(
+            "Your overrides cleared — using channel/global defaults.",
+            ephemeral=True,
+        )
+        return
+
+    if show or (model is None and diarize is None):
+        cfg = get_user_config(interaction.user.id)
+        if not cfg:
+            txt = ("No personal overrides — using channel/global defaults.\n"
+                   "Set with `/myconfig model:<name>` or `/myconfig diarize:true`.")
+        else:
+            txt = "Your overrides:\n" + "\n".join(
+                f"  **{k}**: `{v}`" for k, v in cfg.items()
+            )
+        await interaction.response.send_message(txt, ephemeral=True)
+        return
+
+    fields: dict = {}
+    if model is not None:
+        fields["model"] = model.strip() or None
+    if diarize is not None:
+        fields["diarize"] = diarize
+    new_cfg = set_user_config(interaction.user.id, **fields)
+    if new_cfg:
+        txt = "Your overrides updated:\n" + "\n".join(
+            f"  **{k}**: `{v}`" for k, v in new_cfg.items()
+        )
+    else:
+        txt = "Overrides cleared — using channel/global defaults."
+    await interaction.response.send_message(txt, ephemeral=True)
+    log.info("User %s myconfig: %s", interaction.user, fields)
 
 
 # Sync commands on startup. Called once after the worker is up.

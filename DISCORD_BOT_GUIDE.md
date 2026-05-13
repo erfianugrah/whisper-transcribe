@@ -15,10 +15,19 @@ embeds.
 | Reply `tldr` (or `summarize`) to a message containing a URL | **Web URL flow** — scrapes the article and posts brief + key points + sections. Works for any non-video URL. **Reddit + HackerNews** get a structured fetch (linked article + post + top comments). If the URL IS a video, falls through to the video pipeline. |
 | Reply `litmus` to a message containing a URL | **AI litmus test** — surfaces stylistic + metadata signals (LLM-tic phrases, em-dash density, hedge usage, generic buzzwords, listicle structure, domain age via Wayback, AdSense detection, author byline). Forensic report, no verdict. |
 | Reply `tldr litmus` (or any keyword combo) to a message | **Chained reply** — fires both flows in one go. Order in your reply preserves order of execution; duplicates dedupe; rate-limit charges per fired job. |
-| `/summarize url:<URL> prompt:<text>` | Slash equivalent of paste-with-text (cleaner UX, arg validation). |
-| `/transcribe url:<URL> diarize:true` | Adds speaker labels. Embed grows a 🏷️ Rename speakers button. |
-| `/find query:<keywords>` | Searches your past transcripts for matching content. |
-| `/status` | Shows queue depth, your rate-limit usage, whisper service health. |
+| `/summarize url:<URL> prompt:<text>` | Slash equivalent of paste-with-text (cleaner UX, arg validation, `model:` autocompletes from the LLM proxy). |
+| `/transcribe url:<URL> diarize:true prompt:<text>` | Adds speaker labels. Embed grows a 🏷️ Rename speakers button. `prompt:` symmetric with `/summarize`. |
+| `/web url:<URL>` | Slash equivalent of the `tldr` reply — summarise any article. |
+| `/litmus url:<URL>` | Slash equivalent of the `litmus` reply — AI litmus test. |
+| `/progress` | Your in-flight jobs with phase + elapsed + ETA. Far richer than the reaction emojis. |
+| `/cancel job:<pick from list>` | Cancel one of YOUR queued or transcribing jobs. Autocompletes from your live entries. |
+| `/queue` | Server-wide view of everything in the bot queue right now. |
+| `/find query:<keywords> kind:<video\|web> since_days:<N>` | Search past transcripts with optional filters. |
+| `/recent kind:<video\|web> limit:<N>` | Last N cached summaries (newest first). |
+| `/redo video_id:<id>` | Re-run a cached YouTube job with different translate / model. Autocompletes from cache. |
+| `/myconfig model:<name> diarize:true` | Your personal defaults — applied in any channel. |
+| `/help topic:<overview\|triggers\|admin\|limits\|errors\|translate>` | Ephemeral help cards. |
+| `/status verbose:true` | Queue depth, service health, plus per-job phase/elapsed when verbose. |
 | `/config …` | Per-channel: model / VLM / diarize / yt_comments defaults (needs Manage Channel). |
 | `/serverconfig …` | Per-server: where Key Points + Chapters land (needs Manage Server). |
 
@@ -243,33 +252,138 @@ Rules:
 
 - `url` — required.
 - `prompt` — optional steering, same effect as Path B.
-- `model` — override `LLM_MODEL` for this run (advanced; pick from
-  `model_proxy`'s `/v1/models`).
+- `model` — override `LLM_MODEL` for this run. **Autocompletes** from the
+  LLM proxy's `/v1/models` endpoint (cached for 5 minutes).
 
 ```
-/transcribe url:<URL> diarize:true
+/transcribe url:<URL> diarize:true prompt:<text>
 ```
 
 - Same flow as `/summarize` but with speaker diarization enabled.
+- `prompt` is symmetric with `/summarize` — forces VLM, steers summary.
 - Emoji on the brief embed: 🏷️ **Rename speakers** button.
 - Click → modal with a text field per detected speaker → submit →
   bot re-runs the brief summary with your names baked in.
 
 ```
-/find query:<keywords>
+/web url:<URL> prompt:<text>
 ```
 
-Searches the bot's transcript cache (case-insensitive substring) and
-returns up to 10 matches with clickable links.
+Slash equivalent of the `tldr` reply trigger. Pass any non-video URL —
+the bot scrapes via Crawl4AI / FlareSolverr / Reddit structured-fetch
+and produces brief + key points + sections embeds.
 
 ```
-/status
+/litmus url:<URL>
+```
+
+Slash equivalent of the `litmus` reply trigger. Forensic AI-writing
+signals on any article. Always runs the page-fetch path (no video
+transcription) even on video URLs.
+
+```
+/progress
+```
+
+Your in-flight jobs with phase + elapsed time + ETA. Replaces guessing
+what 🎧 means — surfaces title (post-download), current phase
+(downloading / transcribing / scraping / summarising), elapsed wall
+time, and an ETA when computable. Ephemeral, only you see it.
+
+```
+/cancel job:<autocomplete from your active jobs>
+```
+
+Cancel one of your own queued or running jobs. Behaviour by phase:
+
+- **queued** (still in bot queue) — soft cancel, drops cleanly.
+- **transcribing** with whisper-side queue position — forwards `DELETE
+  /api/jobs/{id}`; whisper cancels if still queued server-side.
+- **transcribing in flight** — whisperX has no safe interrupt point.
+  Bot tells you to wait.
+- **downloading / scraping / summarising** — also non-interruptible
+  today.
+
+```
+/queue
+```
+
+Server-wide queue listing — every active and queued job with phase,
+elapsed time, and submitter. Useful for "is the worker stuck?" or
+"why hasn't mine started yet?".
+
+```
+/find query:<keywords> kind:<video|web|any> since_days:<N> limit:<N>
+```
+
+Searches the bot's transcript cache (case-insensitive substring).
+Filters:
+- `kind` — video, web, or any (default any).
+- `since_days` — limit to the last N days.
+- `limit` — 1-25 results (default 10).
+
+```
+/recent kind:<any|video|web> limit:<N>
+```
+
+Newest cached summaries first. Same filtering as `/find` but without a
+keyword. Use this to glance at what's been summarised recently.
+
+```
+/redo video_id:<autocomplete>
+```
+
+Re-run a cached YouTube job with different `translate` / `model` /
+`prompt` without retyping the URL. Defaults `refresh:true` (the common
+case is "the model got something wrong, try again"); pass
+`refresh:false` to re-summarise the existing cached transcript without
+re-downloading.
+
+```
+/help topic:<overview|triggers|admin|limits|errors|translate>
+```
+
+In-Discord ephemeral help cards. `overview` (default) lists every
+slash command; the named topics drill into specifics.
+
+```
+/status verbose:true
 ```
 
 Shows queue size, your usage in the last hour, whisper service health,
-active VLM model.
+active VLM model. With `verbose:true`, also lists the bot queue's
+contents (titles, kinds, phases, elapsed).
 
 ---
+
+## Per-user defaults (`/myconfig`)
+
+Want the bot to default to a particular model or always diarize for you
+without retyping each time? Set per-user defaults — they apply in every
+channel where you use the bot.
+
+```
+/myconfig model:gemma-4-31B-it-Q4_K_M    # your default model
+/myconfig diarize:true                    # default to speaker diarization on /transcribe
+/myconfig show:true                       # print your current overrides
+/myconfig clear:true                      # wipe all your overrides
+/myconfig model:                          # empty value clears that one field
+```
+
+**Precedence** (most specific → least):
+
+1. Explicit slash argument (`/summarize model:<x>` wins for that run).
+2. Per-channel config (`/config model:<y>` — channel admin's policy).
+3. Per-user config (`/myconfig model:<z>` — your personal preference).
+4. Env default (`LLM_MODEL`).
+
+Channel config outranks user config on purpose: a channel admin's
+policy ("this channel summarises long-form videos with the 31B model")
+should beat a personal preference. Use `/myconfig` for things that
+follow you around (your usual model, "I always want speaker labels"),
+not policy.
+
+Stored under `bot-cache/users.json`.
 
 ## Channel-specific config
 
@@ -436,11 +550,18 @@ object:
 |---|---|
 | Just pasted a video, want a summary | URL paste (Path A) |
 | Want the bot to focus on something specific | URL + text (Path B) or `/summarize prompt:` |
-| Saw an interesting article someone posted | Reply `tldr` (Path C) |
-| Wondering if an article is AI-generated / AI-spam | Reply `litmus` (Path D) |
+| Saw an interesting article someone posted | Reply `tldr` or `/web url:` |
+| Wondering if an article is AI-generated / AI-spam | Reply `litmus` or `/litmus url:` |
 | Want explicit control over args (model, diarize) | `/summarize`, `/transcribe` (Path E) |
-| Need to find a past summary | `/find` |
-| Channel has different needs from defaults | `/config` (one-time) |
+| "What's the bot doing with my job?" | `/progress` (phase + ETA per job) |
+| Queued wrong URL by accident | `/cancel job:` |
+| "Is the queue stuck?" | `/queue` or `/status verbose:true` |
+| Need to find a past summary | `/find query:` (with filters) |
+| Glance at what's been summarised recently | `/recent` |
+| Want to re-run a YouTube summary with diff opts | `/redo video_id:` (autocompletes from cache) |
+| Always want a particular model / diarize | `/myconfig` (once) |
+| Channel has different needs from defaults | `/config` (one-time, admin) |
+| New to the bot, need a tour | `/help topic:overview` |
 | Diarized output with renaming | `/transcribe diarize:true` then 🏷️ Rename speakers |
 
 The auto-paste, reply-trigger, and slash paths all share the same job
