@@ -12,24 +12,12 @@ BOT_IMAGE     := $(REGISTRY)/whisper-transcribe-bot
 GIT_SHA       := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 
 # Two compose handles:
-#   $(COMPOSE_RUNTIME)         — base only. Used by validation (compose-check)
-#                        which exercises files individually.
-#   $(COMPOSE_RUNTIME) — base + auto-detected overlay. Used by
-#                        runtime targets (up, down, logs, ship, …).
-#                        The overlay auto-attaches when llm-compose's
-#                        external network is present so existing users
-#                        keep their model_proxy routing without manual
-#                        flag-passing; strangers without llm-compose
-#                        get the host-side Ollama default.
+# Compose binding. The llm-compose overlay was removed in May 2026 — its
+# network (`llmc`) is now declared `external` in compose.yaml directly, so
+# `docker compose up` always lands the bot + whisper on the right network
+# and reaches `model_proxy` by hostname. Bring up llm-compose first.
 COMPOSE := docker compose
-# COMPOSE_RUNTIME picks up the llm-compose overlay when its external network
-# exists. The `-f` flags must include BOTH base and overlay because once you
-# pass any `-f`, Compose stops auto-loading compose.yaml.
-ifeq ($(shell docker network inspect llm-compose_llm >/dev/null 2>&1 && echo yes),yes)
-COMPOSE_RUNTIME := docker compose -f compose.yaml -f compose.llm-compose.yaml
-else
 COMPOSE_RUNTIME := docker compose
-endif
 
 # Latest yt-dlp version from PyPI, fetched at make-invocation time. The
 # Dockerfile's volatile yt-dlp layer is keyed on this — when PyPI has a new
@@ -193,15 +181,9 @@ compile-check: ## ast.parse + py_compile (catches syntax + bytecode errors)
 	@python3 -c "import ast; [ast.parse(open(p).read()) for p in ['app.py','bot/main.py','bot/prompts.py']]"
 	@echo "  ast.parse OK"
 
-compose-check: ## Validate compose YAML (prod + dev + llm-compose overlays)
+compose-check: ## Validate compose YAML (prod + dev overlays)
 	@$(COMPOSE) config -q && echo "  compose.yaml OK"
 	@$(COMPOSE) -f compose.yaml -f compose.dev.yaml config -q && echo "  compose.dev.yaml overlay OK"
-	@if docker network inspect llm-compose_llm >/dev/null 2>&1; then \
-	    $(COMPOSE) -f compose.yaml -f compose.llm-compose.yaml config -q && \
-	        echo "  compose.llm-compose.yaml overlay OK"; \
-	else \
-	    echo "  compose.llm-compose.yaml overlay skipped (llm-compose_llm network not present)"; \
-	fi
 
 bot-import-check: ## Import bot main module under stubbed deps + verify exports
 	@python3 -c "$$BOT_IMPORT_CHECK"

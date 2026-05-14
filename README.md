@@ -35,24 +35,16 @@ make build && make up
 # Whisper API ping:  curl http://localhost:7860/api/status
 ```
 
-The bot defaults to `llama3.1` via Ollama on the host; change `LLM_MODEL` /
-`LLM_API_URL` in `bot/.env` to point at any OpenAI-compatible service
-(see `.env.example` for examples covering vLLM, llama.cpp server, OpenAI,
-and llm-compose).
+The defaults point `LLM_API_URL` and `LLM_VISION_API_URL` at
+`http://model_proxy:11434/v1` on the external `llmc` network owned by
+[llm-compose](https://github.com/erfianugrah/llm-compose). Bring
+`llm-compose` up first (`cd ~/llm-compose && make up`) — this stack
+declares the network `external: true` and refuses to start with a clean
+"network llmc not found" error otherwise.
 
-### Running alongside [llm-compose](https://github.com/erfianugrah/llm-compose)
-
-If you already run llm-compose on the same host (for hot-swapping local
-GGUFs), bring it up first, then layer in the overlay so this stack joins
-its `model_proxy`:
-
-```bash
-docker compose -f compose.yaml -f compose.llm-compose.yaml up -d
-```
-
-Defaults in the overlay point `LLM_API_URL` at `http://model_proxy:11434/v1`
-and pick reasonable `LLM_MODEL` / `LLM_VISION_MODEL` presets that exist in
-llm-compose. Override anything you want in `.env`.
+To use a different LLM provider (host-side Ollama, llama.cpp, vLLM,
+hosted APIs), override `LLM_API_URL` / `LLM_MODEL` / `LLM_VISION_API_URL`
+/ `LLM_VISION_MODEL` in `bot/.env` — see `.env.example` for examples.
 
 ## Features
 

@@ -47,12 +47,19 @@ services:
       # Leave unset to disable; see .env.example for the why and how.
       - YT_DLP_COOKIES_FILE=${YT_DLP_COOKIES_FILE:-}
       # VLM: silent-video frame description via OpenAI-compatible endpoint.
-      # Default points at host-side Ollama on the gateway IP (resolves from
-      # inside the container). Override with whatever serves vision models:
-      # llm-compose, vLLM, llama.cpp, hosted services (set LLM_VISION_API_URL
-      # to https://api.openai.com/v1 + your OPENAI_API_KEY equivalent).
-      - LLM_VISION_API_URL=${LLM_VISION_API_URL:-http://host.docker.internal:11434/v1}
-      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-llava}
+      # Defaults target llm-compose's model_proxy on the `llmc` external
+      # network (see the networks: block on this service). Override to
+      # point at any OpenAI-compatible service:
+      #   - host-side Ollama:   http://host.docker.internal:11434/v1
+      #   - llama.cpp server:   http://<host>:8080/v1
+      #   - vLLM:               http://<host>:8000/v1
+      #   - hosted APIs:        https://api.openai.com/v1 (with OPENAI_API_KEY)
+      - LLM_VISION_API_URL=${LLM_VISION_API_URL:-http://model_proxy:11434/v1}
+      - LLM_VISION_MODEL=${LLM_VISION_MODEL:-gemma-4-26B-A4B-it-Q4_K_M}
+      # Scene-cluster synthesis (server-side text LLM call), same endpoint
+      # by default so the VRAM swap is shared.
+      - LLM_TEXT_API_URL=${LLM_TEXT_API_URL:-http://model_proxy:11434/v1}
+      - LLM_SYNTHESIS_MODEL=${LLM_SYNTHESIS_MODEL:-gemma-4-26B-A4B-it-Q4_K_M}
       # Seconds of idle after which WhisperX models unload to free ~2 GB
       # VRAM for other GPU work (LLM inference, browser, comfyui).
       # 300s = the model stays resident for back-to-back jobs (typical
@@ -71,16 +78,20 @@ services:
       - "7860:7860"
     extra_hosts:
       # Lets `host.docker.internal` resolve from Linux containers (Docker
-      # Desktop adds it automatically; Linux Engine doesn't). Used by the
-      # default LLM_VISION_API_URL so out-of-the-box hits a local Ollama
-      # running on the host.
+      # Desktop adds it automatically; Linux Engine doesn't). Kept as a
+      # fallback for users overriding LLM_VISION_API_URL to point at a
+      # host-side service (Ollama, llama.cpp).
       - "host.docker.internal:host-gateway"
     networks:
-      # In-stack network so bot ↔ whisper ↔ scrapers all see each other.
-      # To ALSO join an external llm-compose network, layer in
-      # `compose.llm-compose.yaml` with `docker compose -f compose.yaml -f
-      # compose.llm-compose.yaml up` (see that file).
-      - default
+      # In-stack network for bot ↔ whisper ↔ scrapers.
+      default:
+      # External llm-compose network — required so whisper can reach
+      # model_proxy by name (DNS resolves on this user-defined network).
+      # The `llmc` network is created by llm-compose's `make up`; this
+      # stack will fail to start cleanly if llm-compose isn't running.
+      # That is intentional — they're co-deployed and the old "compose
+      # overlay you might forget" pattern caused silent regressions.
+      llmc:
     volumes:
       # Writable state lives in named volumes — Docker initializes named
       # volumes with the image-path's ownership (uid 1000 / ubuntu), so a
@@ -164,16 +175,15 @@ services:
       - WHISPER_API_URL=http://whisper:7860
       - SCRAPER_API_URL=http://crawl4ai:11235
       - FLARESOLVERR_API_URL=http://flaresolverr:8191/v1
-      # OpenAI-compatible endpoint for summaries. Default targets host-side
-      # Ollama (`ollama serve` on the host machine) — works out of the box
-      # on most hobbyist setups. Override to point at any compatible service:
-      #   - llm-compose:        http://model_proxy:11434/v1 (also needs the
-      #                         compose.llm-compose.yaml overlay)
+      # OpenAI-compatible endpoint for summaries. Default targets the
+      # co-deployed llm-compose model_proxy over the `llmc` external
+      # network. Override to point at any compatible service:
+      #   - host-side Ollama:   http://host.docker.internal:11434/v1
       #   - llama.cpp server:   http://<host>:8080/v1
       #   - vLLM:               http://<host>:8000/v1
       #   - OpenAI / Anthropic: https://api.openai.com/v1 with OPENAI_API_KEY
-      - LLM_API_URL=${LLM_API_URL:-http://host.docker.internal:11434/v1}
-      - LLM_MODEL=${LLM_MODEL:-llama3.1}
+      - LLM_API_URL=${LLM_API_URL:-http://model_proxy:11434/v1}
+      - LLM_MODEL=${LLM_MODEL:-gemma-4-26B-A4B-it-Q4_K_M}
       # Per-slot context on the LLM server. Bot derives its char budget from
       # this; raising it lets typical transcripts fit single-pass per style
       # (1 LLM call instead of map-reduce's 3 calls per chunked style).
@@ -184,7 +194,10 @@ services:
     volumes:
       - bot-cache:/app/cache
     networks:
-      - default
+      default:
+      # Same rationale as the `whisper` service — bot reaches model_proxy
+      # by hostname over the llm-compose `llmc` network.
+      llmc:
     depends_on:
       whisper:
         condition: service_healthy
@@ -203,4 +216,13 @@ volumes:
   valkey-data:    # job queue state + transcript cache (AOF + periodic snapshots)
 
 networks:
+  # In-stack: bot ↔ whisper ↔ valkey ↔ scrapers.
   default:
+  # External network owned by llm-compose. Pinning `name: llmc` so we don't
+  # rely on compose's project-prefixed naming. Marked external so `docker
+  # compose down` won't try to remove it (it belongs to the llm-compose
+  # stack lifecycle). Bring up llm-compose first; this stack will refuse
+  # to start with a clean "network llmc not found" error otherwise.
+  llmc:
+    external: true
+    name: llmc

@@ -480,22 +480,147 @@ from collections import deque, defaultdict
 _user_jobs: dict[int, deque[float]] = defaultdict(deque)
 
 
+# ─── LLM health gate ──────────────────────────────────────────────────────────
+# The bot needs the LLM endpoint (LLM_API_URL) to do any summarisation work.
+# When the endpoint is unreachable, we want fast, clear failure rather than
+# the 130s retry-ladder behaviour the old worker had (10 + 30 + 90 s of pure
+# sleep per request, fanned out across multiple summary styles).
+#
+# Two-pronged design:
+#   1. _llm_call wraps aiohttp transport errors → LLMOfflineError, a
+#      PermanentError subclass that the worker fails fast on (no retry).
+#      Marking the LLM unhealthy at the same time.
+#   2. A background probe (llm_health_loop) polls /v1/models periodically.
+#      Healthy: 60s interval. Unhealthy: 15s interval (fast recovery).
+#   3. The queue gate (_rate_limit_check) rejects new submissions while
+#      unhealthy with a clear user-facing message.
+#
+# Net effect on the user: a failed run posts a "❌ LLM offline" message in
+# ~1s instead of ~140s; subsequent requests reject in <1ms with the same
+# message until the probe flips back to healthy.
+
+LLM_PROBE_HEALTHY_INTERVAL = int(os.environ.get("LLM_PROBE_HEALTHY_INTERVAL", "60"))
+LLM_PROBE_UNHEALTHY_INTERVAL = int(os.environ.get("LLM_PROBE_UNHEALTHY_INTERVAL", "15"))
+LLM_PROBE_TIMEOUT = float(os.environ.get("LLM_PROBE_TIMEOUT", "5"))
+
+
+@dataclass
+class _LLMHealthState:
+    """Bot's view of whether the LLM endpoint is reachable. Single-threaded
+    asyncio access — no lock needed."""
+    healthy: bool = True                # start optimistic; probe corrects on boot
+    last_check_at: float = 0.0          # last probe (success OR failure)
+    last_recovery_at: float = 0.0       # last healthy → unhealthy → healthy edge
+    last_failure_reason: str = ""       # for the user-facing message
+    failure_count: int = 0              # consecutive probe failures
+
+
+_llm_health = _LLMHealthState()
+
+
+def _mark_llm_unhealthy(reason: str) -> None:
+    """Flag LLM as unreachable. Idempotent. On the healthy→unhealthy edge
+    we log a warning so operators see the transition in container logs."""
+    _llm_health.failure_count += 1
+    _llm_health.last_failure_reason = reason
+    _llm_health.last_check_at = time.time()
+    if _llm_health.healthy:
+        log.warning("LLM endpoint marked unhealthy: %s", reason)
+        _llm_health.healthy = False
+
+
+def _mark_llm_healthy() -> None:
+    """Flag LLM as reachable. Logs recovery on the unhealthy→healthy edge."""
+    if not _llm_health.healthy:
+        log.info("LLM endpoint recovered: %s", LLM_API)
+        _llm_health.last_recovery_at = time.time()
+    _llm_health.healthy = True
+    _llm_health.failure_count = 0
+    _llm_health.last_check_at = time.time()
+
+
+async def _probe_llm() -> bool:
+    """One-shot transport probe of LLM_API_URL/models. Returns True on 200.
+
+    Uses a short timeout so an unhealthy endpoint doesn't slow the probe
+    loop. Catches every aiohttp/asyncio error class — at probe time we
+    just want a boolean reachable/not-reachable answer."""
+    if http is None:
+        return False  # session not initialised yet; main loop will retry
+    try:
+        async with http.get(
+            f"{LLM_API}/models",
+            timeout=aiohttp.ClientTimeout(total=LLM_PROBE_TIMEOUT),
+        ) as resp:
+            return resp.status == 200
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        return False
+
+
+async def llm_health_loop() -> None:
+    """Background task: probe LLM_API_URL periodically + maintain
+    _llm_health state. Started from on_ready."""
+    # Boot-time probe so the "Bot ready" log line is followed by an
+    # explicit reachability status. Discord stays connected either way.
+    ok = await _probe_llm()
+    if ok:
+        _mark_llm_healthy()
+        log.info("LLM endpoint reachable at %s (boot probe OK)", LLM_API)
+    else:
+        _mark_llm_unhealthy(f"boot probe failed against {LLM_API}")
+        log.warning(
+            "LLM endpoint NOT reachable at %s — bot will reject new "
+            "summary work with a degraded-mode message and re-probe "
+            "every %ds until recovered.",
+            LLM_API, LLM_PROBE_UNHEALTHY_INTERVAL,
+        )
+
+    while True:
+        interval = (
+            LLM_PROBE_HEALTHY_INTERVAL if _llm_health.healthy
+            else LLM_PROBE_UNHEALTHY_INTERVAL
+        )
+        await asyncio.sleep(interval)
+        if await _probe_llm():
+            _mark_llm_healthy()
+        else:
+            _mark_llm_unhealthy(f"probe failed against {LLM_API}")
+
+
+def _llm_offline_user_reason() -> str:
+    """User-facing reason string when LLM is unreachable. Used by
+    _rate_limit_check and by the worker's failure handler."""
+    if _llm_health.last_recovery_at:
+        ago = int(time.time() - _llm_health.last_recovery_at)
+        when = f" (last reachable ~{ago // 60} min ago)" if ago > 60 else ""
+    else:
+        when = ""
+    return (
+        f"🚧 LLM backend offline{when}. Bot is auto-probing every "
+        f"{LLM_PROBE_UNHEALTHY_INTERVAL}s; resubmit when it's back."
+    )
+
+
 def _rate_limit_check(user_id: int, count: int = 1) -> tuple[bool, str]:
     """Returns (allowed, reason). `allowed=False` rejects with `reason`.
 
-    Two checks:
-      1. Total queue cap (independent of user) — protects against
+    Three checks, in order of severity:
+      1. LLM endpoint reachable — short-circuits everything else when
+         the LLM is down (no point queueing work we can't fulfil).
+      2. Total queue cap (independent of user) — protects against
          collective overload.
-      2. Per-user sliding window (60 min) — protects against single-user
+      3. Per-user sliding window (60 min) — protects against single-user
          spam.
     Bypass list (RATE_LIMIT_BYPASS_USERS) skips the per-user check but
-    still enforces the queue cap (so admins can't crash the bot either).
+    still enforces the queue cap and the LLM gate.
 
     `count` is the number of jobs the caller wants to enqueue atomically
     (e.g. chained `tldr litmus` reply requests two jobs in one go). The
     cap check uses `count` so we reject all-or-nothing rather than
     partial-fail mid-batch.
     """
+    if not _llm_health.healthy:
+        return False, _llm_offline_user_reason()
     if queue.qsize() + count > MAX_QUEUE_SIZE:
         return False, (
             f"Queue is full — would push {queue.qsize()}+{count} past "
@@ -522,6 +647,154 @@ def _rate_limit_check(user_id: int, count: int = 1) -> tuple[bool, str]:
 def _rate_limit_record(user_id: int) -> None:
     """Record that a job was just queued for this user."""
     _user_jobs[user_id].append(time.time())
+
+
+# ─── Retry view (LLM-offline rejections) ──────────────────────────────────────
+# When the queue gate rejects a job because the LLM endpoint is unreachable,
+# we attach a single "Retry when ready" button to the rejection message so
+# the user can resubmit with one click instead of re-pasting the URL.
+#
+# Rate-limit / queue-full rejections don't get the retry button — there's
+# nothing the user can do via a click that retyping wouldn't also fix, and
+# a button that just hits the rate limit again would be misleading.
+
+
+@dataclass
+class _RetrySpec:
+    """Lightweight snapshot of a Job's submission inputs. Stored in the
+    RetryJobsView so a button click can rebuild the Job without holding
+    a stale Job reference (Job contains Discord message/interaction refs
+    that may be invalid by the time the user clicks retry)."""
+    url: str
+    kind: str                      # "video" | "web" | "litmus"
+    video_id: str                  # YT id or URL hash, same convention as Job
+    diarize: bool = False
+    vlm_enabled: bool = True
+    yt_comments_enabled: bool = True
+    user_prompt: str = ""
+    model_override: str | None = None
+    translate: object = "auto"
+    refresh: bool = False
+    explicit_request: bool = True  # retries are always explicit (user clicked)
+
+
+def _job_to_retry_spec(job: "Job") -> _RetrySpec:
+    """Extract the parts of a Job that survive being held in a View."""
+    return _RetrySpec(
+        url=job.url,
+        kind=job.kind,
+        video_id=job.video_id,
+        diarize=job.diarize,
+        vlm_enabled=job.vlm_enabled,
+        yt_comments_enabled=job.yt_comments_enabled,
+        user_prompt=job.user_prompt,
+        model_override=job.model_override,
+        translate=job.translate,
+        refresh=job.refresh,
+        explicit_request=job.explicit_request,
+    )
+
+
+class RetryJobsView(discord.ui.View):
+    """Single-click resubmit for jobs rejected by the LLM-offline gate.
+
+    Only the original submitter can click. Once a click succeeds in
+    queueing the jobs, the button disables itself so a user can't queue
+    the same job twice (the queued copies still respect the rate limit).
+    """
+
+    # 30 min — long enough that a typical LLM outage (model swap, OOM
+    # recovery, container restart) doesn't strand a queued retry, short
+    # enough that the View doesn't pile up indefinitely on the bot's
+    # in-memory state if the LLM stays down for hours.
+    TIMEOUT = float(os.environ.get("RETRY_VIEW_TIMEOUT", "1800"))
+
+    def __init__(self, specs: list[_RetrySpec], target_user_id: int):
+        super().__init__(timeout=self.TIMEOUT)
+        self.specs = specs
+        self.target_user_id = target_user_id
+
+    @discord.ui.button(label="Retry when ready", style=discord.ButtonStyle.primary, emoji="🔁")
+    async def retry_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button,
+    ) -> None:
+        # Only the original submitter can retry — otherwise a stranger
+        # could burn the submitter's rate-limit budget by clicking.
+        if interaction.user.id != self.target_user_id:
+            await interaction.response.send_message(
+                f"Only <@{self.target_user_id}> can retry this submission.",
+                ephemeral=True,
+            )
+            return
+
+        # Re-check the gate (LLM health + rate limit + queue cap). The
+        # whole point of the button is that state may have changed since
+        # the rejection was posted.
+        ok, reason = _rate_limit_check(self.target_user_id, count=len(self.specs))
+        if not ok:
+            # Still failing — ephemeral feedback so the channel doesn't
+            # accumulate "still offline" messages every time the user clicks.
+            # Don't disable the button: state may recover later.
+            await interaction.response.send_message(
+                f"⏳ {reason}", ephemeral=True,
+            )
+            return
+
+        # Gate passes — defer the response (we'll send a followup with
+        # the queued ack) and disable the button to prevent duplicates.
+        await interaction.response.defer(thinking=False)
+        for c in self.children:
+            c.disabled = True
+        try:
+            # Replace the view on the original rejection message so the
+            # disabled button reflects the consumed retry.
+            await interaction.edit_original_response(view=self)
+        except (discord.HTTPException, discord.NotFound):
+            pass
+
+        # Rebuild Jobs. Each one points at the button-click interaction
+        # for ack + worker output. interaction.followup is valid for ~15
+        # min from the click, which comfortably covers transcribe +
+        # summarise on any sane GPU.
+        for spec in self.specs:
+            job = Job(
+                url=spec.url, video_id=spec.video_id,
+                channel=interaction.channel,
+                submitter_id=interaction.user.id,
+                submitter_name=str(interaction.user),
+                user_prompt=spec.user_prompt,
+                diarize=spec.diarize,
+                vlm_enabled=spec.vlm_enabled,
+                yt_comments_enabled=spec.yt_comments_enabled,
+                model_override=spec.model_override,
+                translate=spec.translate,
+                refresh=spec.refresh,
+                kind=spec.kind,
+                explicit_request=spec.explicit_request,
+                interaction=interaction,
+            )
+            _rate_limit_record(job.submitter_id)
+            await queue.put(job)
+            await _ack_queued(job, queue.qsize())
+            log.info(
+                "Retry-button queued %s (%s) from %s (channel=%s)",
+                job.video_id, job.kind, job.submitter_name,
+                interaction.channel.id,
+            )
+
+
+def _maybe_retry_view(
+    specs: list[_RetrySpec],
+    target_user_id: int,
+) -> "RetryJobsView | None":
+    """Return a RetryJobsView when the reason for rejection is recoverable
+    by clicking (i.e. LLM-offline). Returns None for non-recoverable rejects
+    (rate limit, queue full) where a click would just hit the same wall."""
+    if _llm_health.healthy:
+        # LLM is reachable → the gate failed for a different reason
+        # (rate limit, queue cap). A button can't bypass either.
+        return None
+    return RetryJobsView(specs=specs, target_user_id=target_user_id)
 
 
 # ─── Inflight job tracking ────────────────────────────────────────────────────
@@ -957,6 +1230,11 @@ async def on_ready():
     http = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=900))
     bot.loop.create_task(worker())
     bot.loop.create_task(cache_cleanup_loop())
+    # LLM health probe — boots optimistic (healthy), corrects on first probe.
+    # Without this, the first failed user request would be the only signal
+    # to operators that the LLM endpoint is unreachable (and the worker
+    # would burn 130s of retry backoff before posting "❌ Failed").
+    bot.loop.create_task(llm_health_loop())
     try:
         await _sync_slash_commands()
     except Exception as e:
@@ -1240,10 +1518,17 @@ async def on_message(message: discord.Message):
     ok, reason = _rate_limit_check(message.author.id)
     if not ok:
         await safe_react(message, "\U0001f6ab")  # 🚫
+        # LLM-offline rejections get a Retry button so the user doesn't
+        # have to re-paste the URL when the endpoint comes back.
+        retry_view = _maybe_retry_view(
+            [_job_to_retry_spec(j) for j in jobs_to_queue],
+            target_user_id=message.author.id,
+        )
         try:
             await message.channel.send(
                 f"❌ {message.author.mention} {reason}",
                 reference=message, mention_author=False,
+                view=retry_view,
             )
         except discord.HTTPException:
             pass
@@ -1336,22 +1621,10 @@ async def _handle_reply_trigger(
 
     cfg = _effective_config(message.author.id, message.channel.id)
 
-    # Rate-limit + queue-cap apply equally to web/video/litmus jobs.
-    # Atomic batch: reject the whole reply if it would push past either cap.
-    ok, reason = _rate_limit_check(message.author.id, count=len(kind_hints))
-    if not ok:
-        await safe_react(message, "\U0001f6ab")  # 🚫
-        try:
-            await message.channel.send(
-                f"❌ {message.author.mention} {reason}",
-                reference=message, mention_author=False,
-            )
-        except discord.HTTPException:
-            pass
-        return
-
     # Build one Job per hint. URL parsing happens once above; per-hint we
     # only flip the kind discriminator and pick the right ID scheme.
+    # Built BEFORE the rate-limit check so the retry view (attached to
+    # an LLM-offline rejection) has the specs available.
     jobs: list[Job] = []
     for hint in kind_hints:
         if hint == "litmus":
@@ -1409,6 +1682,25 @@ async def _handle_reply_trigger(
                 message=message,
             )
         jobs.append(job)
+
+    # Rate-limit + queue-cap apply equally to web/video/litmus jobs.
+    # Atomic batch: reject the whole reply if it would push past either cap.
+    ok, reason = _rate_limit_check(message.author.id, count=len(kind_hints))
+    if not ok:
+        await safe_react(message, "\U0001f6ab")  # 🚫
+        retry_view = _maybe_retry_view(
+            [_job_to_retry_spec(j) for j in jobs],
+            target_user_id=message.author.id,
+        )
+        try:
+            await message.channel.send(
+                f"❌ {message.author.mention} {reason}",
+                reference=message, mention_author=False,
+                view=retry_view,
+            )
+        except discord.HTTPException:
+            pass
+        return
 
     for job in jobs:
         _rate_limit_record(job.submitter_id)
@@ -2047,6 +2339,19 @@ class NotAVideoError(PermanentError):
     """
 
 
+class LLMOfflineError(PermanentError):
+    """LLM endpoint is unreachable at the transport level (connection
+    refused, DNS failure, no route to host, transport timeout).
+
+    Subclass of PermanentError so the worker skips the retry-backoff
+    ladder. Backoff (10 + 30 + 90 s) is the right policy for a 503 from
+    a loaded model — counterproductive against a port nobody's listening
+    on. The periodic LLM health probe (llm_health_loop) re-flips the
+    bot to healthy when the endpoint comes back, and queued/new jobs
+    are rejected up-front via _rate_limit_check until then.
+    """
+
+
 # Subset of _PERMANENT_REMOTE_PATTERNS that specifically mean "this URL is not
 # a video". Used to distinguish "yt-dlp can't handle this URL at all" from
 # "yt-dlp could but the content is gated/unavailable" (private video, members
@@ -2373,11 +2678,19 @@ async def worker():
             for emoji in PROCESSING_EMOJI:
                 await _job_remove_react(job, emoji)
             await _job_react(job, "\u274c")  # ❌
-            await _job_reply(
-                job,
-                f"Failed to process `{job.video_id}` ({attempts}): "
-                f"{type(last_error).__name__}: {last_error}",
-            )
+            # LLM-offline failures get a clearer user-facing message
+            # than the generic "LLMOfflineError: LLM unreachable at X"
+            # since the user's next move (resubmit later) differs from
+            # other permanent failures (which are typically content-side
+            # and won't be fixed by resubmitting).
+            if isinstance(last_error, LLMOfflineError):
+                reply = _llm_offline_user_reason()
+            else:
+                reply = (
+                    f"Failed to process `{job.video_id}` ({attempts}): "
+                    f"{type(last_error).__name__}: {last_error}"
+                )
+            await _job_reply(job, reply)
         # Terminal: drop from inflight whether success, error, silent drop,
         # or cancellation. Records runtime for the rolling ETA average when
         # the job actually ran.
@@ -3338,8 +3651,14 @@ _model_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 async def _llm_call(prompt: str, max_tokens: int) -> str:
     """One LLM chat-completion request.
 
-    Raises PermanentError on 4xx (won't recover on retry); RuntimeError on 5xx
-    or transport errors (worker will retry).
+    Raises:
+      - LLMOfflineError on transport-level failure (connection refused,
+        DNS, timeout). PermanentError subclass → worker skips retry-ladder
+        AND we mark the LLM unhealthy so subsequent submissions short-circuit
+        in _rate_limit_check.
+      - PermanentError on 4xx or known-permanent error signatures (won't
+        recover on retry).
+      - RuntimeError on 5xx / other HTTP errors (worker retries).
     """
     if http is None: raise RuntimeError("HTTP session not initialised")
     payload = {
@@ -3348,16 +3667,34 @@ async def _llm_call(prompt: str, max_tokens: int) -> str:
         "temperature": LLM_TEMPERATURE,
         "max_tokens": max_tokens,
     }
-    async with http.post(f"{LLM_API}/chat/completions", json=payload) as resp:
-        if resp.status != 200:
-            body = await resp.text()
-            # 4xx OR known-permanent error signature → no retry. Some
-            # OpenAI-compatible servers return 500 with `exceed_context_size_error`
-            # in the body — match the body too.
-            if (400 <= resp.status < 500) or _is_permanent_remote_error(body):
-                raise PermanentError(f"LLM rejected request ({resp.status}): {body[:300]}")
-            raise RuntimeError(f"LLM failed ({resp.status}): {body[:200]}")
-        data = await resp.json()
+    try:
+        async with http.post(f"{LLM_API}/chat/completions", json=payload) as resp:
+            status = resp.status
+            body_for_classify = None
+            if status != 200:
+                body_for_classify = await resp.text()
+            else:
+                data = await resp.json()
+    except (aiohttp.ClientConnectorError,
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ClientConnectionError,
+            asyncio.TimeoutError) as e:
+        # Transport-level: nobody listening at the URL or connection torn
+        # down before we got bytes back. Flag the endpoint unhealthy so
+        # the queue gate stops accepting new jobs until the probe loop
+        # confirms recovery, and fail fast instead of going through the
+        # 130 s retry-backoff ladder for an error that won't fix itself
+        # on retry.
+        _mark_llm_unhealthy(f"{type(e).__name__}: {e}")
+        raise LLMOfflineError(f"LLM unreachable at {LLM_API}: {e}") from e
+    if status != 200:
+        body = body_for_classify or ""
+        # 4xx OR known-permanent error signature → no retry. Some
+        # OpenAI-compatible servers return 500 with `exceed_context_size_error`
+        # in the body — match the body too.
+        if (400 <= status < 500) or _is_permanent_remote_error(body):
+            raise PermanentError(f"LLM rejected request ({status}): {body[:300]}")
+        raise RuntimeError(f"LLM failed ({status}): {body[:200]}")
     return data["choices"][0]["message"]["content"]
 
 
@@ -5269,11 +5606,10 @@ async def cmd_summarize(
     refresh: bool = False,
 ) -> None:
     await interaction.response.defer()
-    ok, reason = _rate_limit_check(interaction.user.id)
-    if not ok:
-        await interaction.followup.send(f"❌ {reason}", ephemeral=True)
-        return
 
+    # Parse + build the Job BEFORE the rate-limit check so that an
+    # LLM-offline rejection can attach a Retry button populated from
+    # the parsed-and-validated job spec.
     cfg = _effective_config(interaction.user.id, interaction.channel.id)
     effective_model = model or cfg.get("model")
     job = _job_from_interaction(
@@ -5290,6 +5626,16 @@ async def cmd_summarize(
             f"❌ Couldn't parse a supported video URL from: {url}", ephemeral=True
         )
         return
+
+    ok, reason = _rate_limit_check(interaction.user.id)
+    if not ok:
+        retry_view = _maybe_retry_view([_job_to_retry_spec(job)],
+                                       target_user_id=interaction.user.id)
+        await interaction.followup.send(
+            f"❌ {reason}", ephemeral=True, view=retry_view,
+        )
+        return
+
     _rate_limit_record(interaction.user.id)
     await queue.put(job)
     await _ack_queued(job, queue.qsize())
@@ -5320,10 +5666,6 @@ async def cmd_transcribe(
     # through to whisper for labelling. `prompt` matches /summarize
     # symmetry: forces VLM enrichment and steers the summary LLM.
     await interaction.response.defer()
-    ok, reason = _rate_limit_check(interaction.user.id)
-    if not ok:
-        await interaction.followup.send(f"❌ {reason}", ephemeral=True)
-        return
 
     cfg = _effective_config(interaction.user.id, interaction.channel.id)
     job = _job_from_interaction(
@@ -5341,6 +5683,16 @@ async def cmd_transcribe(
             f"❌ Couldn't parse a supported video URL from: {url}", ephemeral=True
         )
         return
+
+    ok, reason = _rate_limit_check(interaction.user.id)
+    if not ok:
+        retry_view = _maybe_retry_view([_job_to_retry_spec(job)],
+                                       target_user_id=interaction.user.id)
+        await interaction.followup.send(
+            f"❌ {reason}", ephemeral=True, view=retry_view,
+        )
+        return
+
     _rate_limit_record(interaction.user.id)
     await queue.put(job)
     await _ack_queued(job, queue.qsize())
@@ -5369,10 +5721,6 @@ async def cmd_web(
     happens to be a clear video URL we still route through the web pipeline
     (use /summarize for video). Cache hits return instantly."""
     await interaction.response.defer()
-    ok, reason = _rate_limit_check(interaction.user.id)
-    if not ok:
-        await interaction.followup.send(f"❌ {reason}", ephemeral=True)
-        return
 
     cfg = _effective_config(interaction.user.id, interaction.channel.id)
     effective_model = model or cfg.get("model")
@@ -5387,6 +5735,16 @@ async def cmd_web(
             f"❌ Couldn't parse a URL from: {url}", ephemeral=True
         )
         return
+
+    ok, reason = _rate_limit_check(interaction.user.id)
+    if not ok:
+        retry_view = _maybe_retry_view([_job_to_retry_spec(job)],
+                                       target_user_id=interaction.user.id)
+        await interaction.followup.send(
+            f"❌ {reason}", ephemeral=True, view=retry_view,
+        )
+        return
+
     _rate_limit_record(interaction.user.id)
     await queue.put(job)
     await _ack_queued(job, queue.qsize())
@@ -5411,10 +5769,6 @@ async def cmd_litmus(
     no verdict. Always runs the web-fetch path even on video URLs (the
     bot inspects the page, not the audio)."""
     await interaction.response.defer()
-    ok, reason = _rate_limit_check(interaction.user.id)
-    if not ok:
-        await interaction.followup.send(f"❌ {reason}", ephemeral=True)
-        return
 
     cfg = _effective_config(interaction.user.id, interaction.channel.id)
     job = _job_from_interaction(
@@ -5427,6 +5781,16 @@ async def cmd_litmus(
             f"❌ Couldn't parse a URL from: {url}", ephemeral=True
         )
         return
+
+    ok, reason = _rate_limit_check(interaction.user.id)
+    if not ok:
+        retry_view = _maybe_retry_view([_job_to_retry_spec(job)],
+                                       target_user_id=interaction.user.id)
+        await interaction.followup.send(
+            f"❌ {reason}", ephemeral=True, view=retry_view,
+        )
+        return
+
     _rate_limit_record(interaction.user.id)
     await queue.put(job)
     await _ack_queued(job, queue.qsize())
@@ -5999,10 +6363,6 @@ async def cmd_redo(
             ephemeral=True,
         )
         return
-    ok, reason = _rate_limit_check(interaction.user.id)
-    if not ok:
-        await interaction.followup.send(f"❌ {reason}", ephemeral=True)
-        return
     canonical = f"https://www.youtube.com/watch?v={video_id}"
     cfg = _effective_config(interaction.user.id, interaction.channel.id)
     effective_model = model or cfg.get("model")
@@ -6020,6 +6380,16 @@ async def cmd_redo(
             f"❌ Couldn't build a job for `{video_id}`.", ephemeral=True,
         )
         return
+
+    ok, reason = _rate_limit_check(interaction.user.id)
+    if not ok:
+        retry_view = _maybe_retry_view([_job_to_retry_spec(job)],
+                                       target_user_id=interaction.user.id)
+        await interaction.followup.send(
+            f"❌ {reason}", ephemeral=True, view=retry_view,
+        )
+        return
+
     _rate_limit_record(interaction.user.id)
     await queue.put(job)
     await _ack_queued(job, queue.qsize())
