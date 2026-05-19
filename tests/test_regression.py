@@ -492,6 +492,43 @@ def test_cache_ttl_expiry():
     assert bot.read_cache("vid-expired") is None
 
 
+def test_cache_invalidates_short_scraped_entry():
+    """Pre-existing poisoned scrape cache (body < MIN_SCRAPED_BODY_CHARS,
+    status starts with 'scraped ') must be invalidated on read so the
+    retry actually re-scrapes. This covers the Reuters/DataDome regression
+    where the first failed scrape pinned the bot to an 11-char body
+    forever — every subsequent `tldr` hit the poisoned cache and never
+    exercised the new MIN_SCRAPED_BODY_CHARS guard in _fetch_via_crawl4ai.
+    """
+    bot.write_cache("vid-poisoned", "www.reuters.com",
+                    "scraped 11 chars", "reuters.com", 0)
+    path = bot._cache_path("vid-poisoned")
+    assert path.exists()
+    assert bot.read_cache("vid-poisoned") is None, (
+        "Short scraped body must be treated as cache miss"
+    )
+    # Self-healing: the poisoned file is removed so any concurrent reader
+    # also sees the miss, not just the first one.
+    assert not path.exists(), "Poisoned cache file must be unlinked on miss"
+
+
+def test_cache_does_not_invalidate_short_video_transcript():
+    """A legitimately short video transcript (e.g. a 3-second clip whose
+    only word is 'hi') must NOT be invalidated. Discrimination is via the
+    status-string prefix — only 'scraped ' entries are subject to the
+    floor, video statuses (durations / 'transcribed') are exempt.
+    """
+    bot.write_cache("vid-shortvid", "Tiny clip",
+                    "Transcribed in 3s", "hi", 3)
+    result = bot.read_cache("vid-shortvid")
+    assert result is not None, (
+        "Short video transcripts must be served from cache as usual"
+    )
+    title, status, transcript, dur = result
+    assert transcript == "hi"
+    assert status == "Transcribed in 3s"
+
+
 # ─── 5. VLM helpers ──────────────────────────────────────────────────────────
 
 
@@ -1338,14 +1375,41 @@ def test_job_kind_dispatch():
         raise AssertionError("invalid kind should raise")
 
 
-def test_looks_like_cf_challenge():
-    """Short text containing CF markers → True; long article → False."""
-    assert bot._looks_like_cf_challenge("Just a moment...\nChecking your browser.")
-    assert bot._looks_like_cf_challenge("ddos protection by cloudflare")
-    # Long article that mentions Cloudflare in passing — not a challenge
+def test_looks_like_bot_challenge():
+    """Short text containing anti-bot challenge markers → True; long
+    article → False. Covers Cloudflare (JS + CAPTCHA), DataDome, Akamai,
+    PerimeterX.
+    """
+    # Cloudflare JS challenge
+    assert bot._looks_like_bot_challenge("Just a moment...\nChecking your browser.")
+    assert bot._looks_like_bot_challenge("ddos protection by cloudflare")
+    # Cloudflare CAPTCHA / Turnstile (archive.ph regression — they shell out
+    # to this when rate-limiting and the response title becomes
+    # "One more step" with body "Please complete the security check to
+    # access archive.ph". Previously this slipped past the marker check
+    # because the wording differs from the JS challenge above, and 563
+    # chars was over the MIN_SCRAPED_BODY_CHARS floor.)
+    archive_ph_cf_capture = (
+        "#  One more step  ##  Please complete the security check to access "
+        "archive.ph ##  Why do I have to complete a CAPTCHA?  Completing "
+        "the CAPTCHA proves you are a human and gives you temporary access "
+        "to the web property."
+    )
+    assert bot._looks_like_bot_challenge(archive_ph_cf_capture), (
+        "archive.ph's Cloudflare CAPTCHA page must be detected as a challenge"
+    )
+    # DataDome (the Reuters case that motivated the marker expansion).
+    assert bot._looks_like_bot_challenge("var dd={'rt':'i','cid':'abc'}")
+    assert bot._looks_like_bot_challenge("captcha-delivery.com/load.js")
+    # Akamai / PerimeterX
+    assert bot._looks_like_bot_challenge("set-cookie: _abck=ABC123;")
+    assert bot._looks_like_bot_challenge("px-captcha challenge required")
+    # Long article that mentions one of the products in passing — not a challenge
     long_text = "Cloudflare announced new features. " + "x " * 1500
-    assert not bot._looks_like_cf_challenge(long_text)
-    assert not bot._looks_like_cf_challenge("")
+    assert not bot._looks_like_bot_challenge(long_text)
+    assert not bot._looks_like_bot_challenge("")
+    # Backwards-compat alias still resolves to the same function.
+    assert bot._looks_like_cf_challenge is bot._looks_like_bot_challenge
 
 
 def test_html_to_text_strips_scripts_and_tags():
@@ -1411,9 +1475,161 @@ def test_worker_dispatches_on_kind():
 def test_scraper_config_present():
     """Bot exposes scraper config + functions."""
     for name in ("SCRAPER_API", "FLARESOLVERR_API", "SCRAPER_TIMEOUT",
+                 "MIN_SCRAPED_BODY_CHARS",
+                 "ENABLE_ARCHIVE_FALLBACKS", "WAYBACK_API",
+                 "WAYBACK_TIMEOUT", "ARCHIVE_PH_BASE",
+                 "ARCHIVE_PH_TIMEOUT", "ARCHIVE_USER_AGENT",
                  "fetch_article", "_fetch_via_crawl4ai", "_fetch_via_flaresolverr",
+                 "_fetch_via_wayback", "_fetch_via_archive_ph",
+                 "_wayback_raw_url",
                  "process_url", "_handle_reply_trigger"):
         assert hasattr(bot, name), f"missing: {name}"
+
+
+def test_wayback_raw_url_inserts_id_modifier():
+    """Wayback URLs from the availability API include nav chrome by
+    default; the `id_` modifier returns the raw archived bytes. Verifies
+    the rewrite handles both http→https coercion and the timestamp insert.
+    """
+    inp = "http://web.archive.org/web/20231213155408/https://www.reuters.com/world/"
+    out = bot._wayback_raw_url(inp)
+    assert out == (
+        "https://web.archive.org/web/20231213155408id_/https://www.reuters.com/world/"
+    ), f"unexpected rewrite: {out}"
+    # Idempotent on URLs that already have id_
+    twice = bot._wayback_raw_url(out)
+    # Second pass leaves id_ where it is (no double id_id_)
+    assert "id_id_" not in twice
+    # Already-https input stays https
+    https_in = "https://web.archive.org/web/20240101120000/https://example.com/"
+    assert bot._wayback_raw_url(https_in) == (
+        "https://web.archive.org/web/20240101120000id_/https://example.com/"
+    )
+
+
+def test_fetch_article_routes_archive_tiers_last():
+    """Tier ordering inside fetch_article: live origins (crawl4ai →
+    flaresolverr) must always run before archive snapshots (wayback →
+    archive.ph), since archives can lag real-time by hours-to-days.
+    """
+    import inspect
+    src = inspect.getsource(bot.fetch_article)
+    crawl_pos = src.index("_fetch_via_crawl4ai")
+    flare_pos = src.index("_fetch_via_flaresolverr")
+    wayback_pos = src.index("_fetch_via_wayback")
+    archive_pos = src.index("_fetch_via_archive_ph")
+    assert crawl_pos < flare_pos < wayback_pos < archive_pos, (
+        "Expected tier order: crawl4ai < flaresolverr < wayback < archive.ph"
+    )
+
+
+def test_fetch_via_wayback_returns_none_on_no_snapshot():
+    """Availability API returns `archived_snapshots: {}` for URLs with no
+    snapshot (e.g. very-recent or fabricated URLs like the Reuters
+    2026-05-18 test article). _fetch_via_wayback must return None so
+    fetch_article falls through to archive.ph rather than raising.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    fake_resp = MagicMock()
+    fake_resp.status = 200
+    fake_resp.json = AsyncMock(return_value={
+        "url": "https://example.com/", "archived_snapshots": {},
+    })
+
+    fake_ctx = MagicMock()
+    fake_ctx.__aenter__ = AsyncMock(return_value=fake_resp)
+    fake_ctx.__aexit__ = AsyncMock(return_value=None)
+
+    fake_http = MagicMock()
+    fake_http.get = MagicMock(return_value=fake_ctx)
+
+    with patch.object(bot, "http", fake_http):
+        result = asyncio.run(bot._fetch_via_wayback("https://example.com/"))
+    assert result is None, "No snapshot must yield None, not raise"
+
+
+def test_fetch_via_wayback_handles_rate_limit():
+    """429 from Wayback (its anonymous quotas are ~15 req/min/IP) must
+    fall through silently. Loud retries would burn through the quota
+    faster and pin the entire bot in the failure path.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    fake_resp = MagicMock()
+    fake_resp.status = 429
+    fake_resp.json = AsyncMock(return_value={})
+
+    fake_ctx = MagicMock()
+    fake_ctx.__aenter__ = AsyncMock(return_value=fake_resp)
+    fake_ctx.__aexit__ = AsyncMock(return_value=None)
+
+    fake_http = MagicMock()
+    fake_http.get = MagicMock(return_value=fake_ctx)
+
+    with patch.object(bot, "http", fake_http):
+        result = asyncio.run(bot._fetch_via_wayback("https://example.com/"))
+    assert result is None, "429 must yield None (fall through to next tier)"
+
+
+def test_archive_fallbacks_disabled_short_circuits():
+    """ENABLE_ARCHIVE_FALLBACKS=0 must skip both archive tiers entirely
+    so the bot reverts to the two-tier (Crawl4AI + FlareSolverr) shape.
+    Useful kill-switch if archive.org/ph are degrading the failure path.
+    """
+    import asyncio
+    from unittest.mock import patch
+
+    with patch.object(bot, "ENABLE_ARCHIVE_FALLBACKS", False):
+        wb = asyncio.run(bot._fetch_via_wayback("https://example.com/"))
+        ap = asyncio.run(bot._fetch_via_archive_ph("https://example.com/"))
+    assert wb is None and ap is None
+
+
+def test_min_scraped_body_floor_is_sane():
+    """Default floor must reject obvious challenge stubs (e.g. Reuters'
+    `reuters.com\\n` via DataDome → 11 chars) without rejecting short
+    legitimate articles. 50–500 is the defensible band; default 200."""
+    assert 50 <= bot.MIN_SCRAPED_BODY_CHARS <= 500
+
+
+def test_fetch_via_crawl4ai_rejects_short_body():
+    """Implausibly short markdown (e.g. just the hostname from a DataDome
+    challenge stub) must be rejected so the caller falls through to the
+    FlareSolverr backup. This is the core regression fix for the Reuters
+    case where Crawl4AI returned `reuters.com\\n` and the bot fed those
+    11 chars to the LLM.
+    """
+    import asyncio, inspect
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    # Mock the aiohttp session's POST: return a tiny markdown body.
+    fake_resp = MagicMock()
+    fake_resp.status = 200
+    fake_resp.json = AsyncMock(return_value={"markdown": "reuters.com\n"})
+    fake_resp.text = AsyncMock(return_value="")
+
+    fake_ctx = MagicMock()
+    fake_ctx.__aenter__ = AsyncMock(return_value=fake_resp)
+    fake_ctx.__aexit__ = AsyncMock(return_value=None)
+
+    fake_http = MagicMock()
+    fake_http.post = MagicMock(return_value=fake_ctx)
+
+    with patch.object(bot, "http", fake_http):
+        result = asyncio.run(bot._fetch_via_crawl4ai(
+            "https://www.reuters.com/some/article"))
+
+    assert result is None, (
+        "Crawl4AI returning 12-char DataDome stub must be rejected "
+        "(MIN_SCRAPED_BODY_CHARS floor)"
+    )
+    # Sanity-check the floor is what we documented (200) — if someone
+    # tightens it below 12 we'd lose the regression, above 500 we'd
+    # start rejecting real short articles.
+    assert bot.MIN_SCRAPED_BODY_CHARS >= 12
 
 
 def test_process_url_uses_web_prompts_not_video():

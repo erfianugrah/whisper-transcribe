@@ -146,9 +146,40 @@ FLARESOLVERR_API = os.environ.get("FLARESOLVERR_API_URL",
                                   "http://localhost:8191/v1")
 SCRAPER_TIMEOUT = int(os.environ.get("SCRAPER_TIMEOUT", "120"))
 FLARESOLVERR_TIMEOUT = int(os.environ.get("FLARESOLVERR_TIMEOUT", "90"))
+# Tier 3 + 4 archive fallbacks. Triggered only after Crawl4AI AND
+# FlareSolverr both fail. Both are anti-bot-resilient (DataDome, Akamai
+# Bot Manager, hardened Turnstile) because they fetch a pre-rendered
+# snapshot rather than hitting the live site. Set ENABLE_ARCHIVE_FALLBACKS=0
+# to disable the whole tier (e.g. if archive.org is suffering a long
+# outage and degrading the user-visible failure path).
+ENABLE_ARCHIVE_FALLBACKS = os.environ.get("ENABLE_ARCHIVE_FALLBACKS", "1") != "0"
+WAYBACK_API = os.environ.get(
+    "WAYBACK_API_URL", "https://archive.org/wayback/available",
+)
+WAYBACK_TIMEOUT = int(os.environ.get("WAYBACK_TIMEOUT", "30"))
+ARCHIVE_PH_BASE = os.environ.get("ARCHIVE_PH_BASE_URL", "https://archive.ph")
+ARCHIVE_PH_TIMEOUT = int(os.environ.get("ARCHIVE_PH_TIMEOUT", "60"))
+# Stable UA for archive endpoints. archive.org tightens anonymous quotas
+# and the API docs ask integrators to identify themselves; archive.ph
+# rejects empty / "python-urllib" UAs entirely.
+ARCHIVE_USER_AGENT = os.environ.get(
+    "ARCHIVE_USER_AGENT",
+    "Mozilla/5.0 (compatible; whisper-transcribe-bot/1.0; "
+    "+https://github.com/erfianugrah/whisper-transcribe)",
+)
 # Scraped article body cap. Articles longer than this hit map-reduce in
 # summarize() — the budget calc applies as it does for transcripts.
 SCRAPED_BODY_CHAR_CAP = int(os.environ.get("SCRAPED_BODY_CHAR_CAP", "200000"))
+# Minimum scraped body length before we treat a scrape as successful.
+# Anti-bot products (DataDome, Akamai Bot Manager, PerimeterX, hardened CF
+# Turnstile) often serve a tiny challenge stub that survives readability
+# extraction as a few dozen chars of nothing — e.g. Reuters via Crawl4AI
+# returns just `reuters.com\n` (11 chars). Without a floor, the bot would
+# feed that stub to the LLM and produce a useless "no content to summarise"
+# embed. A real article body is virtually always >500 chars after
+# readability; 200 is a conservative floor that still passes short blog
+# posts. Set to 0 to disable.
+MIN_SCRAPED_BODY_CHARS = int(os.environ.get("MIN_SCRAPED_BODY_CHARS", "200"))
 LLM_API = os.environ.get("LLM_API_URL", "http://localhost:11434/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gemma-4-26B-A4B-it-Q4_K_M")
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "turbo")
@@ -1729,9 +1760,13 @@ async def _handle_reply_trigger(
 # ─── Web scraper client ──────────────────────────────────────────────────────
 
 
-# Patterns in scraped Markdown that indicate a Cloudflare interstitial /
-# challenge page. When seen in the Crawl4AI output, fall back to FlareSolverr.
-_CF_CHALLENGE_MARKERS = (
+# Patterns in scraped Markdown / stripped HTML that indicate a bot-protection
+# interstitial (Cloudflare, DataDome, Akamai Bot Manager, PerimeterX). When
+# seen in the Crawl4AI output we fall back to FlareSolverr; when seen in
+# FlareSolverr's resolved HTML we reject too (FlareSolverr only handles
+# Cloudflare, so a DataDome/Akamai stub passing through it is still useless).
+_BOT_CHALLENGE_MARKERS = (
+    # Cloudflare — "Just a moment" path is the classic JS challenge.
     "Just a moment",
     "Checking your browser",
     "challenges.cloudflare.com",
@@ -1739,20 +1774,47 @@ _CF_CHALLENGE_MARKERS = (
     "ddos protection by cloudflare",
     "Enable JavaScript and cookies to continue",
     "cf_chl_opt",
+    # Cloudflare CAPTCHA / Turnstile path — wording differs from the JS
+    # challenge above. archive.ph in particular shells out to this when
+    # rate-limiting our IP, with the title "One more step" + body
+    # "Please complete the security check to access <site>".
+    "One more step",
+    "Please complete the security check",
+    "Why do I have to complete a CAPTCHA?",
+    "Completing the CAPTCHA proves you are a human",
+    # DataDome (e.g. Reuters, Allociné, many French/EU news sites).
+    # `var dd={'rt':` is their script init; `captcha-delivery.com` is their
+    # challenge endpoint.
+    "captcha-delivery.com",
+    "var dd={'rt':",
+    # Akamai Bot Manager
+    "ak-challenge",
+    "_abck",
+    # PerimeterX / HUMAN
+    "_pxhd",
+    "px-captcha",
 )
 
 
-def _looks_like_cf_challenge(text: str) -> bool:
-    """Heuristic: extracted Markdown that's just a CF interstitial.
+def _looks_like_bot_challenge(text: str) -> bool:
+    """Heuristic: extracted body that's just a bot-protection interstitial.
 
-    A real article body is usually >500 chars and contains paragraph text;
-    a CF challenge page is short and dominated by the marker phrases above.
-    Both checks together avoid false positives on long articles that happen
-    to mention Cloudflare in passing.
+    A real article body is usually >500 chars of paragraph text; a challenge
+    stub is short and dominated by the marker phrases above. Both checks
+    together avoid false positives on long articles that happen to mention
+    one of these products in passing. The upper-length cap is generous
+    (4000 chars) because some Akamai stubs embed a chunk of bm.js text.
     """
-    if not text or len(text) > 2000:
+    if not text or len(text) > 4000:
         return False
-    return any(m.lower() in text.lower() for m in _CF_CHALLENGE_MARKERS)
+    return any(m.lower() in text.lower() for m in _BOT_CHALLENGE_MARKERS)
+
+
+# Backwards-compat alias — `_looks_like_cf_challenge` was the original name
+# back when only Cloudflare was on the radar. Kept so any external scripts
+# or in-flight branches don't break; safe to remove on the next major.
+_CF_CHALLENGE_MARKERS = _BOT_CHALLENGE_MARKERS
+_looks_like_cf_challenge = _looks_like_bot_challenge
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -1820,7 +1882,21 @@ async def _fetch_via_crawl4ai(url: str) -> str | None:
         return None
 
     md = (data.get("markdown") or "").strip()
-    if not md or _looks_like_cf_challenge(md):
+    if not md:
+        return None
+    if _looks_like_bot_challenge(md):
+        log.warning("Crawl4AI returned bot-challenge stub for %s — "
+                    "falling back to FlareSolverr", url)
+        return None
+    if MIN_SCRAPED_BODY_CHARS and len(md) < MIN_SCRAPED_BODY_CHARS:
+        # Hardened anti-bot products (DataDome, Akamai) often pass the
+        # marker check because their challenge stub is just `<title>` text
+        # after readability extraction (e.g. Reuters → "reuters.com").
+        # An article that genuinely renders to <200 chars is rare enough
+        # that it's worth retrying via FlareSolverr.
+        log.warning("Crawl4AI returned too-short body (%d chars, floor %d) "
+                    "for %s — treating as failed extraction",
+                    len(md), MIN_SCRAPED_BODY_CHARS, url)
         return None
     return md
 
@@ -1861,11 +1937,162 @@ async def _fetch_via_flaresolverr(url: str) -> str | None:
     if not html:
         return None
     text = _html_to_text(html)
-    if not text or len(text) < 200:
+    if not text:
+        return None
+    if _looks_like_bot_challenge(text):
+        # FlareSolverr only handles Cloudflare — DataDome/Akamai stubs sail
+        # through it unchanged. Reject so the caller surfaces an honest
+        # "scrapers failed" error rather than summarising boilerplate.
+        log.warning("FlareSolverr returned bot-challenge stub for %s", url)
+        return None
+    if MIN_SCRAPED_BODY_CHARS and len(text) < MIN_SCRAPED_BODY_CHARS:
         # Probably still a challenge or login wall — give up rather than feed
         # the LLM a few hundred bytes of nav-bar text.
+        log.warning("FlareSolverr returned too-short body (%d chars, "
+                    "floor %d) for %s", len(text), MIN_SCRAPED_BODY_CHARS, url)
         return None
     return text
+
+
+# ─── Tier 3/4: Archive fallbacks ──────────────────────────────────────────────
+# When Crawl4AI + FlareSolverr both fail (anti-bot product won and stayed
+# won), try fetching a pre-rendered snapshot from archive.org's Wayback
+# Machine, then archive.ph. Both have several upsides:
+#
+#   • Snapshot HTML has already cleared DataDome/Akamai/CF at archive time
+#     — we never hit the live origin, never see the challenge.
+#   • Wayback exposes an "id_" raw-bytes view that strips its UI chrome,
+#     so Crawl4AI's readability extractor sees the article DOM cleanly.
+#   • archive.ph re-renders each snapshot as a static HTML mirror; no JS
+#     execution required to view.
+#
+# Trade-offs:
+#   • Wayback snapshots can lag the live URL by hours-to-days. For news
+#     this is usually fine (articles rarely change after publication);
+#     for live blogs / fast-updating pages it's a known limitation.
+#   • Wayback rate-limits anonymous traffic aggressively (~15 req/min/IP
+#     in our testing). On 429 we silently fall through to archive.ph
+#     rather than retrying — the live channel might be a single high-
+#     traffic Discord server hitting the same IP.
+#   • archive.ph has no official API and occasionally serves Cloudflare
+#     challenges of its own. Crawl4AI's headful Playwright clears those.
+#
+# Both tiers are gated on ENABLE_ARCHIVE_FALLBACKS so they can be turned
+# off without a redeploy.
+
+
+# Inserts the Wayback `id_` modifier after the timestamp, which switches
+# the response from "snapshot wrapped in Wayback chrome" to "raw archived
+# bytes". Important for clean readability extraction.
+_WAYBACK_TS_RE = re.compile(r"(/web/\d{14})/")
+
+
+def _wayback_raw_url(snapshot_url: str) -> str:
+    """Convert a normal Wayback URL to its `id_` raw form.
+
+    Input:  http://web.archive.org/web/20231213155408/https://www.reuters.com/
+    Output: https://web.archive.org/web/20231213155408id_/https://www.reuters.com/
+
+    Also coerces the scheme to HTTPS because the API still returns http:// URLs
+    from time to time.
+    """
+    url = snapshot_url.replace("http://web.archive.org", "https://web.archive.org", 1)
+    return _WAYBACK_TS_RE.sub(r"\1id_/", url, count=1)
+
+
+async def _fetch_via_wayback(url: str) -> str | None:
+    """Tier 3 fallback: Wayback Machine.
+
+    1. Ask the availability API for the closest snapshot of `url`.
+    2. Rewrite to the `id_` raw form (no Wayback nav chrome).
+    3. Hand that URL to Crawl4AI so its readability extractor pulls the
+       article body. We re-use the existing Crawl4AI path so MIN_SCRAPED_
+       BODY_CHARS + bot-challenge detection apply automatically.
+
+    Returns None on:
+      • Rate limit (429) — falls through to archive.ph silently.
+      • No snapshot available — common for very recent / niche URLs.
+      • Crawl4AI fails on the snapshot URL.
+      • Network / timeout errors.
+
+    Never raises — this is a best-effort tier. PermanentError from the
+    downstream Crawl4AI call is suppressed too (we don't want a malformed
+    snapshot URL to short-circuit the entire fallback chain).
+    """
+    # Kill-switch is evaluated FIRST so flipping ENABLE_ARCHIVE_FALLBACKS
+    # off cleanly disables the tier without depending on http session
+    # initialisation order (matters for tests + standalone import).
+    if not ENABLE_ARCHIVE_FALLBACKS:
+        return None
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+
+    try:
+        async with http.get(
+            WAYBACK_API,
+            params={"url": url},
+            timeout=aiohttp.ClientTimeout(total=WAYBACK_TIMEOUT),
+            headers={"User-Agent": ARCHIVE_USER_AGENT},
+        ) as resp:
+            if resp.status == 429:
+                log.warning("Wayback rate-limited (429) for %s — skipping tier", url)
+                return None
+            if resp.status != 200:
+                log.warning("Wayback availability %d for %s", resp.status, url)
+                return None
+            data = await resp.json(content_type=None)
+    except asyncio.TimeoutError:
+        log.warning("Wayback availability timeout for %s", url)
+        return None
+    except aiohttp.ClientError as e:
+        log.warning("Wayback transport error for %s: %s", url, e)
+        return None
+    except (ValueError, json_mod.JSONDecodeError) as e:
+        log.warning("Wayback non-JSON response for %s: %s", url, e)
+        return None
+
+    snap = (data.get("archived_snapshots") or {}).get("closest") or {}
+    snap_url = snap.get("url")
+    if not snap.get("available") or not snap_url:
+        log.info("Wayback has no snapshot for %s", url)
+        return None
+
+    raw_url = _wayback_raw_url(snap_url)
+    log.info("Wayback snapshot %s for %s — re-extracting", snap.get("timestamp"), url)
+    try:
+        return await _fetch_via_crawl4ai(raw_url)
+    except PermanentError as e:
+        # A 4xx from Crawl4AI on the snapshot URL shouldn't kill the
+        # whole chain — archive.ph is still worth trying.
+        log.warning("Wayback snapshot rejected by Crawl4AI for %s: %s", url, e)
+        return None
+
+
+async def _fetch_via_archive_ph(url: str) -> str | None:
+    """Tier 4 fallback: archive.ph (archive.today).
+
+    No official API — we hit `/newest/<url>`, which 302s to the latest
+    snapshot. archive.ph snapshots are static HTML with the article body
+    intact, so Crawl4AI's readability extractor handles them well.
+
+    Returns None on any failure. Never raises (best-effort tier — when
+    this fails fetch_article raises a final RuntimeError).
+    """
+    if not ENABLE_ARCHIVE_FALLBACKS:
+        return None
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+
+    # archive.ph stores by URL exact-match; embed the original URL directly.
+    # Note: URLs in the path can contain `:` and `/` — archive.ph handles
+    # them unescaped, which is non-standard but documented behaviour.
+    archive_url = f"{ARCHIVE_PH_BASE.rstrip('/')}/newest/{url}"
+    log.info("Trying archive.ph for %s → %s", url, archive_url)
+    try:
+        return await _fetch_via_crawl4ai(archive_url)
+    except PermanentError as e:
+        log.warning("archive.ph URL rejected by Crawl4AI for %s: %s", url, e)
+        return None
 
 
 # ─── Reddit-specific scraper ──────────────────────────────────────────────────
@@ -2286,15 +2513,22 @@ async def _fetch_hn(url: str) -> tuple[str, str]:
 async def fetch_article(url: str) -> tuple[str, str]:
     """Scrape `url` and return (title, body_text).
 
-    Routing:
+    Routing (live origins first, archive snapshots last):
       1. Reddit post URLs → JSON API + linked-article fetch + top comments.
       2. HackerNews post URLs → Firebase API + linked-article fetch +
          top comments.
-      3. Everything else → Crawl4AI; FlareSolverr on CF block / failure.
+      3. Generic Crawl4AI on the live URL.
+      4. FlareSolverr on the live URL (CF challenge bypass).
+      5. Wayback Machine snapshot (DataDome/Akamai-resilient — never touches
+         the live origin). Gated on ENABLE_ARCHIVE_FALLBACKS.
+      6. archive.ph snapshot (no official API but tends to mirror sites
+         Wayback misses). Gated on ENABLE_ARCHIVE_FALLBACKS.
 
     Raises PermanentError on 4xx (bad URL, scheme reject) — caller should NOT
-    retry. Raises RuntimeError on total failure across both backends.
+    retry. Raises RuntimeError on total failure across every backend.
     """
+    from urllib.parse import urlparse
+
     if _is_reddit_post_url(url):
         try:
             title, body = await _fetch_reddit(url)
@@ -2323,14 +2557,34 @@ async def fetch_article(url: str) -> tuple[str, str]:
     log.info("[scrape] crawl4ai miss/CF — trying FlareSolverr for %s", url)
     text = await _fetch_via_flaresolverr(url)
     if text is not None:
-        from urllib.parse import urlparse
         title = urlparse(url).hostname or url
         log.info("[scrape] flaresolverr ok: %s (%d chars)", url, len(text))
         return title, text[:SCRAPED_BODY_CHAR_CAP]
 
+    # Tiers 5 + 6: archive snapshots. Anti-bot-resilient (DataDome, Akamai,
+    # hardened Turnstile) because the snapshot was rendered before the
+    # protection challenge — we re-fetch the cached HTML from the archive
+    # rather than hitting the origin. Both return None on any failure
+    # rather than raising; we only escalate to RuntimeError after both miss.
+    if ENABLE_ARCHIVE_FALLBACKS:
+        log.info("[scrape] FlareSolverr miss — trying Wayback for %s", url)
+        md = await _fetch_via_wayback(url)
+        if md is not None:
+            title = _derive_title_from_markdown(md, url)
+            log.info("[scrape] wayback ok: %s (%d chars)", url, len(md))
+            return title, md[:SCRAPED_BODY_CHAR_CAP]
+
+        log.info("[scrape] Wayback miss — trying archive.ph for %s", url)
+        md = await _fetch_via_archive_ph(url)
+        if md is not None:
+            title = _derive_title_from_markdown(md, url)
+            log.info("[scrape] archive.ph ok: %s (%d chars)", url, len(md))
+            return title, md[:SCRAPED_BODY_CHAR_CAP]
+
     raise RuntimeError(
-        f"Both scrapers failed for {url} — site likely behind hard "
-        f"Turnstile or down."
+        f"All scrapers failed for {url} — site likely behind hardened "
+        f"anti-bot protection (DataDome/Akamai/Turnstile) with no "
+        f"archive snapshot available."
     )
 
 
@@ -4116,6 +4370,28 @@ def read_cache(video_id: str, translate: object = "auto") -> tuple[str, str, str
     # before the duration field existed.
     if duration <= 0:
         duration = _derive_duration_from_transcript(transcript)
+
+    # Defensive: invalidate cached web-scrape entries whose body never met
+    # the meaningful-content floor. Before the MIN_SCRAPED_BODY_CHARS guard
+    # was added to _fetch_via_crawl4ai, anti-bot stubs (Reuters → DataDome
+    # → "reuters.com\n", 11 chars) were happily persisted to cache and
+    # served on every retry — pinning the user to a useless "no content to
+    # summarise" embed forever. The status field discriminates: web jobs
+    # always write "scraped N chars", video jobs write durations / formats.
+    # Limited strictly to that prefix so a legitimately short transcript
+    # (e.g. a 3-second clip) is never invalidated.
+    if (status.startswith("scraped ")
+            and MIN_SCRAPED_BODY_CHARS
+            and len(transcript.strip()) < MIN_SCRAPED_BODY_CHARS):
+        log.warning("[%s] Cached scrape body below floor (%d chars, "
+                    "floor %d) — invalidating so retry re-scrapes",
+                    video_id, len(transcript.strip()), MIN_SCRAPED_BODY_CHARS)
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return None
+
     return title, status, transcript, duration
 
 
