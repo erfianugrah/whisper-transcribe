@@ -1174,16 +1174,29 @@ async def _job_remove_react(job: Job, emoji: str) -> None:
         await safe_remove_react(job.message, emoji)
 
 
-async def _job_reply(job: Job, text: str) -> None:
-    """Send a textual reply for failure / status messages."""
+async def _job_reply(
+    job: Job, text: str, view: discord.ui.View | None = None,
+) -> None:
+    """Send a textual reply for failure / status messages.
+
+    `view` (optional) attaches Discord components (buttons, selects) to the
+    reply — used by the worker's LLM-offline failure handler to surface a
+    one-click resubmit button after a mid-pipeline LLM crash.
+    """
+    # discord.py's send / followup.send accept `view=MISSING` as the "no
+    # view" sentinel; passing `view=None` works on modern versions but
+    # branching keeps us safe across pin upgrades.
+    kwargs: dict[str, object] = {}
+    if view is not None:
+        kwargs["view"] = view
     if job.message is not None:
         try:
-            await job.channel.send(text, reference=job.message)
+            await job.channel.send(text, reference=job.message, **kwargs)
         except discord.HTTPException as e:
             log.warning("reply failed: %s", e)
     elif job.interaction is not None:
         try:
-            await job.interaction.followup.send(text)
+            await job.interaction.followup.send(text, **kwargs)
         except discord.HTTPException as e:
             log.warning("interaction reply failed: %s", e)
 
@@ -2685,12 +2698,22 @@ async def worker():
             # and won't be fixed by resubmitting).
             if isinstance(last_error, LLMOfflineError):
                 reply = _llm_offline_user_reason()
+                # Attach a Retry button so the user gets a one-click
+                # resubmit when the LLM is back, mirroring the queue-gate
+                # rejection UX. The retry path re-enters worker() and will
+                # cache-hit the transcribe step (same video_id + translate),
+                # so the user only pays the summarisation cost on retry.
+                retry_view = RetryJobsView(
+                    specs=[_job_to_retry_spec(job)],
+                    target_user_id=job.submitter_id,
+                )
             else:
                 reply = (
                     f"Failed to process `{job.video_id}` ({attempts}): "
                     f"{type(last_error).__name__}: {last_error}"
                 )
-            await _job_reply(job, reply)
+                retry_view = None
+            await _job_reply(job, reply, view=retry_view)
         # Terminal: drop from inflight whether success, error, silent drop,
         # or cancellation. Records runtime for the rolling ETA average when
         # the job actually ran.

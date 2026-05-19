@@ -1593,6 +1593,37 @@ def test_worker_handles_not_a_video_error():
     assert "silent_drop" in worker_src
 
 
+def test_worker_attaches_retry_view_on_llm_offline_failure():
+    """Worker terminal-failure path must build a RetryJobsView when the
+    last_error is LLMOfflineError so the user gets a one-click resubmit
+    without copy-pasting the URL when the LLM comes back. Mirrors the
+    queue-gate rejection UX in _maybe_retry_view."""
+    src = BOT_SRC
+    worker_src = src[src.index("async def worker"):
+                      src.index("async def process(job: Job)")]
+    # The branch must look at LLMOfflineError specifically — non-LLM
+    # permanent errors (content-side issues) don't get the button.
+    assert "isinstance(last_error, LLMOfflineError)" in worker_src
+    # And it must construct the view from the live Job's retry spec.
+    assert "RetryJobsView(" in worker_src
+    assert "_job_to_retry_spec(job)" in worker_src
+    # And pass it down to _job_reply.
+    assert "view=retry_view" in worker_src
+
+
+def test_job_reply_accepts_view_parameter():
+    """_job_reply must accept an optional `view` so the worker's
+    LLM-offline failure handler can attach a Retry button. Without this
+    parameter, the worker can't surface a retry button on terminal
+    failure and the user is forced to re-paste the URL."""
+    import inspect
+    sig = inspect.signature(bot._job_reply)
+    assert "view" in sig.parameters, \
+        "_job_reply must accept a `view` kwarg for the Retry button path"
+    # Default must be None so existing callers (without a view) still work.
+    assert sig.parameters["view"].default is None
+
+
 def test_video_path_raises_not_a_video_on_unsupported():
     """process() must distinguish NotAVideoError from generic PermanentError
     so the worker can route correctly."""
