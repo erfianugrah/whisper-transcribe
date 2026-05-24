@@ -1401,8 +1401,24 @@ def test_looks_like_bot_challenge():
     # DataDome (the Reuters case that motivated the marker expansion).
     assert bot._looks_like_bot_challenge("var dd={'rt':'i','cid':'abc'}")
     assert bot._looks_like_bot_challenge("captcha-delivery.com/load.js")
-    # Akamai / PerimeterX
-    assert bot._looks_like_bot_challenge("set-cookie: _abck=ABC123;")
+    # Akamai — marker is the canonical unsolved-challenge cookie sentinel
+    # `_abck=~-1~`, NOT the bare cookie name. The full sentinel only
+    # appears in actual blocked Akamai responses; a bare `_abck` mention
+    # in a short security-blog post about Akamai bypass would otherwise
+    # trip the heuristic falsely.
+    assert bot._looks_like_bot_challenge(
+        "set-cookie: _abck=~-1~-1~-1~-1~AAAA;"
+    )
+    assert bot._looks_like_bot_challenge(
+        "_abck=~-1~-1~-1~ Akamai bot manager blocked this request"
+    )
+    # The bare cookie name in an article body is NOT a challenge — covers
+    # the false-positive case that motivated the tightening (a security
+    # blog about `_abck` cookies that happens to be < 4000 chars).
+    assert not bot._looks_like_bot_challenge(
+        "The _abck cookie is set by Akamai's bot manager to track "
+        "client fingerprints. " + "x " * 30
+    ), "bare `_abck` mention in an article must not be flagged as a challenge"
     assert bot._looks_like_bot_challenge("px-captcha challenge required")
     # Long article that mentions one of the products in passing — not a challenge
     long_text = "Cloudflare announced new features. " + "x " * 1500
@@ -1586,6 +1602,75 @@ def test_archive_fallbacks_disabled_short_circuits():
         wb = asyncio.run(bot._fetch_via_wayback("https://example.com/"))
         ap = asyncio.run(bot._fetch_via_archive_ph("https://example.com/"))
     assert wb is None and ap is None
+
+
+def test_archive_ph_url_encodes_query_string():
+    """Tracker-tagged URLs (`?utm_source=`, `?id=`) must survive the
+    embed-into-archive.ph-path step. Without percent-encoding, yarl/aiohttp
+    splits the user URL's query string off as archive.ph's own query
+    string, breaking the URL-exact-match snapshot lookup. Verifies the
+    URL passed to Crawl4AI keeps the original query attached as part of
+    the looked-up URL (encoded), not as a top-level archive.ph query.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    captured: list[str] = []
+
+    async def fake_crawl4ai(url: str) -> str | None:
+        captured.append(url)
+        return None
+
+    with patch.object(bot, "_fetch_via_crawl4ai",
+                      side_effect=fake_crawl4ai), \
+         patch.object(bot, "http", AsyncMock()):  # ensure http is non-None
+        asyncio.run(bot._fetch_via_archive_ph(
+            "https://www.reuters.com/world/europe/article/?utm_source=twitter"
+        ))
+
+    assert len(captured) == 1, "Crawl4AI must be called exactly once"
+    archive_url = captured[0]
+    # The query string from the user URL must be PERCENT-ENCODED into the
+    # archive.ph path so yarl can't split it off. `?utm_source=...` would
+    # become archive.ph's own query string; `%3Futm_source%3D...` keeps
+    # it attached to the URL being looked up.
+    assert "%3F" in archive_url, (
+        f"`?` must be percent-encoded into archive.ph path; got {archive_url!r}"
+    )
+    assert "%3D" in archive_url, (
+        f"`=` must be percent-encoded into archive.ph path; got {archive_url!r}"
+    )
+    # Sanity: scheme + slashes preserved (safe=':/'), so logs stay
+    # human-readable for the URL-being-archived prefix.
+    assert archive_url.startswith(
+        "https://archive.ph/newest/https://www.reuters.com/world/europe/article/"
+    )
+    # The literal `?utm_source=` must NOT appear unencoded in the path —
+    # that's the regression we're guarding against.
+    assert "?utm_source=" not in archive_url
+
+
+def test_archive_ph_url_unchanged_for_query_less_input():
+    """URLs with no query string must produce the same archive.ph URL as
+    before the encoding fix — guards against the new `quote()` call
+    accidentally over-escaping (e.g. encoding `:` or `/` and breaking the
+    happy path that worked in production).
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+
+    captured: list[str] = []
+
+    async def fake_crawl4ai(url: str) -> str | None:
+        captured.append(url)
+        return None
+
+    with patch.object(bot, "_fetch_via_crawl4ai",
+                      side_effect=fake_crawl4ai), \
+         patch.object(bot, "http", AsyncMock()):
+        asyncio.run(bot._fetch_via_archive_ph("https://example.com/foo"))
+
+    assert captured == ["https://archive.ph/newest/https://example.com/foo"]
 
 
 def test_min_scraped_body_floor_is_sane():

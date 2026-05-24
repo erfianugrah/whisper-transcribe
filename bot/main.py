@@ -1787,9 +1787,12 @@ _BOT_CHALLENGE_MARKERS = (
     # challenge endpoint.
     "captcha-delivery.com",
     "var dd={'rt':",
-    # Akamai Bot Manager
+    # Akamai Bot Manager. `_abck=~-1~` is the canonical "unsolved
+    # challenge" cookie sentinel — won't appear in legitimate article
+    # text the way bare `_abck` would (security blogs about Akamai
+    # bypass routinely mention the cookie name itself).
     "ak-challenge",
-    "_abck",
+    "_abck=~-1~",
     # PerimeterX / HUMAN
     "_pxhd",
     "px-captcha",
@@ -2083,10 +2086,21 @@ async def _fetch_via_archive_ph(url: str) -> str | None:
     if http is None:
         raise RuntimeError("HTTP session not initialised")
 
-    # archive.ph stores by URL exact-match; embed the original URL directly.
-    # Note: URLs in the path can contain `:` and `/` — archive.ph handles
-    # them unescaped, which is non-standard but documented behaviour.
-    archive_url = f"{ARCHIVE_PH_BASE.rstrip('/')}/newest/{url}"
+    # archive.ph stores by URL exact-match. Percent-encode the embedded URL
+    # so reserved chars (`?`, `&`, `=`, `#`) don't get reinterpreted as
+    # archive.ph's own query-string by yarl/aiohttp's URL parser:
+    #   raw : archive.ph/newest/https://r.com/x?utm=1
+    #     -> path=/newest/https://r.com/x  query=utm=1   (lookup misses
+    #        the tracker-tagged URL because archive.ph keys by exact URL).
+    #   safe: archive.ph/newest/https://r.com/x%3Futm%3D1
+    #     -> path is preserved end-to-end, archive.ph decodes it back to
+    #        the original URL for snapshot lookup.
+    # `safe=':/'` keeps the scheme separator and path slashes readable in
+    # logs; only the actually-reserved chars get escaped.
+    from urllib.parse import quote
+    archive_url = (
+        f"{ARCHIVE_PH_BASE.rstrip('/')}/newest/{quote(url, safe=':/')}"
+    )
     log.info("Trying archive.ph for %s → %s", url, archive_url)
     try:
         return await _fetch_via_crawl4ai(archive_url)
