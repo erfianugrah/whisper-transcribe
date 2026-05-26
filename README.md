@@ -1,11 +1,12 @@
 # whisper-transcribe
 
-GPU-accelerated transcription + Discord TL;DW bot. Four content flows:
+GPU-accelerated transcription + Discord TL;DW bot. Five content flows:
 
 1. **Videos with speech** → whisperX (faster-whisper + wav2vec2 alignment + pyannote diarization) → LLM summary, plus a 4th *Community Reaction* embed pulling top YouTube comments
 2. **Videos without speech** (music videos, silent gameplay, ASMR) → frame extraction + VLM descriptions → LLM summary
 3. **Web articles** → Crawl4AI / FlareSolverr → LLM summary (triggered by replying `tldr` or `summarize` to a Discord message containing a URL). Reddit + HackerNews URLs get a structured fetch (post + linked article + top comments).
 4. **AI litmus test** → regex stylistic scan + Wayback / AdSense / author-byline metadata + ambiguous-case LLM qualitative read → forensic signals report (no verdict). Triggered by replying `litmus` to a URL message.
+5. **Images** (screenshots, memes, documents, photos) → EasyOCR text extraction + VLM scene description → LLM summary. Triggered by replying `tldr` to a Discord message with image attachments — OCR handles faithful transcription of any visible text, the vision model describes the scene, and the LLM combines both into a concise summary.
 
 Gradio UI + HTTP API for the whisper service; Discord bot for hands-off summarisation.
 
@@ -62,6 +63,7 @@ hosted APIs), override `LLM_API_URL` / `LLM_MODEL` / `LLM_VISION_API_URL`
 - **Auto-summarise videos** when their URL is posted (YouTube + 17 other platforms; URL-shape-aware so Reddit/Twitter text posts don't auto-trigger)
 - **YouTube comments** — top 100 fetched via yt-dlp, filtered (creator-hearted/pinned prioritised), summarised as a 4th "Community Reaction" embed
 - **`tldr` reply trigger** on web URLs → scrape + summarise. Reddit + HackerNews get structured fetches (linked article + OP body + top comments)
+- **`tldr` reply trigger** on image attachments → EasyOCR + VLM describe + LLM summary. Up to 4 images per message; per-image cap 32MB. Screenshots, documents, memes, photos all supported.
 - **`litmus` reply trigger** → AI-litmus forensic report (LLM-tic phrases, em-dash density, Wayback domain age, AdSense, author byline; LLM qualitative read on ambiguous middle range)
 - **Silent-video fallback** — VLM frame descriptions when speech density is low
 - **Slash commands**: `/summarize`, `/transcribe`, `/status`, `/find`, `/config`, `/serverconfig`
@@ -78,6 +80,7 @@ hosted APIs), override `LLM_API_URL` / `LLM_MODEL` / `LLM_VISION_API_URL`
 | `/api/jobs` | POST | Submit a transcription job (async, queued) — **preferred** |
 | `/api/jobs/{id}` | GET | Job status + result |
 | `/api/jobs/{id}` | DELETE | Cancel a queued job (running jobs can't be cancelled) |
+| `/api/image` | POST | OCR + VLM describe a single uploaded image (multipart `file` field). Returns `{ocr, description, width, height, model, bytes}`. Used by the bot's image-summary reply trigger. |
 | `/api/queue` | GET | Queue depth, active jobs, recent terminal jobs |
 | `/api/transcribe` | POST | Transcribe (deprecated sync wrapper around `/api/jobs`) |
 | `/api/describe` | POST | Extract frames + describe via VLM (silent-video fallback) |
@@ -204,6 +207,10 @@ directly — same surface area.
 | `JOB_TTL` | `3600` | How long terminal job hashes stick around (seconds) |
 | `JOB_RECENT_LIMIT` | `100` | Cap on `jobs:recent` list (for `/api/queue`) |
 | `WORKER_CONCURRENCY` | `1` | Number of parallel transcription workers (single GPU → 1) |
+| `IMAGE_MAX_BYTES` | `33554432` | Server-side per-image upload cap on `/api/image` (32MB) |
+| `IMAGE_VLM_PROMPT` | (default) | Override the VLM prompt used for single-image describe calls |
+| `VLM_OCR_ENABLED` | `1` | Whether EasyOCR runs (set `0` to skip OCR on `/api/image` and `/api/describe`) |
+| `VLM_OCR_LANGUAGES` | `en` | CSV of EasyOCR language codes (e.g. `en,fr,de`) |
 
 ### Discord bot
 | Variable | Default | Description |
@@ -241,6 +248,10 @@ directly — same surface area.
 | `MAX_JOBS_PER_USER_PER_HOUR` | `20` | Per-user sliding-window rate limit |
 | `MAX_QUEUE_SIZE` | `40` | Global queue cap |
 | `JOB_POLL_INTERVAL` | `3` | Seconds between `/api/jobs/{id}` polls while a transcription runs |
+| `IMAGE_MAX_ATTACHMENTS` | `4` | Max image attachments per `tldr` reply |
+| `IMAGE_MAX_BYTES_PER_ATTACHMENT` | `33554432` | Per-attachment byte cap the bot will forward (32MB) |
+| `IMAGE_API_TIMEOUT` | `180` | Per-image timeout on the `/api/image` call (OCR is fast; VLM is the long pole) |
+| `IMAGE_OCR_VERBATIM_MIN_CHARS` | `80` | Minimum total OCR chars across attachments before the verbatim "Text in image" embed + key-points pass fire |
 
 See `.env.example` and `bot/.env.example` for the full list.
 

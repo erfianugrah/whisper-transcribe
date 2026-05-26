@@ -17,7 +17,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -400,6 +400,7 @@ from prompts import (
     PROMPT_BRIEF_SILENT, PROMPT_KEY_POINTS_SILENT, PROMPT_CHAPTERS_SILENT,
     REDUCE_BRIEF_SILENT, REDUCE_KEY_POINTS_SILENT,
     PROMPT_LITMUS,
+    PROMPT_BRIEF_IMAGE, PROMPT_KEY_POINTS_IMAGE,
     CHUNK_PREAMBLE,
 )
 
@@ -445,6 +446,12 @@ class Job:
     # Job kind: "video" (default — yt-dlp + whisper + summarize) or "web"
     # (crawl4ai + summarize). Worker dispatches on this discriminant.
     kind: str = "video"
+    # Image-attachment jobs (kind="image") carry a list of CDN URLs the bot
+    # downloads from. Empty for non-image kinds. The first attachment's
+    # filename is used as the title; multi-image jobs render bullets per
+    # image in the key-points embed.
+    image_urls: list[str] = field(default_factory=list)
+    image_filenames: list[str] = field(default_factory=list)
     # True when the user explicitly asked for a summary (reply-trigger,
     # slash command). False when the URL was just posted in a watched
     # channel and the bot picked it up automatically. Controls failure
@@ -467,9 +474,10 @@ class Job:
                     self.message is not None, self.interaction is not None,
                 )
             )
-        if self.kind not in ("video", "web", "litmus"):
+        if self.kind not in ("video", "web", "litmus", "image"):
             raise ValueError(
-                f"Job.kind must be 'video' | 'web' | 'litmus', got {self.kind!r}"
+                f"Job.kind must be 'video' | 'web' | 'litmus' | 'image', "
+                f"got {self.kind!r}"
             )
 
 
@@ -697,7 +705,7 @@ class _RetrySpec:
     a stale Job reference (Job contains Discord message/interaction refs
     that may be invalid by the time the user clicks retry)."""
     url: str
-    kind: str                      # "video" | "web" | "litmus"
+    kind: str                      # "video" | "web" | "litmus" | "image"
     video_id: str                  # YT id or URL hash, same convention as Job
     diarize: bool = False
     vlm_enabled: bool = True
@@ -707,6 +715,11 @@ class _RetrySpec:
     translate: object = "auto"
     refresh: bool = False
     explicit_request: bool = True  # retries are always explicit (user clicked)
+    # Image-attachment retries carry the same CDN URL list as the source Job.
+    # Discord attachment URLs are signed but valid for ~24h, long enough for
+    # the 30-min RetryJobsView TIMEOUT to keep working in practice.
+    image_urls: tuple[str, ...] = ()
+    image_filenames: tuple[str, ...] = ()
 
 
 def _job_to_retry_spec(job: "Job") -> _RetrySpec:
@@ -723,6 +736,8 @@ def _job_to_retry_spec(job: "Job") -> _RetrySpec:
         translate=job.translate,
         refresh=job.refresh,
         explicit_request=job.explicit_request,
+        image_urls=tuple(job.image_urls),
+        image_filenames=tuple(job.image_filenames),
     )
 
 
@@ -802,6 +817,8 @@ class RetryJobsView(discord.ui.View):
                 refresh=spec.refresh,
                 kind=spec.kind,
                 explicit_request=spec.explicit_request,
+                image_urls=list(spec.image_urls),
+                image_filenames=list(spec.image_filenames),
                 interaction=interaction,
             )
             _rate_limit_record(job.submitter_id)
@@ -1653,15 +1670,52 @@ async def _handle_reply_trigger(
         return
 
     url = _extract_first_url(referenced.content)
+
+    # Image-attachment fallback: when there's no URL but the referenced
+    # message has image attachments, route to the image OCR+VLM flow.
+    # Litmus on an image doesn't make sense (no domain age, no AdSense,
+    # no byline) so we silently drop the `litmus` hint when only images
+    # are present — a chained `tldr litmus` on an image still produces
+    # the image summary.
+    image_urls: list[str] = []
+    image_filenames: list[str] = []
     if url is None:
+        image_urls, image_filenames = _extract_image_attachments(referenced)
+
+    if url is None and not image_urls:
         try:
             await message.channel.send(
-                "❌ No URL found in the message you replied to.",
+                "❌ No URL or image attachment found in the message you "
+                "replied to.",
                 reference=message, mention_author=False,
             )
         except discord.HTTPException:
             pass
         return
+
+    # Image-only path: drop hints that don't apply, keep only "summary".
+    if url is None and image_urls:
+        image_hints = [h for h in kind_hints if h == "summary"]
+        if not image_hints:
+            # User typed `litmus` on an image-only message — explain and stop.
+            try:
+                await message.channel.send(
+                    "❌ The `litmus` test is for URLs, not images. "
+                    "Try `tldr` for an image summary.",
+                    reference=message, mention_author=False,
+                )
+            except discord.HTTPException:
+                pass
+            return
+        if len(image_hints) != len(kind_hints):
+            # Chained `tldr litmus` on an image — keep the summary, log that
+            # litmus was dropped.
+            log.info(
+                "Reply-trigger: dropping non-image-compatible hints (%s) "
+                "on image-only message",
+                [h for h in kind_hints if h not in image_hints],
+            )
+        kind_hints = image_hints
 
     cfg = _effective_config(message.author.id, message.channel.id)
 
@@ -1671,7 +1725,23 @@ async def _handle_reply_trigger(
     # an LLM-offline rejection) has the specs available.
     jobs: list[Job] = []
     for hint in kind_hints:
-        if hint == "litmus":
+        if url is None and image_urls:
+            # Image-attachment summary. video_id derived from the first
+            # attachment URL so retries dedupe sensibly on the inflight map.
+            job = Job(
+                url=image_urls[0],  # used as cache key + log identifier
+                video_id=_hash_url(image_urls[0]),
+                channel=message.channel,
+                submitter_id=message.author.id,
+                submitter_name=str(message.author),
+                model_override=cfg.get("model"),
+                kind="image",
+                explicit_request=True,
+                image_urls=list(image_urls),
+                image_filenames=list(image_filenames),
+                message=message,
+            )
+        elif hint == "litmus":
             # Litmus is always a web-style fetch — even when the URL points
             # at a video, we want to inspect the page (text, byline,
             # AdSense, domain age), not transcribe the audio.
@@ -2730,12 +2800,14 @@ def _is_permanent_remote_error(text: str) -> bool:
 #   📰  web article scrape (crawl4ai / flaresolverr)
 PROCESSING_EMOJI_VIDEO = "\U0001f3a7"  # 🎧
 PROCESSING_EMOJI_WEB = "\U0001f4f0"    # 📰
-# Cleanup list covers BOTH so a kind switch (e.g. NotAVideoError fall-through)
-# leaves no stale reactions behind.
+PROCESSING_EMOJI_IMAGE = "\U0001f5bc\ufe0f"  # 🖼️ image OCR + VLM
+# Cleanup list covers ALL kinds so a kind switch (e.g. NotAVideoError
+# fall-through) leaves no stale reactions behind.
 PROCESSING_EMOJI = (
     "\u23f3",                  # ⏳ queued
     PROCESSING_EMOJI_VIDEO,    # 🎧 video fetch
     PROCESSING_EMOJI_WEB,      # 📰 web fetch
+    PROCESSING_EMOJI_IMAGE,    # 🖼️ image processing
     "\U0001f9e0",              # 🧠 summarising
 )
 
@@ -2906,6 +2978,8 @@ async def worker():
                     handler = process_litmus
                 elif job.kind == "web":
                     handler = process_url
+                elif job.kind == "image":
+                    handler = process_image
                 else:
                     handler = process
                 await handler(job)
@@ -3660,6 +3734,424 @@ async def process_url(job: Job):
     await _job_react(job, "\u2705")  # ✅
 
     log.info("[%s] Done — posted web summary", job.video_id)
+
+
+# ─── Image attachment handler (OCR + VLM + LLM summary) ──────────────────
+# Triggered by replying `tldr` / `summarize` to a Discord message that
+# carries image attachments (and no URL). For each attachment we:
+#   1. Download the bytes via the bot's aiohttp session.
+#   2. POST multipart to whisper's /api/image — the service runs EasyOCR
+#      (faithful text extraction) and the configured VLM (scene description)
+#      in parallel and returns both.
+#   3. Format into a compact <images> block (one section per attachment).
+#   4. Run the standard summarize() over that block with the IMAGE prompts.
+#   5. Post a single TL;DR embed; if any OCR text was extracted, attach
+#      a verbatim "Text in image" embed below it.
+
+IMAGE_MAX_ATTACHMENTS = int(os.environ.get("IMAGE_MAX_ATTACHMENTS", "4"))
+# Per-attachment byte cap on what the bot will forward to whisper. Discord
+# free-tier attachments cap at 25 MB; Nitro at 50 MB. 32 MB matches the
+# server-side IMAGE_MAX_BYTES default.
+IMAGE_MAX_BYTES_PER_ATTACHMENT = int(os.environ.get(
+    "IMAGE_MAX_BYTES_PER_ATTACHMENT", str(32 * 1024 * 1024)))
+# Per-attachment timeout for the /api/image call. OCR is ~1-2s; VLM is the
+# long pole (5-30s on a 7B model, longer on larger). 180s leaves headroom
+# for queue waits on the LLM proxy.
+IMAGE_API_TIMEOUT = int(os.environ.get("IMAGE_API_TIMEOUT", "180"))
+
+# File extensions accepted as images. Mirrors _ALLOWED_IMAGE_CONTENT_TYPES
+# on the server side but checked against attachment filenames (Discord's
+# attachment.content_type can be missing for older attachments).
+_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".gif",
+                     ".bmp", ".tif", ".tiff")
+
+
+def _attachment_is_image(att: "discord.Attachment") -> bool:
+    """True if a Discord attachment looks like a still image.
+
+    Prefers att.content_type when present (Discord populates it from MIME
+    sniffing); falls back to extension. Animated GIFs are accepted — OCR
+    grabs the first frame, VLM describes the still.
+    """
+    ct = (att.content_type or "").lower()
+    if ct.startswith("image/"):
+        return True
+    fn = (att.filename or "").lower()
+    return fn.endswith(_IMAGE_EXTENSIONS)
+
+
+def _extract_image_attachments(
+    message: "discord.Message",
+) -> tuple[list[str], list[str]]:
+    """Return (urls, filenames) for image attachments on the message.
+
+    Capped at IMAGE_MAX_ATTACHMENTS to bound LLM cost and Discord embed
+    real-estate. Order preserved (matches the order Discord renders them).
+    """
+    urls: list[str] = []
+    filenames: list[str] = []
+    for att in message.attachments:
+        if not _attachment_is_image(att):
+            continue
+        # Filter out oversized attachments at the source so the user sees
+        # the rejection in logs and we don't waste a download round-trip.
+        if att.size and att.size > IMAGE_MAX_BYTES_PER_ATTACHMENT:
+            log.info(
+                "Image attachment %s skipped: %d bytes > limit %d",
+                att.filename, att.size, IMAGE_MAX_BYTES_PER_ATTACHMENT,
+            )
+            continue
+        urls.append(att.url)
+        filenames.append(att.filename or "image")
+        if len(urls) >= IMAGE_MAX_ATTACHMENTS:
+            break
+    return urls, filenames
+
+
+async def _download_attachment_bytes(url: str) -> bytes:
+    """Download a Discord CDN attachment. Returns raw bytes.
+
+    Raises:
+      PermanentError on 4xx (signed URL expired, deleted) — retry won't help.
+      RuntimeError on transient network failure (worker will retry).
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+    try:
+        async with http.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+            if 400 <= resp.status < 500:
+                raise PermanentError(
+                    f"attachment download failed {resp.status} — "
+                    f"signed URL likely expired or attachment deleted"
+                )
+            if resp.status != 200:
+                raise RuntimeError(
+                    f"attachment download failed: HTTP {resp.status}"
+                )
+            # Defensive: don't load more than IMAGE_MAX_BYTES_PER_ATTACHMENT
+            # into memory even if the server claims a smaller content-length.
+            data = await resp.content.read(IMAGE_MAX_BYTES_PER_ATTACHMENT + 1)
+            if len(data) > IMAGE_MAX_BYTES_PER_ATTACHMENT:
+                raise PermanentError(
+                    f"attachment exceeds size cap "
+                    f"({IMAGE_MAX_BYTES_PER_ATTACHMENT} bytes)"
+                )
+            return data
+    except asyncio.TimeoutError:
+        raise RuntimeError("attachment download timed out")
+    except aiohttp.ClientError as e:
+        raise RuntimeError(f"attachment download transport error: {e}")
+
+
+async def _call_image_api(
+    data: bytes,
+    filename: str,
+    *,
+    prompt: str | None = None,
+) -> dict:
+    """POST one image to whisper's /api/image. Returns the JSON body.
+
+    Raises PermanentError on 422 permanent (VLM not configured) or 4xx
+    rejections; RuntimeError on transient 5xx / transport / timeout.
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+    form = aiohttp.FormData()
+    # Guess a content_type from filename; falls back to image/jpeg which
+    # the server-side filter accepts for any image/*-shaped filename.
+    import mimetypes
+    ctype, _ = mimetypes.guess_type(filename)
+    form.add_field(
+        "file", data,
+        filename=filename,
+        content_type=ctype or "image/jpeg",
+    )
+    if prompt:
+        form.add_field("prompt", prompt)
+    try:
+        async with http.post(
+            f"{WHISPER_API}/api/image",
+            data=form,
+            timeout=aiohttp.ClientTimeout(total=IMAGE_API_TIMEOUT),
+        ) as resp:
+            body = await resp.json(content_type=None)
+            if resp.status == 200:
+                return body
+            err = (body or {}).get("error", f"HTTP {resp.status}")
+            if body and body.get("permanent") is True:
+                kind = body.get("kind") or ""
+                # VLM-not-configured: the operator needs to fix the model;
+                # retrying never helps. Surface a user-readable message.
+                if kind == "vlm_not_configured":
+                    raise PermanentError(
+                        f"vision model can't accept images: {err}. "
+                        f"Set LLM_VISION_MODEL to a multimodal model "
+                        f"(or load with mmproj on llama-server)."
+                    )
+                raise PermanentError(f"/api/image rejected: {err}")
+            if 400 <= resp.status < 500:
+                raise PermanentError(f"/api/image {resp.status}: {err}")
+            raise RuntimeError(f"/api/image {resp.status}: {err}")
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"/api/image timed out after {IMAGE_API_TIMEOUT}s")
+    except aiohttp.ClientError as e:
+        raise RuntimeError(f"/api/image transport error: {e}")
+
+
+def _format_image_block(
+    *,
+    index: int,
+    filename: str,
+    width: int,
+    height: int,
+    description: str,
+    ocr: str,
+) -> str:
+    """Render one image's extracted content into the <images> block format
+    described in PROMPT_BRIEF_IMAGE. Both description and OCR are included
+    when present; absent fields render as `(none)` to keep the LLM honest
+    about what was actually extracted (vs hallucinating absent content).
+    """
+    dim = f"{width}×{height}" if width and height else "unknown size"
+    description = (description or "").strip() or "(no description available)"
+    ocr_block = (ocr or "").strip()
+    # EasyOCR joins snippets with " | " — split back to one-per-line so the
+    # LLM sees discrete tokens rather than one wall of text.
+    if ocr_block:
+        ocr_lines = [s.strip() for s in ocr_block.split(" | ") if s.strip()]
+        ocr_rendered = "\n".join(ocr_lines)
+    else:
+        ocr_rendered = "(no text detected)"
+    return (
+        f"## Image {index} ({filename}, {dim})\n"
+        f"[Description] {description}\n"
+        f"[Text on screen]\n{ocr_rendered}"
+    )
+
+
+# Min total OCR chars across all images before we also render the
+# "Text in image" verbatim embed and run the key-points LLM pass.
+# Below this, the brief alone covers the content (a meme / photo with a
+# 2-word caption doesn't need a separate verbatim block).
+IMAGE_OCR_VERBATIM_MIN_CHARS = int(os.environ.get(
+    "IMAGE_OCR_VERBATIM_MIN_CHARS", "80"))
+
+
+async def process_image(job: Job):
+    """Image-attachment handler. OCR + VLM-describe each attachment via
+    /api/image, then summarize with the standard LLM.
+
+    Cache strategy: image jobs are NOT cached. Discord CDN URLs are signed
+    and rotate; the same conceptual image posted twice gets a different
+    URL and a different video_id. Caching would only ever hit on the
+    Retry-button path, which already short-circuits via the in-memory view.
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+    if not job.image_urls:
+        raise PermanentError("image job has no attachments")
+
+    # 1. Whisper service health check — cheap and prevents wasting an LLM
+    # call when /api/image will 503.
+    async with http.get(f"{WHISPER_API}/api/status") as resp:
+        if resp.status != 200:
+            raise RuntimeError("Whisper service unavailable")
+
+    log.info(
+        "[%s] Image job: %d attachment(s) — %s",
+        job.video_id, len(job.image_urls),
+        ", ".join(job.image_filenames),
+    )
+    await _job_react(job, PROCESSING_EMOJI_IMAGE)
+    _inflight_phase(job, PHASE_SCRAPING)  # closest existing phase — download+VLM
+
+    # 2. For each attachment: download → /api/image. Sequential (not
+    # parallel) so a single VLM that serialises requests doesn't get
+    # hammered, and so OOM on one image doesn't kill the others' progress.
+    blocks: list[str] = []
+    ocr_parts: list[tuple[str, str]] = []  # (filename, ocr) for verbatim embed
+    total_ocr_chars = 0
+    for i, (url, filename) in enumerate(
+        zip(job.image_urls, job.image_filenames), start=1,
+    ):
+        log.info("[%s] Downloading attachment %d/%d: %s",
+                 job.video_id, i, len(job.image_urls), filename)
+        try:
+            data = await _download_attachment_bytes(url)
+        except PermanentError:
+            # One bad attachment shouldn't kill the whole job if others
+            # succeed. Skip and continue.
+            log.warning("[%s] Attachment %d unavailable, skipping: %s",
+                        job.video_id, i, filename)
+            blocks.append(
+                f"## Image {i} ({filename})\n"
+                f"[Description] (could not be downloaded — attachment expired "
+                f"or deleted)\n[Text on screen]\n(none)"
+            )
+            continue
+
+        log.info("[%s] Processing attachment %d via /api/image (%d bytes)",
+                 job.video_id, i, len(data))
+        # User prompt threads through to the VLM — "focus on the X"
+        # style steering, same UX as the video VLM path.
+        vlm_prompt = _build_vlm_prompt(job.user_prompt) if job.user_prompt else None
+        result = await _call_image_api(data, filename, prompt=vlm_prompt)
+
+        description = (result.get("description") or "").strip()
+        ocr = (result.get("ocr") or "").strip()
+        width = int(result.get("width") or 0)
+        height = int(result.get("height") or 0)
+        total_ocr_chars += len(ocr)
+        if ocr:
+            ocr_parts.append((filename, ocr))
+
+        blocks.append(_format_image_block(
+            index=i, filename=filename,
+            width=width, height=height,
+            description=description, ocr=ocr,
+        ))
+
+    if not blocks:
+        # All attachments failed to download — nothing to summarise.
+        raise PermanentError(
+            "no image attachments could be downloaded — "
+            "Discord CDN URLs may have expired"
+        )
+
+    body = "\n\n".join(blocks)
+    log.info(
+        "[%s] Image extraction done: %d image(s), %d chars description+OCR, "
+        "OCR=%d chars",
+        job.video_id, len(blocks), len(body), total_ocr_chars,
+    )
+
+    # 3. LLM summary.
+    ref_block = ""
+    if job.user_prompt:
+        ref_block = (
+            "The Discord user who requested this summary specifically asked: "
+            "<user_request>\n"
+            f"{job.user_prompt}\n"
+            "</user_request>\n"
+            "Honour that request when shaping your output — emphasise the "
+            "aspects they're interested in.\n\n"
+        )
+
+    await _job_react(job, "\U0001f9e0")  # 🧠 summarising
+    _inflight_phase(job, PHASE_SUMMARIZING,
+                    title=job.image_filenames[0] if job.image_filenames else None)
+
+    _token = _model_override.set(job.model_override) if job.model_override else None
+    try:
+        # Brief is always produced. Key-points only when there's a
+        # meaningful amount of OCR text (otherwise it duplicates the brief).
+        coros = [summarize(
+            body, PROMPT_BRIEF_IMAGE, LLM_MAX_TOKENS_BRIEF,
+            reference_block=ref_block,
+        )]
+        do_key_points = total_ocr_chars >= IMAGE_OCR_VERBATIM_MIN_CHARS
+        if do_key_points:
+            coros.append(summarize(
+                body, PROMPT_KEY_POINTS_IMAGE, LLM_MAX_TOKENS_KEY_POINTS,
+                reference_block=ref_block,
+                char_cap=SUMMARY_CHAR_CAP,
+            ))
+        results = await asyncio.gather(*coros)
+    finally:
+        if _token is not None:
+            _model_override.reset(_token)
+
+    brief = sanitize_llm_output(results[0])
+    key_points = sanitize_llm_output(results[1]) if do_key_points else ""
+
+    # 4. Post embeds.
+    n = len(job.image_urls)
+    title = (
+        f"Image: {job.image_filenames[0]}"
+        if n == 1
+        else f"{n} images: {job.image_filenames[0]} + {n - 1} more"
+    )
+    detail_channel = resolve_summary_channel(job.channel)
+    use_split = detail_channel.id != job.channel.id
+
+    detail_msg = None
+    # Detail-channel header (only when split routing is configured).
+    if use_split and (key_points or total_ocr_chars):
+        if job.message is not None:
+            requester = job.message.author.mention
+        elif job.interaction is not None:
+            requester = job.interaction.user.mention
+        else:
+            requester = f"<@{job.submitter_id}>"
+        header = discord.Embed(
+            title=truncate(title, 240),
+            description=f"Requested by {requester} in <#{job.channel.id}>",
+            color=0x9B59B6,  # purple — distinguishes image from video/web/litmus
+        )
+        # Set the first image as the embed's image so the detail channel
+        # has a visual anchor.
+        if job.image_urls:
+            header.set_image(url=job.image_urls[0])
+        detail_msg = await detail_channel.send(embed=header)
+
+    # Key-points embed (only when we ran the second LLM pass).
+    if key_points:
+        await send_long_embed(detail_channel, "Key Points", key_points, 0x8E44AD)
+
+    # Verbatim OCR embed — only when the OCR is substantial. Short OCR (a
+    # meme caption) is already in the brief; rendering it twice is noise.
+    if total_ocr_chars >= IMAGE_OCR_VERBATIM_MIN_CHARS:
+        if len(ocr_parts) == 1:
+            verbatim = ocr_parts[0][1].replace(" | ", "\n")
+        else:
+            verbatim = "\n\n".join(
+                f"**{fn}**\n{ocr.replace(' | ', chr(10))}"
+                for fn, ocr in ocr_parts
+            )
+        await send_long_embed(
+            detail_channel, "Text in image", verbatim, 0x7D3C98,
+        )
+
+    # Brief embed in the original channel.
+    embed = discord.Embed(
+        title=truncate(f"TL;DR: {title}", 240),
+        description=truncate(brief, 4000),
+        color=0x9B59B6,
+    )
+    footer_bits = [f"{n} image{'s' if n != 1 else ''}"]
+    if total_ocr_chars:
+        footer_bits.append(f"{total_ocr_chars} chars OCR")
+    embed.set_footer(text=" | ".join(footer_bits))
+    # Show the first image inline on the brief embed so users see what
+    # was summarised at a glance.
+    if job.image_urls:
+        embed.set_thumbnail(url=job.image_urls[0])
+
+    if job.user_prompt:
+        embed.add_field(
+            name="User request",
+            value=truncate(job.user_prompt, 1000),
+            inline=False,
+        )
+
+    if use_split and detail_msg:
+        embed.add_field(
+            name="",
+            value=f"[Full breakdown →]({detail_msg.jump_url})",
+            inline=False,
+        )
+
+    if job.message is not None:
+        await job.channel.send(embed=embed, reference=job.message)
+    else:
+        await job.channel.send(embed=embed)
+
+    for emoji in PROCESSING_EMOJI:
+        await _job_remove_react(job, emoji)
+    await _job_react(job, "\u2705")  # ✅
+
+    log.info("[%s] Done — posted image summary (%d image(s), brief=%d chars)",
+             job.video_id, n, len(brief))
 
 
 # ─── AI litmus handler ───────────────────────────────────────────────────────
@@ -6358,6 +6850,8 @@ _HELP_TOPICS: dict[str, str] = {
         "**TL;DW Bot — quick overview**\n\n"
         "Paste a video URL → bot transcribes + summarises automatically.\n"
         "Reply `tldr` to a message with a URL → summarises any article.\n"
+        "Reply `tldr` to a message with image attachments → OCR + visual "
+        "description + summary.\n"
         "Reply `litmus` → forensic AI-writing test on an article.\n\n"
         "**Slash commands:**\n"
         "• `/summarize url:` — video → 3 embeds (brief / key points / chapters)\n"
@@ -6373,9 +6867,16 @@ _HELP_TOPICS: dict[str, str] = {
     ),
     "triggers": (
         "**Reply triggers (no URL needed in your reply)**\n\n"
-        "Reply with one of these words to a message containing a URL:\n"
-        "• `tldr` / `summarize` / `summarise` — summary flow (video or web auto-detect)\n"
-        "• `litmus` — AI litmus test (forensic signals, no verdict)\n\n"
+        "Reply with one of these words to a message containing a URL "
+        "or image attachments:\n"
+        "• `tldr` / `summarize` / `summarise` — summary flow (video, web, "
+        "or image OCR auto-detect)\n"
+        "• `litmus` — AI litmus test on URLs only (forensic signals, no verdict)\n\n"
+        "**Image summaries:** Reply `tldr` to a message with one or more "
+        "image attachments → the bot extracts on-screen text via OCR, "
+        "describes the scene with the vision model, and posts a single "
+        "TL;DR embed plus a verbatim \"Text in image\" embed when there's "
+        "enough OCR content to be worth showing separately.\n\n"
         "**Chained replies:** `tldr litmus` or `litmus tldr` (order preserved) fires both. "
         "Reply body must be only keywords + punctuation — sentences like "
         "\"give me a tldr\" intentionally don't trigger.\n\n"

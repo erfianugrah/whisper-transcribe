@@ -2970,6 +2970,211 @@ def test_handle_reply_trigger_builds_one_job_per_hint():
     assert "count=len(kind_hints)" in src
 
 
+# ─── Image-attachment flow (OCR + VLM + summary) ───────────────────────
+
+
+def test_job_kind_image_accepted():
+    """Job dataclass validates kind in {video, web, litmus, image}."""
+    import discord as _d
+    channel = types.SimpleNamespace(id=1)
+    msg = types.SimpleNamespace(id=2)
+    j = bot.Job(
+        url="https://cdn.discord.com/x.png", video_id="img1",
+        channel=channel, submitter_id=1, submitter_name="u",
+        kind="image", message=msg,
+    )
+    assert j.kind == "image"
+    assert j.image_urls == []  # default empty list
+    assert j.image_filenames == []
+
+
+def test_job_kind_image_rejects_unknown():
+    """Unknown kinds still raise — the validator was updated, not bypassed."""
+    msg = types.SimpleNamespace(id=2)
+    channel = types.SimpleNamespace(id=1)
+    import pytest as _pytest  # noqa
+    try:
+        bot.Job(
+            url="x", video_id="y", channel=channel,
+            submitter_id=1, submitter_name="u",
+            kind="bogus", message=msg,
+        )
+    except ValueError as e:
+        assert "Job.kind" in str(e) and "image" in str(e)
+    else:
+        raise AssertionError("expected ValueError for kind='bogus'")
+
+
+def test_attachment_is_image_content_type():
+    """Content-type prefix wins over extension check."""
+    a = types.SimpleNamespace(content_type="image/png", filename="x.txt", size=1)
+    assert bot._attachment_is_image(a) is True
+
+
+def test_attachment_is_image_extension_fallback():
+    """Falls back to extension when content_type is missing/generic."""
+    a = types.SimpleNamespace(content_type=None, filename="screenshot.PNG", size=1)
+    assert bot._attachment_is_image(a) is True
+    b = types.SimpleNamespace(
+        content_type="application/octet-stream",
+        filename="meme.jpeg", size=1,
+    )
+    assert bot._attachment_is_image(b) is True
+
+
+def test_attachment_is_image_rejects_non_image():
+    """PDFs and videos are NOT routed to the image OCR flow."""
+    pdf = types.SimpleNamespace(content_type="application/pdf",
+                                filename="doc.pdf", size=1)
+    assert bot._attachment_is_image(pdf) is False
+    mp4 = types.SimpleNamespace(content_type="video/mp4",
+                                filename="clip.mp4", size=1)
+    assert bot._attachment_is_image(mp4) is False
+    txt = types.SimpleNamespace(content_type=None, filename="notes.txt", size=1)
+    assert bot._attachment_is_image(txt) is False
+
+
+def test_extract_image_attachments_caps_at_max():
+    """Image extraction respects IMAGE_MAX_ATTACHMENTS cap and skips oversized."""
+    images = [
+        types.SimpleNamespace(
+            content_type="image/png", filename=f"img{i}.png",
+            size=1024, url=f"https://cdn/x/img{i}.png",
+        )
+        for i in range(10)
+    ]
+    msg = types.SimpleNamespace(attachments=images)
+    urls, names = bot._extract_image_attachments(msg)
+    assert len(urls) == bot.IMAGE_MAX_ATTACHMENTS
+    assert len(names) == len(urls)
+    # Order preserved — first N attachments
+    assert urls[0].endswith("img0.png")
+
+
+def test_extract_image_attachments_skips_oversized():
+    """Attachments larger than IMAGE_MAX_BYTES_PER_ATTACHMENT are dropped."""
+    huge = types.SimpleNamespace(
+        content_type="image/png", filename="huge.png",
+        size=bot.IMAGE_MAX_BYTES_PER_ATTACHMENT + 1,
+        url="https://cdn/huge.png",
+    )
+    ok = types.SimpleNamespace(
+        content_type="image/png", filename="ok.png",
+        size=1024, url="https://cdn/ok.png",
+    )
+    msg = types.SimpleNamespace(attachments=[huge, ok])
+    urls, names = bot._extract_image_attachments(msg)
+    assert urls == ["https://cdn/ok.png"]
+    assert names == ["ok.png"]
+
+
+def test_extract_image_attachments_ignores_non_images():
+    """Mixed attachments — only images come through."""
+    pdf = types.SimpleNamespace(
+        content_type="application/pdf", filename="a.pdf",
+        size=1024, url="https://cdn/a.pdf",
+    )
+    img = types.SimpleNamespace(
+        content_type="image/jpeg", filename="b.jpg",
+        size=1024, url="https://cdn/b.jpg",
+    )
+    msg = types.SimpleNamespace(attachments=[pdf, img, pdf])
+    urls, names = bot._extract_image_attachments(msg)
+    assert urls == ["https://cdn/b.jpg"]
+    assert names == ["b.jpg"]
+
+
+def test_format_image_block_with_ocr():
+    """Formatter produces the documented <images>-block shape."""
+    block = bot._format_image_block(
+        index=1, filename="err.png", width=1200, height=800,
+        description="A red error dialog",
+        ocr="NullPointerException | at MyClass.foo(MyClass.java:42)",
+    )
+    assert "## Image 1 (err.png, 1200×800)" in block
+    assert "[Description] A red error dialog" in block
+    assert "[Text on screen]" in block
+    # OCR split back onto separate lines (one per snippet)
+    assert "NullPointerException" in block
+    assert "at MyClass.foo(MyClass.java:42)" in block
+    assert " | " not in block  # joined snippets re-split
+
+
+def test_format_image_block_no_ocr():
+    """Empty OCR renders as `(no text detected)`, not blank."""
+    block = bot._format_image_block(
+        index=2, filename="photo.jpg", width=0, height=0,
+        description="A sunset over water", ocr="",
+    )
+    assert "[Text on screen]\n(no text detected)" in block
+    # Unknown dimensions render explicitly so the LLM doesn't hallucinate
+    assert "unknown size" in block
+
+
+def test_worker_dispatch_routes_image_kind():
+    """worker() must dispatch kind='image' to process_image."""
+    src = bot.__dict__["worker"].__wrapped__.__code__.co_consts if hasattr(
+        bot.__dict__.get("worker", None), "__wrapped__") else None
+    # Source-level check (the dispatch lives in a chained if/elif inside
+    # the worker loop, not exposed as a constant). Just grep the source.
+    bot_src = BOT_SRC
+    worker_src = bot_src[
+        bot_src.index("for attempt in range(MAX_RETRIES + 1):"):
+        bot_src.index("async def process(job: Job):")
+    ]
+    assert 'job.kind == "image"' in worker_src
+    assert "handler = process_image" in worker_src
+
+
+def test_process_image_is_async_and_uses_api_image():
+    """process_image POSTs to /api/image and uses the IMAGE prompt templates."""
+    import inspect
+    src = inspect.getsource(bot.process_image)
+    assert inspect.iscoroutinefunction(bot.process_image)
+    assert "/api/image" in src or "_call_image_api" in src
+    # Uses image-specific prompts (not the web/video ones)
+    assert "PROMPT_BRIEF_IMAGE" in src
+    # Posts a single embed in the original channel (mirrors process_url)
+    assert "job.channel.send" in src
+
+
+def test_image_prompts_present():
+    """prompts.py exports the image-specific prompt templates."""
+    assert hasattr(p, "PROMPT_BRIEF_IMAGE")
+    assert hasattr(p, "PROMPT_KEY_POINTS_IMAGE")
+    # The brief prompt mentions both VLM scene + OCR (so the LLM knows
+    # what extraction shape to expect).
+    assert "OCR" in p.PROMPT_BRIEF_IMAGE
+    assert "image" in p.PROMPT_BRIEF_IMAGE.lower()
+    # Both use the standard <images> input block (so summarize() can
+    # substitute {transcript} as it does for video/web).
+    assert "<images>" in p.PROMPT_BRIEF_IMAGE
+    assert "{transcript}" in p.PROMPT_BRIEF_IMAGE
+    assert "{reference_block}" in p.PROMPT_BRIEF_IMAGE
+
+
+def test_reply_trigger_handles_image_fallback():
+    """_handle_reply_trigger checks for image attachments when no URL found."""
+    import inspect
+    src = inspect.getsource(bot._handle_reply_trigger)
+    # URL-first; image fallback path
+    assert "_extract_image_attachments(referenced)" in src
+    # Image-only message with a chained `litmus` hint drops litmus.
+    assert "image_hints" in src
+    # Build an image Job for image-only path
+    assert 'kind="image"' in src
+    assert "image_urls=list(image_urls)" in src
+
+
+def test_api_image_route_registered():
+    """/api/image route is registered alongside /api/describe in app.py."""
+    assert 'Route("/api/image", api_image, methods=["POST"])' in APP_SRC
+    # The handler exists and mentions OCR + VLM (both pipelines invoked)
+    assert "async def api_image(" in APP_SRC
+    assert "_ocr_frame" in APP_SRC
+    assert "_describe_frame" in APP_SRC
+
+
 # ─── User prompt feature ────────────────────────────────────────────────────
 
 

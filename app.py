@@ -4038,6 +4038,198 @@ async def api_describe(request: Request):
                 log.warning(f"[API] Cleanup failed: {e}")
 
 
+# ─── Single-image OCR + VLM endpoint ─────────────────────────────────────────
+# Used by the Discord bot's image-attachment summary flow. Mirrors the
+# pipeline that /api/describe runs per-frame, but for one user-uploaded
+# still image. Unlike /api/describe (which takes a path on a shared volume),
+# this endpoint accepts the image as multipart bytes so callers in other
+# containers don't need a shared mount.
+
+# Cap per-request upload size. Discord allows attachments up to 25MB
+# (50MB for Nitro boosters); 32MB is a comfortable ceiling that still
+# catches abuse / accidental video uploads.
+IMAGE_MAX_BYTES = int(os.environ.get("IMAGE_MAX_BYTES", str(32 * 1024 * 1024)))
+
+# Per-image VLM prompt. Distinct from VLM_FRAME_PROMPT (which is tuned for
+# 1-of-60 video frames where the model should describe action) — for a
+# single still we want a more comprehensive, self-contained description.
+IMAGE_VLM_PROMPT = os.environ.get(
+    "IMAGE_VLM_PROMPT",
+    "Describe this image in 2-4 sentences. Include the subject, setting, "
+    "any people or objects, the overall mood, and notable visual details. "
+    "If there is significant text visible (signs, captions, document "
+    "contents, UI), note that text is present but don't try to transcribe "
+    "it verbatim — OCR handles that separately. Be concrete, no hedging.",
+)
+
+
+_ALLOWED_IMAGE_CONTENT_TYPES = (
+    "image/jpeg", "image/jpg", "image/png", "image/webp",
+    "image/gif", "image/bmp", "image/tiff",
+)
+
+
+async def api_image(request: Request):
+    """POST /api/image — OCR + VLM describe a single uploaded image.
+
+    Accepts multipart/form-data with field `file` (the image bytes).
+    Optional form fields:
+      model:  VLM model id (default LLM_VISION_MODEL)
+      prompt: VLM prompt override (default IMAGE_VLM_PROMPT)
+      ocr:    "0" to skip OCR pass (default "1")
+      vlm:    "0" to skip VLM pass (default "1")
+
+    Returns:
+      {
+        "ocr": "...",           # joined OCR snippets, " | "-separated
+        "description": "...",   # VLM scene description
+        "width": int, "height": int,
+        "model": str,            # VLM model id used
+        "bytes": int,            # original upload size
+      }
+
+    422 + permanent:true on VLM-not-configured (mmproj missing on the
+    deployed model). 400 on missing file / oversized upload / bad mime.
+    """
+    # Starlette parses multipart lazily; the form() call buffers the body.
+    try:
+        form = await request.form()
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"multipart parse failed: {e}"}, status_code=400,
+        )
+
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read"):
+        return JSONResponse(
+            {"error": "missing 'file' field (multipart upload required)"},
+            status_code=400,
+        )
+
+    content_type = (getattr(upload, "content_type", "") or "").lower()
+    # Be lenient — Discord CDN sometimes serves images with generic
+    # application/octet-stream. Accept anything that LOOKS like an image
+    # extension OR carries an image/* content type.
+    filename = (getattr(upload, "filename", "") or "upload").lower()
+    looks_like_image = (
+        content_type.startswith("image/")
+        or filename.endswith((".jpg", ".jpeg", ".png", ".webp",
+                              ".gif", ".bmp", ".tif", ".tiff"))
+    )
+    if not looks_like_image:
+        return JSONResponse(
+            {"error": f"unsupported content-type '{content_type}' and "
+                      f"non-image filename '{filename}'"},
+            status_code=400,
+        )
+
+    data = await upload.read()
+    if not data:
+        return JSONResponse({"error": "empty upload"}, status_code=400)
+    if len(data) > IMAGE_MAX_BYTES:
+        return JSONResponse(
+            {"error": f"image too large: {len(data)} bytes > "
+                      f"IMAGE_MAX_BYTES ({IMAGE_MAX_BYTES})"},
+            status_code=400,
+        )
+
+    # Persist to a temp file so _ocr_frame / _describe_frame (which both
+    # take a path) can read it. Suffix follows the original filename so
+    # ffmpeg / PIL / EasyOCR / VLM all see a sensible extension.
+    suffix = os.path.splitext(filename)[1] or ".jpg"
+    if suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp",
+                              ".gif", ".bmp", ".tif", ".tiff"):
+        suffix = ".jpg"
+    tmpdir = tempfile.mkdtemp(prefix="image-upload-")
+    tmp_path = os.path.join(tmpdir, f"img{suffix}")
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
+
+        do_ocr = form.get("ocr", "1") not in ("0", "false", "no", "off")
+        do_vlm = form.get("vlm", "1") not in ("0", "false", "no", "off")
+        vlm_model = (form.get("model") or LLM_VISION_MODEL).strip()
+        prompt = (form.get("prompt") or IMAGE_VLM_PROMPT).strip()
+
+        log.info(
+            "[API] /image: filename=%s bytes=%d ct=%s ocr=%s vlm=%s model=%s",
+            filename, len(data), content_type, do_ocr, do_vlm, vlm_model,
+        )
+
+        # Cheap dimension probe via PIL (already a transitive dep through
+        # whisperx). Falls back gracefully if PIL can't decode (corrupt
+        # upload) — the downstream OCR/VLM calls will surface the real
+        # error.
+        width = height = 0
+        try:
+            from PIL import Image as _PILImage
+            with _PILImage.open(tmp_path) as im:
+                width, height = im.size
+        except Exception as e:
+            log.warning("[API] /image: PIL dimension probe failed: %s", e)
+
+        ocr_text = ""
+        description = ""
+
+        # Run OCR + VLM in parallel — both are blocking sync calls so
+        # gather them in worker threads. OCR is fast (~1-2s); VLM is
+        # the long pole (5-30s depending on model + image complexity).
+        async def _run_ocr() -> str:
+            if not do_ocr:
+                return ""
+            try:
+                return await asyncio.to_thread(_ocr_frame, tmp_path)
+            except Exception as e:
+                log.warning("[API] /image: OCR failed: %s", e)
+                return ""
+
+        async def _run_vlm() -> str:
+            if not do_vlm:
+                return ""
+            try:
+                return await asyncio.to_thread(
+                    _describe_frame, tmp_path, vlm_model, prompt,
+                )
+            except RuntimeError as e:
+                # Surface VLM-not-configured as a permanent 422 — matches
+                # /api/describe semantics so the bot doesn't waste retries.
+                if _is_vlm_not_configured(str(e)):
+                    raise VLMNotConfiguredError(str(e)) from e
+                raise
+
+        try:
+            ocr_text, description = await asyncio.gather(_run_ocr(), _run_vlm())
+        except VLMNotConfiguredError as e:
+            log.error("[API] /image permanent error (VLM config): %s", e)
+            return JSONResponse(
+                {"error": str(e), "permanent": True,
+                 "kind": "vlm_not_configured"},
+                status_code=422,
+            )
+        except Exception as e:
+            log.error("[API] /image VLM error: %s", e)
+            traceback.print_exc()
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+        return JSONResponse({
+            "ocr": ocr_text or "",
+            "description": description or "",
+            "width": width,
+            "height": height,
+            "model": vlm_model,
+            "bytes": len(data),
+        })
+    finally:
+        # Best-effort cleanup; ignore failures (next /tmp sweep handles it).
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+            if os.path.isdir(tmpdir) and not os.listdir(tmpdir):
+                os.rmdir(tmpdir)
+        except Exception as e:
+            log.warning("[API] /image cleanup failed: %s", e)
+
+
 async def api_cleanup(request: Request):
     """POST /api/cleanup — best-effort delete a yt-dlp temp file.
 
@@ -4079,6 +4271,7 @@ API_ROUTES = [
     Route("/api/yt-download", api_yt_download, methods=["POST"]),
     Route("/api/transcribe", api_transcribe, methods=["POST"]),
     Route("/api/describe", api_describe, methods=["POST"]),
+    Route("/api/image", api_image, methods=["POST"]),
     Route("/api/cleanup", api_cleanup, methods=["POST"]),
     # Server-side job queue (Valkey-backed). New default — bot/MCP use these.
     Route("/api/jobs", api_jobs_submit, methods=["POST"]),
