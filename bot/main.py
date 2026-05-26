@@ -3808,11 +3808,53 @@ def _extract_image_attachments(
     return urls, filenames
 
 
+# Image-format magic-byte signatures. We check these on every downloaded
+# attachment to catch Discord CDN edge cases where a signed URL returns
+# 200 with a tiny HTML error stub (`{"message":"This content is no longer
+# available."}` shape) instead of the real bytes — the bot used to forward
+# those stubs to /api/image, which then handed them to the VLM, which 400'd
+# with "Failed to load image". With a sniff here, the failure is surfaced
+# as a clean PermanentError after the first attempt instead of burning
+# four retries on the same stub.
+_IMAGE_MAGIC_BYTES = (
+    b"\x89PNG\r\n\x1a\n",          # PNG
+    b"\xff\xd8\xff",                # JPEG (any flavour)
+    b"GIF87a", b"GIF89a",            # GIF
+    b"RIFF",                         # WebP (full check below)
+    b"BM",                           # BMP
+    b"II*\x00", b"MM\x00*",          # TIFF (little/big endian)
+    b"\x00\x00\x00\x0cftypheic",     # HEIC (Discord auto-converts iOS uploads)
+    b"\x00\x00\x00\x0cftypheix",
+    b"\x00\x00\x00\x0cftypavif",     # AVIF
+)
+
+
+def _looks_like_image_bytes(data: bytes) -> bool:
+    """Cheap magic-byte sniff to confirm `data` is a real image.
+
+    Falsey for HTML error stubs, JSON error bodies, redirected login pages,
+    and the empty/truncated payloads Discord's CDN occasionally returns
+    for expired signed URLs.
+    """
+    if not data or len(data) < 16:
+        return False
+    for sig in _IMAGE_MAGIC_BYTES:
+        if data.startswith(sig):
+            # RIFF prefix is shared by WAV / AVI / WebP — require the
+            # WEBP fourcc at byte offset 8 for true WebP.
+            if sig == b"RIFF":
+                return len(data) >= 12 and data[8:12] == b"WEBP"
+            return True
+    return False
+
+
 async def _download_attachment_bytes(url: str) -> bytes:
     """Download a Discord CDN attachment. Returns raw bytes.
 
     Raises:
-      PermanentError on 4xx (signed URL expired, deleted) — retry won't help.
+      PermanentError on 4xx, on non-image content-type, or on bytes that
+        don't pass the magic-byte sniff (HTML error stub, JSON, empty).
+        These never recover by retrying.
       RuntimeError on transient network failure (worker will retry).
     """
     if http is None:
@@ -3835,6 +3877,29 @@ async def _download_attachment_bytes(url: str) -> bytes:
                 raise PermanentError(
                     f"attachment exceeds size cap "
                     f"({IMAGE_MAX_BYTES_PER_ATTACHMENT} bytes)"
+                )
+            ctype = (resp.headers.get("content-type") or "").lower()
+            # Discord CDN returns the actual content-type for valid
+            # attachments (image/png, image/webp, image/gif, ...). If it
+            # comes back as text/html or application/json the body is an
+            # error stub, not an image — surface a permanent failure.
+            if ctype and not ctype.startswith(
+                ("image/", "application/octet-stream", "binary/octet-stream"),
+            ):
+                preview = data[:200].decode("utf-8", errors="replace")
+                raise PermanentError(
+                    f"attachment download returned non-image "
+                    f"content-type '{ctype}' — likely a CDN error page. "
+                    f"Body preview: {preview!r}"
+                )
+            # Magic-byte sniff catches the case where content-type is
+            # missing or generic but the bytes still aren't an image.
+            if not _looks_like_image_bytes(data):
+                preview = data[:64].hex()
+                raise PermanentError(
+                    f"attachment download returned {len(data)} bytes that "
+                    f"are not a recognised image format. "
+                    f"First bytes (hex): {preview}"
                 )
             return data
     except asyncio.TimeoutError:

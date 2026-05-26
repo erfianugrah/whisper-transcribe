@@ -4156,17 +4156,53 @@ async def api_image(request: Request):
             filename, len(data), content_type, do_ocr, do_vlm, vlm_model,
         )
 
-        # Cheap dimension probe via PIL (already a transitive dep through
-        # whisperx). Falls back gracefully if PIL can't decode (corrupt
-        # upload) — the downstream OCR/VLM calls will surface the real
-        # error.
+        # Normalise to JPEG via PIL before the VLM call. llama.cpp's
+        # multimodal image loader is strict about format/MIME matching
+        # the data URL prefix _describe_frame() hard-codes as image/jpeg,
+        # so a PNG / WebP / GIF / AVIF straight from Discord CDN gets
+        # rejected with "Failed to load image or audio file" (HTTP 400)
+        # even though the bytes are a valid image. Re-encode to baseline
+        # JPEG (RGB, no alpha) and the VLM accepts every format PIL can
+        # decode. PIL is a transitive dep via whisperx so no new install.
+        #
+        # OCR still runs against the original — EasyOCR is happy with
+        # any format and PNG/lossless input may even be slightly more
+        # legible than a JPEG round-trip.
         width = height = 0
+        vlm_path = tmp_path  # default: feed the original if normalisation fails
         try:
             from PIL import Image as _PILImage
             with _PILImage.open(tmp_path) as im:
                 width, height = im.size
+                # Flatten transparency against white — the VLM sees a
+                # natural background instead of black where alpha used
+                # to be (matches how browsers/Discord display the image).
+                if im.mode in ("RGBA", "LA", "P"):
+                    bg = _PILImage.new("RGB", im.size, (255, 255, 255))
+                    rgba = im.convert("RGBA")
+                    bg.paste(rgba, mask=rgba.split()[-1])
+                    rgb = bg
+                elif im.mode != "RGB":
+                    rgb = im.convert("RGB")
+                else:
+                    rgb = im
+                # Animated GIFs / multi-frame TIFFs — PIL gives the first
+                # frame by default, which is what we want for the VLM
+                # describe pass (single still). The OCR pass on the
+                # original handles each frame internally via EasyOCR.
+                jpeg_path = os.path.join(tmpdir, "img-vlm.jpg")
+                rgb.save(jpeg_path, "JPEG", quality=90, optimize=True)
+                vlm_path = jpeg_path
+                log.info(
+                    "[API] /image: normalised to JPEG for VLM "
+                    "(orig=%dx%d %s → jpg %d bytes)",
+                    width, height, im.format, os.path.getsize(jpeg_path),
+                )
         except Exception as e:
-            log.warning("[API] /image: PIL dimension probe failed: %s", e)
+            log.warning(
+                "[API] /image: PIL normalise failed (%s) — feeding original "
+                "to VLM; expect VLM HTTP 400 if format isn't JPEG.", e,
+            )
 
         ocr_text = ""
         description = ""
@@ -4188,7 +4224,7 @@ async def api_image(request: Request):
                 return ""
             try:
                 return await asyncio.to_thread(
-                    _describe_frame, tmp_path, vlm_model, prompt,
+                    _describe_frame, vlm_path, vlm_model, prompt,
                 )
             except RuntimeError as e:
                 # Surface VLM-not-configured as a permanent 422 — matches
