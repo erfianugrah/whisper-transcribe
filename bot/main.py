@@ -3870,13 +3870,34 @@ async def _download_attachment_bytes(url: str) -> bytes:
                 raise RuntimeError(
                     f"attachment download failed: HTTP {resp.status}"
                 )
-            # Defensive: don't load more than IMAGE_MAX_BYTES_PER_ATTACHMENT
-            # into memory even if the server claims a smaller content-length.
-            data = await resp.content.read(IMAGE_MAX_BYTES_PER_ATTACHMENT + 1)
+            # Cap upload size at the source via Content-Length BEFORE reading
+            # — we don't want to buffer multi-GB into memory just to reject.
+            # Discord populates Content-Length for all attachment responses.
+            clen = int(resp.headers.get("content-length") or "0")
+            if clen and clen > IMAGE_MAX_BYTES_PER_ATTACHMENT:
+                raise PermanentError(
+                    f"attachment exceeds size cap "
+                    f"({clen} > {IMAGE_MAX_BYTES_PER_ATTACHMENT} bytes)"
+                )
+            # `resp.read()` reads the full body, length-prefixed. Earlier
+            # versions used `resp.content.read(N)` which streams and can
+            # return short on chunked-transfer or connection-edge cases —
+            # observed delivering truncated PNGs to /api/image and tripping
+            # PIL's "image file is truncated" path. `read()` always returns
+            # the complete body or raises ClientPayloadError.
+            data = await resp.read()
             if len(data) > IMAGE_MAX_BYTES_PER_ATTACHMENT:
                 raise PermanentError(
                     f"attachment exceeds size cap "
-                    f"({IMAGE_MAX_BYTES_PER_ATTACHMENT} bytes)"
+                    f"({len(data)} > {IMAGE_MAX_BYTES_PER_ATTACHMENT} bytes)"
+                )
+            # Cross-check against Content-Length — if the body is shorter
+            # than the server claimed, the transfer was interrupted. Raise
+            # transient so a retry can grab the full thing.
+            if clen and len(data) < clen:
+                raise RuntimeError(
+                    f"attachment download short: got {len(data)} bytes, "
+                    f"server claimed {clen}"
                 )
             ctype = (resp.headers.get("content-type") or "").lower()
             # Discord CDN returns the actual content-type for valid

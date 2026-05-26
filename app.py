@@ -4172,7 +4172,20 @@ async def api_image(request: Request):
         vlm_path = tmp_path  # default: feed the original if normalisation fails
         try:
             from PIL import Image as _PILImage
+            from PIL import ImageFile as _PILImageFile
+            # Tolerate slightly truncated images — PIL otherwise refuses
+            # to .load() anything missing its EOF marker, even when 99%
+            # of the IDAT data is intact. Discord's CDN occasionally
+            # serves images with the last few bytes missing (observed
+            # 2026-05-26 on real Discord attachments); the VLM rejects
+            # the original PNG outright but happily accepts whatever
+            # PIL re-encodes after a best-effort decode.
+            _PILImageFile.LOAD_TRUNCATED_IMAGES = True
             with _PILImage.open(tmp_path) as im:
+                # Force .load() under LOAD_TRUNCATED_IMAGES so partial
+                # data gets converted to whatever black/transparent fill
+                # PIL uses for missing pixels — better than the VLM 400.
+                im.load()
                 width, height = im.size
                 # Flatten transparency against white — the VLM sees a
                 # natural background instead of black where alpha used
