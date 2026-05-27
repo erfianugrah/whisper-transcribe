@@ -2690,6 +2690,27 @@ class NotAVideoError(PermanentError):
     """
 
 
+# Pattern matching upstream 5xx errors propagated through whisper's
+# /api/image and /api/describe endpoints. The LLM proxy returns 502
+# during model swaps (~30-45s window) and the bot's default retry
+# backoff (10/30/90) frequently lands the retry mid-swap. When we
+# see one of these in the error message, the worker bumps the next
+# retry delay to at least 90s so the retry has a chance to land on
+# a stable proxy. Match both the proxy's own 502 and llama-server's
+# 503-during-load shape.
+_UPSTREAM_5XX_PATTERN = re.compile(
+    r"VLM HTTP 50[2345]|upstream error|Remote end closed connection|"
+    r"llama_server.*loading|model is loading",
+    re.IGNORECASE,
+)
+
+
+def _is_upstream_5xx(err: BaseException) -> bool:
+    """True if the error is an LLM proxy / llama-server transient 5xx
+    that benefits from a longer-than-default retry wait."""
+    return bool(_UPSTREAM_5XX_PATTERN.search(str(err)))
+
+
 class LLMOfflineError(PermanentError):
     """LLM endpoint is unreachable at the transport level (connection
     refused, DNS failure, no route to host, transport timeout).
@@ -2971,7 +2992,23 @@ async def worker():
             try:
                 if attempt > 0:
                     delay = RETRY_BACKOFF[min(attempt - 1, len(RETRY_BACKOFF) - 1)]
-                    log.info("[%s] Retry %d/%d in %ds...", job.video_id, attempt, MAX_RETRIES, delay)
+                    # LLM proxy model swaps take ~30-45s and return 502
+                    # during the window. The default 10s/30s/90s backoff
+                    # consistently lands the retry mid-swap. Bump the
+                    # first two delays to >swap-time when the last error
+                    # was an upstream 5xx, so the retry has a chance to
+                    # land on a stable proxy. Caps at the configured
+                    # delay if the user explicitly raised RETRY_BACKOFF.
+                    if last_error is not None and _is_upstream_5xx(last_error):
+                        delay = max(delay, 90)
+                        log.info(
+                            "[%s] Retry %d/%d in %ds (upstream 5xx — "
+                            "waiting past model swap window)...",
+                            job.video_id, attempt, MAX_RETRIES, delay,
+                        )
+                    else:
+                        log.info("[%s] Retry %d/%d in %ds...",
+                                 job.video_id, attempt, MAX_RETRIES, delay)
                     await asyncio.sleep(delay)
                 # Recompute handler each attempt — NotAVideoError flips kind.
                 if job.kind == "litmus":
@@ -3929,6 +3966,17 @@ async def _download_attachment_bytes(url: str) -> bytes:
         raise RuntimeError(f"attachment download transport error: {e}")
 
 
+# Inline retry budget for transient upstream 5xx inside _call_image_api.
+# Separate from the worker-level RETRY_BACKOFF: this catches the proxy
+# mid-swap window without burning a full worker retry slot. Total worst
+# case from these in-call retries: 2 * 90s = 3 min before the call
+# returns to the worker loop (which may then do its own retries).
+_IMAGE_API_INLINE_502_RETRIES = int(os.environ.get(
+    "IMAGE_API_INLINE_502_RETRIES", "2"))
+_IMAGE_API_INLINE_502_WAIT = int(os.environ.get(
+    "IMAGE_API_INLINE_502_WAIT", "90"))
+
+
 async def _call_image_api(
     data: bytes,
     filename: str,
@@ -3954,34 +4002,67 @@ async def _call_image_api(
     )
     if prompt:
         form.add_field("prompt", prompt)
-    try:
-        async with http.post(
-            f"{WHISPER_API}/api/image",
-            data=form,
-            timeout=aiohttp.ClientTimeout(total=IMAGE_API_TIMEOUT),
-        ) as resp:
-            body = await resp.json(content_type=None)
-            if resp.status == 200:
-                return body
-            err = (body or {}).get("error", f"HTTP {resp.status}")
-            if body and body.get("permanent") is True:
-                kind = body.get("kind") or ""
-                # VLM-not-configured: the operator needs to fix the model;
-                # retrying never helps. Surface a user-readable message.
-                if kind == "vlm_not_configured":
-                    raise PermanentError(
-                        f"vision model can't accept images: {err}. "
-                        f"Set LLM_VISION_MODEL to a multimodal model "
-                        f"(or load with mmproj on llama-server)."
+    # Inline retry loop for upstream 5xx — specifically the model-proxy
+    # 502 that lands during a vision-model swap window. Without this,
+    # the worker-level retry (10s/30s/90s) almost always lands the
+    # next attempt mid-swap too.
+    attempts = _IMAGE_API_INLINE_502_RETRIES + 1
+    for inline_attempt in range(attempts):
+        try:
+            async with http.post(
+                f"{WHISPER_API}/api/image",
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=IMAGE_API_TIMEOUT),
+            ) as resp:
+                body = await resp.json(content_type=None)
+                if resp.status == 200:
+                    return body
+                err = (body or {}).get("error", f"HTTP {resp.status}")
+                if body and body.get("permanent") is True:
+                    kind = body.get("kind") or ""
+                    # VLM-not-configured: operator needs to fix the model;
+                    # retrying never helps.
+                    if kind == "vlm_not_configured":
+                        raise PermanentError(
+                            f"vision model can't accept images: {err}. "
+                            f"Set LLM_VISION_MODEL to a multimodal model "
+                            f"(or load with mmproj on llama-server)."
+                        )
+                    raise PermanentError(f"/api/image rejected: {err}")
+                if 400 <= resp.status < 500:
+                    raise PermanentError(f"/api/image {resp.status}: {err}")
+                # 5xx — inline-retry if it looks like a proxy swap (502
+                # with "upstream error" / "Remote end closed" in the body)
+                # and we still have inline-retry budget.
+                err_str = f"/api/image {resp.status}: {err}"
+                is_swap_502 = (
+                    resp.status == 502
+                    and (_UPSTREAM_5XX_PATTERN.search(err_str) is not None)
+                )
+                if is_swap_502 and inline_attempt < attempts - 1:
+                    log.info(
+                        "/api/image got swap-502 (inline attempt %d/%d); "
+                        "sleeping %ds to outlast model swap...",
+                        inline_attempt + 1, attempts,
+                        _IMAGE_API_INLINE_502_WAIT,
                     )
-                raise PermanentError(f"/api/image rejected: {err}")
-            if 400 <= resp.status < 500:
-                raise PermanentError(f"/api/image {resp.status}: {err}")
-            raise RuntimeError(f"/api/image {resp.status}: {err}")
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"/api/image timed out after {IMAGE_API_TIMEOUT}s")
-    except aiohttp.ClientError as e:
-        raise RuntimeError(f"/api/image transport error: {e}")
+                    await asyncio.sleep(_IMAGE_API_INLINE_502_WAIT)
+                    # IMPORTANT: aiohttp FormData is single-use; rebuild
+                    # for the next attempt.
+                    form = aiohttp.FormData()
+                    form.add_field(
+                        "file", data,
+                        filename=filename,
+                        content_type=ctype or "image/jpeg",
+                    )
+                    if prompt:
+                        form.add_field("prompt", prompt)
+                    continue
+                raise RuntimeError(err_str)
+        except asyncio.TimeoutError:
+            raise RuntimeError(f"/api/image timed out after {IMAGE_API_TIMEOUT}s")
+        except aiohttp.ClientError as e:
+            raise RuntimeError(f"/api/image transport error: {e}")
 
 
 def _format_image_block(
