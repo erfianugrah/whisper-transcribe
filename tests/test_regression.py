@@ -3169,6 +3169,18 @@ def test_is_generic_image_filename_keeps_meaningful_names():
         assert not bot._is_generic_image_filename(name), f"should keep: {name}"
 
 
+def test_ocr_title_snippet_strips_trailing_orphan_punctuation():
+    """Trailing isolated symbol after whitespace (OCR-chunk-split artifact)
+    gets stripped, but punctuation glued to a word stays."""
+    # Trailing orphan @ — the @username got chopped off into the next chunk
+    assert bot._ocr_title_snippet("Kate Tungusova @") == "Kate Tungusova"
+    assert bot._ocr_title_snippet("BREAKING NEWS -") == "BREAKING NEWS"
+    assert bot._ocr_title_snippet("SOME HEADLINE :") == "SOME HEADLINE"
+    # Glued punctuation — keep it (it's legitimate, no leading space)
+    assert bot._ocr_title_snippet("Hello world!") == "Hello world!"
+    assert bot._ocr_title_snippet("This is a question?") == "This is a question?"
+
+
 def test_ocr_title_snippet_first_easyocr_chunk():
     """EasyOCR joins snippets with ' | '; title snippet takes the first."""
     assert bot._ocr_title_snippet("") == ""

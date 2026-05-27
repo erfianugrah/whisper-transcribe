@@ -4154,6 +4154,13 @@ def _ocr_title_snippet(ocr_text: str, max_chars: int = 80) -> str:
     # Collapse internal whitespace runs so multi-line OCR doesn't render
     # as a multi-line embed title (Discord renders \n inside titles).
     first = re.sub(r"\s+", " ", first)
+    # Strip trailing isolated punctuation / symbols when they sit AFTER
+    # a space — these are typically OCR-chunk artifacts where the next
+    # neighbouring word (e.g. "@username") got split off by the " | "
+    # join. "Kate Tungusova @" → "Kate Tungusova". Doesn't touch valid
+    # trailing punctuation glued to a word like "Hello world!" because
+    # we require a leading space.
+    first = re.sub(r"\s+[^\w\s]{1,3}$", "", first).rstrip()
     if len(first) < 10:
         return ""
     if len(first) <= max_chars:
