@@ -741,6 +741,13 @@ def _job_to_retry_spec(job: "Job") -> _RetrySpec:
     )
 
 
+# Sentinel prefix the RetryJobsView appends to the original rejection
+# message when a click fails (LLM still offline / queue still full).
+# Found-and-replaced on subsequent failed clicks so we refresh the
+# timestamp rather than stacking lines.
+_RETRY_FOOTER_MARKER = "\n· last retry "
+
+
 class RetryJobsView(discord.ui.View):
     """Single-click resubmit for jobs rejected by the LLM-offline gate.
 
@@ -778,12 +785,33 @@ class RetryJobsView(discord.ui.View):
         # the rejection was posted.
         ok, reason = _rate_limit_check(self.target_user_id, count=len(self.specs))
         if not ok:
-            # Still failing — ephemeral feedback so the channel doesn't
-            # accumulate "still offline" messages every time the user clicks.
-            # Don't disable the button: state may recover later.
-            await interaction.response.send_message(
-                f"⏳ {reason}", ephemeral=True,
+            # Still failing. Edit the original rejection message in place
+            # with a refreshed "last tried" footer rather than sending a
+            # new ephemeral on every click — repeated clicks would otherwise
+            # stack up multiple identical ephemerals in the channel.
+            # Discord's "(edited)" badge gives the user enough feedback
+            # that the click registered. Button stays enabled.
+            now_hms = time.strftime("%H:%M:%S")
+            base = interaction.message.content if interaction.message else ""
+            # Strip any prior footer so we refresh rather than concat.
+            if _RETRY_FOOTER_MARKER in base:
+                base = base.split(_RETRY_FOOTER_MARKER, 1)[0].rstrip()
+            new_content = (
+                f"{base}{_RETRY_FOOTER_MARKER}{now_hms} — still offline"
             )
+            try:
+                await interaction.response.edit_message(
+                    content=new_content, view=self,
+                )
+            except (discord.HTTPException, discord.NotFound):
+                # Fallback: ephemeral if the original message was deleted
+                # or we lost edit permission. Rare path.
+                try:
+                    await interaction.followup.send(
+                        f"⏳ {reason}", ephemeral=True,
+                    )
+                except discord.HTTPException:
+                    pass
             return
 
         # Gate passes — defer the response (we'll send a followup with

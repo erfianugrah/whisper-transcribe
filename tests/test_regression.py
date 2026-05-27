@@ -1925,6 +1925,43 @@ def test_job_reply_accepts_view_parameter():
     assert sig.parameters["view"].default is None
 
 
+def test_retry_button_edits_in_place_on_repeated_failure():
+    """When the user clicks Retry while the LLM is still offline (or any
+    other gate failure), the handler must EDIT the original rejection
+    message in place rather than sending a fresh ephemeral on every click.
+    Repeated clicks otherwise stack identical 'still offline' ephemerals
+    in the channel — the bug the user reported on 2026-05-27."""
+    src = BOT_SRC
+    # Find the retry_button handler.
+    start = src.index("async def retry_button")
+    # Bound by the next def at the same indent (the closing of the view).
+    end = src.index("def _maybe_retry_view", start)
+    handler_src = src[start:end]
+    # The not-ok branch must call edit_message, NOT send_message-ephemeral
+    # as the primary feedback path.
+    assert "interaction.response.edit_message" in handler_src, \
+        "Retry-still-failing path must edit the rejection in place"
+    # The footer marker constant must be referenced so the timestamp
+    # gets refreshed rather than concatenated.
+    assert "_RETRY_FOOTER_MARKER" in handler_src, \
+        "Retry handler must use _RETRY_FOOTER_MARKER for idempotent edits"
+    # The constant itself must exist and be a newline-prefixed marker so
+    # the split-and-replace logic finds prior footers.
+    assert hasattr(bot, "_RETRY_FOOTER_MARKER"), \
+        "bot module must expose _RETRY_FOOTER_MARKER constant"
+    assert bot._RETRY_FOOTER_MARKER.startswith("\n"), \
+        "_RETRY_FOOTER_MARKER must start with newline so it's distinguishable"
+    # The button must NOT disable itself on a failed retry — state may
+    # recover and the user should be able to click again.
+    not_ok_block = handler_src.split("if not ok:", 1)[1].split("return", 1)[0]
+    assert "disabled = True" not in not_ok_block, \
+        "Failed retry must keep the button enabled for the next attempt"
+    # Fallback ephemeral is only on the edit_message exception path — the
+    # primary path stays in-channel-edit.
+    assert "followup.send" in handler_src, \
+        "Fallback ephemeral required when edit_message fails (deleted msg)"
+
+
 def test_video_path_raises_not_a_video_on_unsupported():
     """process() must distinguish NotAVideoError from generic PermanentError
     so the worker can route correctly."""
