@@ -3138,6 +3138,97 @@ def test_process_image_is_async_and_uses_api_image():
     assert "job.channel.send" in src
 
 
+def test_is_generic_image_filename_catches_discord_clipboard_names():
+    """Filenames Discord clipboard paste assigns should all be flagged generic."""
+    for name in (
+        "image.png", "image.jpg", "Image.PNG", "IMAGE.WEBP",
+        "Untitled.png", "untitled.jpg",
+        "clipboard.png", "clipboard.jpg",
+        "screenshot.png", "Screenshot.png", "screen-shot.png",
+        "Screenshot 2024-05-26 at 10.30.45.png",
+        "pasted-image.png", "Pasted_Image.png",
+        "IMG_1234.JPG", "img_5678.png", "DSC01234.JPG",
+        "PIC00001.JPG", "P12345.jpg", "PHOTO_9876.png",
+        "1234.png", "567.jpg",
+        "2024-05-26-screenshot.png",
+    ):
+        assert bot._is_generic_image_filename(name), f"should be generic: {name}"
+
+
+def test_is_generic_image_filename_keeps_meaningful_names():
+    """Meaningful filenames (uploaded with actual descriptive names) stay."""
+    for name in (
+        "diagram-architecture.png",
+        "error_message.png",
+        "my_holiday_2024.jpg",
+        "flowchart-v2.webp",
+        "recipe-card.jpeg",
+        "company-logo.png",
+        "meme.png",                # 4 chars, not generic
+    ):
+        assert not bot._is_generic_image_filename(name), f"should keep: {name}"
+
+
+def test_ocr_title_snippet_first_easyocr_chunk():
+    """EasyOCR joins snippets with ' | '; title snippet takes the first."""
+    assert bot._ocr_title_snippet("") == ""
+    assert bot._ocr_title_snippet("hi") == ""  # too short
+    assert bot._ocr_title_snippet("hello world here") == "hello world here"
+    assert bot._ocr_title_snippet(
+        "BREAKING NEWS | A whole subtitle | more text below"
+    ) == "BREAKING NEWS"
+    # Long single-line input gets truncated on a word boundary
+    long_text = "This is a very long single line of OCR text that will exceed the title length cap easily here"
+    s = bot._ocr_title_snippet(long_text, max_chars=40)
+    assert s.endswith("\u2026")  # ellipsis
+    assert len(s) <= 40
+    # Multi-line collapsed to single line
+    assert "\n" not in bot._ocr_title_snippet("line one\nline two | more")
+
+
+def test_derive_image_title_prefers_ocr_for_generic_filename():
+    """OCR snippet beats a generic 'image.png' filename."""
+    title = bot._derive_image_title(
+        filenames=["image.png"],
+        ocr_parts=[("image.png", "@daddycool tweeted something | replies | likes")],
+    )
+    assert title == "@daddycool tweeted something"
+
+
+def test_derive_image_title_falls_back_to_image_for_no_ocr_no_name():
+    """No OCR + generic filename → bare 'Image' (better than 'image.png')."""
+    assert bot._derive_image_title(
+        filenames=["image.png"], ocr_parts=[],
+    ) == "Image"
+
+
+def test_derive_image_title_keeps_meaningful_filename_when_no_ocr():
+    """Meaningful filename used when no OCR — with separators normalised."""
+    assert bot._derive_image_title(
+        filenames=["holiday-photo-2024.jpg"], ocr_parts=[],
+    ) == "holiday photo 2024"
+
+
+def test_derive_image_title_multi_image_with_ocr():
+    """Multi-image — count prefix + OCR snippet from the first that has text."""
+    title = bot._derive_image_title(
+        filenames=["image.png", "image.png", "image.png"],
+        ocr_parts=[
+            ("image.png", ""),  # first image had no OCR
+            ("image.png", "Receipt total $42.99 | Thank you for shopping"),
+        ],
+    )
+    assert title.startswith("3 images")
+    assert "Receipt total" in title
+
+
+def test_derive_image_title_multi_image_no_ocr():
+    """Multi-image, no OCR — just the count."""
+    assert bot._derive_image_title(
+        filenames=["image.png", "image.png"], ocr_parts=[],
+    ) == "2 images"
+
+
 def test_image_prompts_present():
     """prompts.py exports the image-specific prompt templates."""
     assert hasattr(p, "PROMPT_BRIEF_IMAGE")

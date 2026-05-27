@@ -4104,6 +4104,115 @@ IMAGE_OCR_VERBATIM_MIN_CHARS = int(os.environ.get(
     "IMAGE_OCR_VERBATIM_MIN_CHARS", "80"))
 
 
+# Filenames Discord (and the OSes that paste into it) assign to clipboard
+# screenshots / unsaved uploads. None of these carry information about the
+# image content — "TL;DR: Image: image.png" reads as nothing. When we see
+# one we drop the filename from the embed title and try to derive something
+# meaningful from the OCR text instead.
+#
+# Matches: image.png, image.jpg, Untitled.png, clipboard.jpg, screenshot*,
+# screen-shot*, Screen Shot YYYY-MM-DD*, paste-image.png, pasted_image.png,
+# IMG_1234.JPG, DSC01234.JPG, PIC00001.JPG, 1234.png, 2024-05-26-*.png.
+_GENERIC_IMAGE_NAME_PATTERN = re.compile(
+    r"^(?:"
+    r"image|untitled|clipboard|paste[d]?[_\-\s]*image|"
+    r"screen[_\-\s]?shot.*|"                  # screenshot / Screen Shot YYYY-MM-DD at HH:MM:SS
+    r"(?:img|dsc|pic|cam|p|photo)[_\-]?\d+|"  # IMG_1234, DSC01234, etc.
+    r"\d{4}[_\-]\d{2}[_\-]\d{2}.*|"           # date-only stems
+    r"\d+"                                    # pure number stems (1234.png)
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _is_generic_image_filename(filename: str) -> bool:
+    """True if filename is a placeholder like 'image.png' / 'Untitled.jpg' /
+    'IMG_1234.JPG' — carries no signal about the image content. Bot then
+    falls back to OCR-derived title."""
+    if not filename:
+        return True
+    stem = os.path.splitext(filename)[0].strip()
+    if not stem:
+        return True
+    return bool(_GENERIC_IMAGE_NAME_PATTERN.match(stem))
+
+
+def _ocr_title_snippet(ocr_text: str, max_chars: int = 80) -> str:
+    """Extract a short, title-worthy phrase from EasyOCR output.
+
+    EasyOCR joins detected text snippets with ' | '. The first snippet is
+    usually the highest-up / left-most text in the image — typically a
+    headline / username / window title / meme caption, which makes a
+    much better Discord embed title than 'image.png'.
+
+    Returns '' when no snippet meets the minimum-length bar (avoids
+    1-2 character snippets like a stray '@' or 'X').
+    """
+    if not ocr_text:
+        return ""
+    first = ocr_text.split(" | ", 1)[0].strip()
+    # Collapse internal whitespace runs so multi-line OCR doesn't render
+    # as a multi-line embed title (Discord renders \n inside titles).
+    first = re.sub(r"\s+", " ", first)
+    if len(first) < 10:
+        return ""
+    if len(first) <= max_chars:
+        return first
+    # Truncate on a word boundary if possible — nicer than mid-word.
+    cut = first[: max_chars - 1].rsplit(" ", 1)[0]
+    if len(cut) < max_chars // 2:
+        cut = first[: max_chars - 1]
+    return cut + "…"
+
+
+def _derive_image_title(
+    filenames: list[str],
+    ocr_parts: list[tuple[str, str]],
+) -> str:
+    """Build a human-friendly title for the image-summary embed.
+
+    Priority:
+    1. First image's OCR snippet (when OCR found enough text).
+    2. Meaningful filename (when not on the generic-placeholder list).
+    3. Fallback to "Image" / "N images".
+
+    Multi-image jobs always carry the count, optionally suffixed with
+    an OCR snippet from the first image.
+    """
+    n = len(filenames)
+    # First OCR snippet (any image, ordered as ocr_parts — which matches
+    # attachment order).
+    ocr_snippet = ""
+    for _fn, ocr in ocr_parts:
+        snippet = _ocr_title_snippet(ocr)
+        if snippet:
+            ocr_snippet = snippet
+            break
+
+    primary_name = filenames[0] if filenames else ""
+    is_generic = _is_generic_image_filename(primary_name)
+    name_stem = ""
+    if not is_generic and primary_name:
+        stem = os.path.splitext(primary_name)[0]
+        # Make filename-style separators read as English: 'cool_pic-v2' →
+        # 'cool pic v2'. Single-letter underscores like 'a_b' get joined.
+        name_stem = re.sub(r"[_\-]+", " ", stem).strip()
+
+    if n == 1:
+        if ocr_snippet:
+            return ocr_snippet
+        if name_stem:
+            return name_stem
+        return "Image"
+    # Multi-image
+    base = f"{n} images"
+    if ocr_snippet:
+        return f"{base} — {ocr_snippet}"
+    if name_stem:
+        return f"{base} ({name_stem} + {n - 1} more)"
+    return base
+
+
 async def process_image(job: Job):
     """Image-attachment handler. OCR + VLM-describe each attachment via
     /api/image, then summarize with the standard LLM.
@@ -4231,13 +4340,11 @@ async def process_image(job: Job):
     brief = sanitize_llm_output(results[0])
     key_points = sanitize_llm_output(results[1]) if do_key_points else ""
 
-    # 4. Post embeds.
+    # 4. Post embeds. Title prefers OCR snippet over filename because
+    # Discord clipboard pastes all arrive as "image.png" and the embed
+    # title "TL;DR: image.png" carries zero information about content.
     n = len(job.image_urls)
-    title = (
-        f"Image: {job.image_filenames[0]}"
-        if n == 1
-        else f"{n} images: {job.image_filenames[0]} + {n - 1} more"
-    )
+    title = _derive_image_title(job.image_filenames, ocr_parts)
     detail_channel = resolve_summary_channel(job.channel)
     use_split = detail_channel.id != job.channel.id
 
