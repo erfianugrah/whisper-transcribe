@@ -3,3 +3,8 @@ models/
 __pycache__/
 *.pyc
 .env
+# UI: the bun stage installs + builds from source; never ship host artifacts.
+ui/node_modules/
+ui/dist/
+ui/.tanstack/
+.git/

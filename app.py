@@ -4388,6 +4388,83 @@ async def api_cleanup(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# ─── SPA support endpoints (history / media / upload / live proxy) ────────────
+# These wrap state that today lives in-process in the Gradio UI so the React
+# SPA in ui/ can be fully self-sufficient over HTTP.
+
+async def api_history(request: Request):
+    """GET /api/history — recent transcription history (last 50 entries)."""
+    return JSONResponse(_load_history())
+
+
+async def api_media(request: Request):
+    """GET /api/media — server-side media files available for transcription.
+
+    `?refresh=1` bypasses the scan_media_files TTL cache.
+    """
+    force = request.query_params.get("refresh") in ("1", "true", "yes")
+    files = scan_media_files(force=force)
+    return JSONResponse({"files": [{"name": n, "path": p} for n, p in files]})
+
+
+async def api_upload(request: Request):
+    """POST /api/upload — multipart file upload.
+
+    Streams the upload to a fresh temp dir and returns the server-side path
+    the SPA then submits to /api/jobs (mirrors the yt-download → jobs flow).
+    """
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "filename"):
+        return JSONResponse({"error": "missing 'file' field"}, status_code=400)
+    out_dir = tempfile.mkdtemp(prefix="upload-")
+    safe_name = os.path.basename(upload.filename or "upload") or "upload"
+    dest = os.path.join(out_dir, safe_name)
+    size = 0
+    try:
+        with open(dest, "wb") as f:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                size += len(chunk)
+    finally:
+        await upload.close()
+    log.info(f"[API] upload saved: {dest} ({size} bytes)")
+    return JSONResponse({"file_path": dest, "filename": safe_name, "size": size})
+
+
+async def api_live_health(request: Request):
+    """GET /api/live/health — proxy whisper-live capacity for the SPA."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{LIVE_SERVICE_URL}/health")
+            return JSONResponse(r.json(), status_code=r.status_code)
+    except Exception as e:
+        return JSONResponse({"status": "unavailable", "error": str(e)}, status_code=503)
+
+
+async def api_live_chunk(request: Request):
+    """POST /api/live/transcribe-chunk — same-origin proxy of raw 16 kHz PCM
+    to the whisper-live sidecar so the browser Live tab can reach it."""
+    import httpx
+    body = await request.body()
+    context = request.query_params.get("context", "")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{LIVE_SERVICE_URL}/transcribe-chunk",
+                params={"context": context},
+                content=body,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            return JSONResponse(r.json(), status_code=r.status_code)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
 API_ROUTES = [
     Route("/api/status", api_status, methods=["GET"]),
     Route("/api/yt-download", api_yt_download, methods=["POST"]),
@@ -4400,7 +4477,29 @@ API_ROUTES = [
     Route("/api/jobs/{job_id}", api_jobs_get, methods=["GET"]),
     Route("/api/jobs/{job_id}", api_jobs_cancel, methods=["DELETE"]),
     Route("/api/queue", api_queue_info, methods=["GET"]),
+    # SPA support (history / media / upload / live proxy).
+    Route("/api/history", api_history, methods=["GET"]),
+    Route("/api/media", api_media, methods=["GET"]),
+    Route("/api/upload", api_upload, methods=["POST"]),
+    Route("/api/live/health", api_live_health, methods=["GET"]),
+    Route("/api/live/transcribe-chunk", api_live_chunk, methods=["POST"]),
 ]
+
+# Static mount for the React SPA (ui/dist). Registered ahead of the greedy
+# Gradio mount at "/" so /ui/* resolves to the SPA. Conditional so dev runs
+# without a build don't crash — Gradio stays the only UI until ui/dist exists.
+UI_DIST = os.environ.get(
+    "UI_DIST", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "dist")
+)
+if os.path.isdir(UI_DIST):
+    from starlette.routing import Mount
+    from starlette.staticfiles import StaticFiles
+    API_ROUTES.append(
+        Mount("/ui", app=StaticFiles(directory=UI_DIST, html=True), name="ui")
+    )
+    log.info(f"Mounting SPA at /ui from {UI_DIST}")
+else:
+    log.info(f"SPA dist not found at {UI_DIST}; /ui disabled (Gradio only)")
 
 
 # -- Launch --------------------------------------------------------------------

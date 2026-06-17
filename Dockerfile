@@ -1,5 +1,17 @@
 FROM denoland/deno:bin-2.7.14 AS deno
 
+# ─── SPA build stage ─────────────────────────────────────────────────────
+# Compiles the React SPA in ui/ to a static bundle (dist/) served at /ui by
+# the Starlette app. Lockfile copied first so deps cache independently of
+# source edits. Output is ~600 KB of static assets — negligible vs the CUDA
+# layers below.
+FROM oven/bun:1 AS ui-build
+WORKDIR /ui
+COPY ui/package.json ui/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY ui/ ./
+RUN bun run build
+
 FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -112,6 +124,9 @@ RUN for lang in $(echo "$ALIGN_LANGS" | tr ',' ' '); do \
         python3 -c "import whisperx; whisperx.load_align_model('$lang', device='cpu')" \
         || echo "WARN: pre-warm for '$lang' failed (will download lazily)"; \
     done
+
+# ─── Built SPA (static assets, served at /ui) ─────────────────────────────
+COPY --from=ui-build --chown=ubuntu:ubuntu /ui/dist ./ui/dist
 
 # ─── Source code (changes here invalidate only this layer + CMD) ─────────────
 COPY --chown=ubuntu:ubuntu app.py .
