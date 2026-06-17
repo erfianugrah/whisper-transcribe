@@ -4443,6 +4443,79 @@ def test_bot_job_has_translate_field():
     assert 'translate: object = "auto"' in BOT_SRC
 
 
+# ─── Live transcription (whisper-live sidecar) ─────────────────────────────
+
+
+def test_bot_is_live_error_defined():
+    """IsLiveError must be a defined exception class."""
+    assert "class IsLiveError(" in BOT_SRC
+
+
+def test_bot_live_emoji_defined():
+    """PROCESSING_EMOJI_LIVE defined and present in the PROCESSING_EMOJI tuple."""
+    assert "PROCESSING_EMOJI_LIVE" in BOT_SRC
+    tuple_src = BOT_SRC[BOT_SRC.index("PROCESSING_EMOJI = ("):][:500]
+    assert "PROCESSING_EMOJI_LIVE" in tuple_src
+
+
+def test_bot_validator_accepts_live_kind():
+    """Job.__post_init__ must accept kind='live'."""
+    idx = BOT_SRC.index("self.kind not in")
+    assert '"live"' in BOT_SRC[idx:idx + 120]
+
+
+def test_bot_is_live_stream_uses_probe_endpoint():
+    """_is_live_stream must call whisper-live's /probe (not shell yt-dlp —
+    the bot container has no yt-dlp/ffmpeg)."""
+    assert "async def _is_live_stream(" in BOT_SRC
+    fn_src = BOT_SRC[BOT_SRC.index("async def _is_live_stream("):][:900]
+    assert "/probe" in fn_src
+    assert "WHISPER_LIVE_URL" in fn_src
+    # Must NOT shell out to yt-dlp from the bot.
+    assert "create_subprocess" not in fn_src
+
+
+def test_bot_process_uses_is_live_gate():
+    """process() must raise IsLiveError when _is_live_stream is true."""
+    proc_src = BOT_SRC[BOT_SRC.index("async def process(job: Job):"):]
+    proc_src = proc_src[:proc_src.index("async def process_url")]
+    assert "_is_live_stream" in proc_src
+    assert "raise IsLiveError" in proc_src
+
+
+def test_bot_worker_reroutes_is_live():
+    """worker() must catch IsLiveError and set kind='live'."""
+    worker_src = BOT_SRC[BOT_SRC.index("async def worker("):][:5000]
+    assert "except IsLiveError" in worker_src
+    assert 'job.kind = "live"' in worker_src
+
+
+def test_bot_worker_dispatches_live_handler():
+    """worker() must dispatch kind='live' to process_live."""
+    worker_src = BOT_SRC[BOT_SRC.index("async def worker("):][:5000]
+    assert 'job.kind == "live"' in worker_src
+    assert "process_live" in worker_src
+
+
+def test_bot_process_live_defined_and_uses_ws():
+    """process_live must exist and connect to whisper-live via WebSocket."""
+    assert "async def process_live(" in BOT_SRC
+    fn_src = BOT_SRC[BOT_SRC.index("async def process_live("):]
+    next_def = fn_src.index("\nasync def ", 1)
+    fn_src = fn_src[:next_def]
+    assert "ws_connect" in fn_src
+    assert "WHISPER_LIVE_WS" in fn_src
+    assert "summarize(" in fn_src
+    # No SpeakerRenameView constructed on live (no diarization in streaming mode).
+    assert "SpeakerRenameView(" not in fn_src
+
+
+def test_bot_whisper_live_env_vars():
+    """Both HTTP and WS forms of the whisper-live URL must be derived."""
+    assert "WHISPER_LIVE_URL" in BOT_SRC
+    assert "WHISPER_LIVE_WS" in BOT_SRC
+
+
 def test_bot_passes_translate_to_server():
     """process() must forward Job.translate to the /api/jobs payload."""
     src = BOT_SRC[BOT_SRC.index("transcribe_payload = {"):]

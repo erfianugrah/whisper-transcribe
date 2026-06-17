@@ -141,6 +141,9 @@ if not DISCORD_TOKEN:
               "Set it via env or bot/.env (see bot/.env.example).")
     sys.exit(2)
 WHISPER_API = os.environ.get("WHISPER_API_URL", "http://localhost:7860")
+WHISPER_LIVE_URL = os.environ.get("WHISPER_LIVE_URL", "http://localhost:7861")
+# WebSocket form derived from the HTTP URL (http→ws, https→wss).
+WHISPER_LIVE_WS = WHISPER_LIVE_URL.replace("http://", "ws://", 1).replace("https://", "wss://", 1)
 SCRAPER_API = os.environ.get("SCRAPER_API_URL", "http://localhost:11235")
 FLARESOLVERR_API = os.environ.get("FLARESOLVERR_API_URL",
                                   "http://localhost:8191/v1")
@@ -474,9 +477,9 @@ class Job:
                     self.message is not None, self.interaction is not None,
                 )
             )
-        if self.kind not in ("video", "web", "litmus", "image"):
+        if self.kind not in ("video", "web", "litmus", "image", "live"):
             raise ValueError(
-                f"Job.kind must be 'video' | 'web' | 'litmus' | 'image', "
+                f"Job.kind must be 'video' | 'web' | 'litmus' | 'image' | 'live', "
                 f"got {self.kind!r}"
             )
 
@@ -688,6 +691,29 @@ def _rate_limit_record(user_id: int) -> None:
     _user_jobs[user_id].append(time.time())
 
 
+async def _is_live_stream(url: str) -> bool:
+    """Ask whisper-live whether `url` is a currently-airing live stream.
+
+    Fails safe (returns False) on any error — if whisper-live is down or
+    the probe errors, the job falls through to the normal video pipeline
+    rather than getting stuck. Only currently-live streams return True;
+    VOD'd streams ('was_live') route to the normal video pipeline."""
+    if http is None:
+        return False
+    try:
+        async with http.get(
+            f"{WHISPER_LIVE_URL}/probe",
+            params={"url": url},
+            timeout=aiohttp.ClientTimeout(total=35),
+        ) as resp:
+            if resp.status != 200:
+                return False
+            data = await resp.json()
+            return bool(data.get("is_live"))
+    except Exception:
+        return False
+
+
 # ─── Retry view (LLM-offline rejections) ──────────────────────────────────────
 # When the queue gate rejects a job because the LLM endpoint is unreachable,
 # we attach a single "Retry when ready" button to the rejection message so
@@ -705,7 +731,7 @@ class _RetrySpec:
     a stale Job reference (Job contains Discord message/interaction refs
     that may be invalid by the time the user clicks retry)."""
     url: str
-    kind: str                      # "video" | "web" | "litmus" | "image"
+    kind: str                      # "video" | "web" | "litmus" | "image" | "live"
     video_id: str                  # YT id or URL hash, same convention as Job
     diarize: bool = False
     vlm_enabled: bool = True
@@ -2718,6 +2744,17 @@ class NotAVideoError(PermanentError):
     """
 
 
+class IsLiveError(Exception):
+    """process() determined the URL is a currently-airing live stream.
+
+    Caught by worker() (mirroring NotAVideoError) to re-route the job to
+    kind='live' / process_live, which streams via whisper-live instead of
+    downloading a never-terminating file. Deliberately a plain Exception
+    (not PermanentError) so its except clause — placed before the
+    NotAVideoError/PermanentError handlers — catches it as a routing signal.
+    """
+
+
 # Pattern matching upstream 5xx errors propagated through whisper's
 # /api/image and /api/describe endpoints. The LLM proxy returns 502
 # during model swaps (~30-45s window) and the bot's default retry
@@ -2850,6 +2887,7 @@ def _is_permanent_remote_error(text: str) -> bool:
 PROCESSING_EMOJI_VIDEO = "\U0001f3a7"  # 🎧
 PROCESSING_EMOJI_WEB = "\U0001f4f0"    # 📰
 PROCESSING_EMOJI_IMAGE = "\U0001f5bc\ufe0f"  # 🖼️ image OCR + VLM
+PROCESSING_EMOJI_LIVE = "\U0001f399\ufe0f"   # 🎙️ live transcription
 # Cleanup list covers ALL kinds so a kind switch (e.g. NotAVideoError
 # fall-through) leaves no stale reactions behind.
 PROCESSING_EMOJI = (
@@ -2857,6 +2895,7 @@ PROCESSING_EMOJI = (
     PROCESSING_EMOJI_VIDEO,    # 🎧 video fetch
     PROCESSING_EMOJI_WEB,      # 📰 web fetch
     PROCESSING_EMOJI_IMAGE,    # 🖼️ image processing
+    PROCESSING_EMOJI_LIVE,     # 🎙️ live transcription
     "\U0001f9e0",              # 🧠 summarising
 )
 
@@ -3045,11 +3084,19 @@ async def worker():
                     handler = process_url
                 elif job.kind == "image":
                     handler = process_image
+                elif job.kind == "live":
+                    handler = process_live
                 else:
                     handler = process
                 await handler(job)
                 last_error = None
                 break
+            except IsLiveError as e:
+                log.info("[%s] live stream — re-routing to live pipeline: %s",
+                         job.video_id, e)
+                job.kind = "live"
+                # Routing change, not a retry — re-enter loop with new handler.
+                continue
             except NotAVideoError as e:
                 if job.explicit_request:
                     # User explicitly asked for a summary; URL isn't a
@@ -3152,6 +3199,13 @@ async def process(job: Job):
         title, status, transcript, duration = cached
         log.info("[%s] Cache hit (%d chars, '%s')", job.video_id, len(transcript), title)
     else:
+        # 1b. Live-stream gate. A live stream download never terminates, so
+        # detect-and-reroute BEFORE the download. Cache hits skip this (a
+        # cached transcript means the stream already finished as a VOD).
+        # _is_live_stream fails safe to False, so a down whisper-live just
+        # means we attempt the normal video path.
+        if await _is_live_stream(job.url):
+            raise IsLiveError(job.url)
         # 2. Download. Keep the video stream alongside audio when VLM is
         # enabled — /api/describe needs a video file to extract frames
         # from. When VLM is off, audio-only WAV (smaller, current default).
@@ -4461,6 +4515,100 @@ async def process_image(job: Job):
 
     log.info("[%s] Done — posted image summary (%d image(s), brief=%d chars)",
              job.video_id, n, len(brief))
+
+
+async def process_live(job: Job):
+    """Stream-transcribe a currently-airing live URL via whisper-live.
+
+    The bot is a thin WebSocket client: it sends the URL to whisper-live's
+    /ws-url, which runs yt-dlp|ffmpeg internally and streams back transcript
+    segments. When the live stream ends (yt-dlp exits), whisper-live sends a
+    'done' frame; we then summarise and post (same prompts as video jobs).
+    Live streams have no speaker labels, so no SpeakerRenameView is attached.
+    """
+    if http is None:
+        raise RuntimeError("HTTP session not initialised")
+
+    await _job_react(job, PROCESSING_EMOJI_LIVE)  # 🎙️
+    _inflight_phase(job, PHASE_TRANSCRIBING)
+
+    # 1. Title via probe (best-effort; the WS path doesn't return it).
+    title = "Live Stream"
+    try:
+        async with http.get(
+            f"{WHISPER_LIVE_URL}/probe", params={"url": job.url},
+            timeout=aiohttp.ClientTimeout(total=35),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                title = data.get("title") or title
+    except Exception:
+        pass
+
+    # 2. Stream: open WS, send URL, collect segments until 'done'.
+    transcript_parts: list[str] = []
+    stream_start = time.monotonic()
+    async with http.ws_connect(f"{WHISPER_LIVE_WS}/ws-url", timeout=60) as ws:
+        await ws.send_json({"url": job.url})
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                if data["type"] == "segment":
+                    transcript_parts.append(data["text"])
+                elif data["type"] == "done":
+                    break
+                elif data["type"] == "error":
+                    raise RuntimeError(f"whisper-live: {data['message']}")
+            elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                break
+
+    if not transcript_parts:
+        raise PermanentError("No speech detected in live stream — nothing to summarise.")
+
+    transcript = " ".join(transcript_parts)
+    duration = int(time.monotonic() - stream_start)
+    duration_str = format_duration(duration)
+
+    # 3. Summarise (mirror the video handler's brief + key_points calls).
+    _inflight_phase(job, PHASE_SUMMARIZING)
+    await _job_react(job, "\U0001f9e0")  # 🧠
+    brief, key_points = await asyncio.gather(
+        summarize(
+            transcript, PROMPT_BRIEF, LLM_MAX_TOKENS_BRIEF,
+            reduce_template=REDUCE_BRIEF,
+            title=title, duration=duration_str, reference_block="",
+        ),
+        summarize(
+            transcript, PROMPT_KEY_POINTS, LLM_MAX_TOKENS_KEY_POINTS,
+            reduce_template=REDUCE_KEY_POINTS,
+            title=title, duration=duration_str, reference_block="",
+            char_cap=SUMMARY_CHAR_CAP,
+        ),
+    )
+    brief = sanitize_llm_output(brief)
+    key_points = sanitize_llm_output(key_points)
+
+    # 4. Post embeds (no SpeakerRenameView — streaming mode has no speakers).
+    detail_channel = resolve_summary_channel(job.channel)
+    await send_long_embed(detail_channel, "Key Points", key_points, 0x9B59B6)
+
+    embed = discord.Embed(
+        title=f"TL;DW: {truncate(title, 240)}",
+        url=job.url,
+        description=truncate(brief, 4000),
+        color=0x9B59B6,  # purple — distinct from video (red) / web (blue)
+    )
+    embed.set_footer(text=f"Live · {duration_str}")
+    if job.message is not None:
+        await job.channel.send(embed=embed, reference=job.message)
+    else:
+        await job.channel.send(embed=embed)
+
+    for emoji in PROCESSING_EMOJI:
+        await _job_remove_react(job, emoji)
+    await _job_react(job, "\u2705")  # ✅
+    log.info("[%s] Done — live summary posted (%d chars, %s)",
+             job.video_id, len(transcript), duration_str)
 
 
 # ─── AI litmus handler ───────────────────────────────────────────────────────
