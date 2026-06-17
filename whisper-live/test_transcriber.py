@@ -69,7 +69,90 @@ def test_transcribe_chunk_passes_context_as_initial_prompt():
     assert calls.get("initial_prompt") == "previous text"
 
 
-# ── server integration tests ───────────────────────────────────────────────────
+# ── LocalAgreement streaming tests ──────────────────────────────────────────────
+from transcriber import HypothesisBuffer, OnlineSession, SAMPLE_RATE
+
+
+def _w(start, end, text):
+    return types.SimpleNamespace(start=start, end=end, word=text)
+
+
+class _ScriptedModel:
+    """Returns a queued word-list per transcribe() call, as faster-whisper
+    would: one segment carrying `.words`."""
+
+    def __init__(self, scripts):
+        self._scripts = list(scripts)
+
+    def transcribe(self, audio, **k):
+        words = self._scripts.pop(0) if self._scripts else []
+        seg = types.SimpleNamespace(
+            start=words[0].start if words else 0.0,
+            end=words[-1].end if words else 0.0,
+            text="".join(w.word for w in words),
+            words=words,
+        )
+        return [seg], _info
+
+
+def _session(scripts, **kw):
+    return OnlineSession(_ScriptedModel(scripts), **kw)
+
+
+_PCM_2S = (np.zeros(SAMPLE_RATE * 2, dtype=np.int16)).tobytes()
+
+
+def test_hypothesis_commits_only_agreed_prefix():
+    """Two passes: stable prefix commits, divergent tail is held back."""
+    sess = _session(
+        [
+            [_w(0.0, 0.5, " hello"), _w(0.5, 1.0, " world"), _w(1.0, 1.5, " foo")],
+            [_w(0.0, 0.5, " hello"), _w(0.5, 1.0, " world"), _w(1.0, 1.6, " bar")],
+        ]
+    )
+    sess.insert_audio(_PCM_2S)
+    c1, _ = sess.process()  # first pass: nothing agreed yet
+    assert c1 == ""
+    sess.insert_audio(_PCM_2S)
+    c2, partial = sess.process()  # second pass: prefix now agreed
+    assert c2 == "hello world"
+    assert "bar" in partial  # divergent tail still provisional
+
+
+def test_transient_hallucination_never_commits():
+    """A word present in one pass but gone the next is never committed."""
+    sess = _session(
+        [
+            [_w(0.0, 0.5, " testing"), _w(0.5, 1.0, " Bye-bye")],
+            [_w(0.0, 0.5, " testing")],
+            [_w(0.0, 0.5, " testing")],
+        ]
+    )
+    for _ in range(3):
+        sess.insert_audio(_PCM_2S)
+        sess.process()
+    committed = "".join(w[2] for w in sess.committed).strip()
+    assert "testing" in committed
+    assert "Bye-bye" not in committed
+
+
+def test_process_waits_for_min_chunk():
+    """Below the min-chunk threshold, no inference / no commit."""
+    sess = _session([[_w(0.0, 0.5, " hi")]], min_chunk_s=1.0)
+    sess.insert_audio((np.zeros(SAMPLE_RATE // 2, dtype=np.int16)).tobytes())  # 0.5s
+    c, p = sess.process()
+    assert c == "" and p == ""
+
+
+def test_finish_flushes_unconfirmed_tail():
+    sess = _session([[_w(0.0, 0.5, " hello"), _w(0.5, 1.0, " there")]])
+    sess.insert_audio(_PCM_2S)
+    sess.process()  # 'hello there' staged in buffer, not yet agreed
+    final = sess.finish()
+    assert final == "hello there"
+
+
+# ── server integration tests ────────────────────────────────────────────────────
 import os
 os.environ.setdefault("LIVE_MODEL", "stub")
 os.environ.setdefault("DEVICE", "cpu")
@@ -132,6 +215,7 @@ def test_ws_url_route_registered():
     app = _make_app()
     paths = {getattr(r, "path", None) for r in app.routes}
     assert "/ws-url" in paths
+    assert "/ws-stream" in paths
 
 
 if __name__ == "__main__":

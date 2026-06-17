@@ -2730,7 +2730,7 @@ async def _worker_shutdown():
 # -- HTTP API (for MCP server / programmatic access) --------------------------
 from starlette.requests import Request
 from starlette.responses import JSONResponse
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
 
 
 async def api_status(request: Request):
@@ -4465,6 +4465,65 @@ async def api_live_chunk(request: Request):
         return JSONResponse({"error": str(e)}, status_code=502)
 
 
+async def ws_live_stream(websocket):
+    """WS /api/live/stream — same-origin bridge between the browser and the
+    whisper-live sidecar's /ws-stream (LocalAgreement streaming). The browser
+    sends binary PCM frames; the sidecar replies commit/partial JSON. We pump
+    bytes both ways and tear down when either side closes.
+    """
+    import websockets
+    from starlette.websockets import WebSocketDisconnect
+
+    await websocket.accept()
+    ws_url = (
+        LIVE_SERVICE_URL.replace("http://", "ws://").replace("https://", "wss://")
+        + "/ws-stream"
+    )
+    try:
+        # ping_interval=None: GPU inference bursts can delay pong handling;
+        # we don't want a spurious keepalive timeout killing the stream.
+        async with websockets.connect(ws_url, max_size=None, ping_interval=None) as up:
+            async def to_upstream():
+                try:
+                    while True:
+                        msg = await websocket.receive()
+                        if msg.get("type") == "websocket.disconnect":
+                            break
+                        if msg.get("bytes") is not None:
+                            await up.send(msg["bytes"])
+                        elif msg.get("text") is not None:
+                            await up.send(msg["text"])
+                except WebSocketDisconnect:
+                    pass
+                finally:
+                    await up.close()
+
+            async def to_client():
+                try:
+                    async for m in up:
+                        if isinstance(m, (bytes, bytearray)):
+                            await websocket.send_bytes(bytes(m))
+                        else:
+                            await websocket.send_text(m)
+                except Exception:
+                    pass
+
+            t1 = asyncio.create_task(to_upstream())
+            t2 = asyncio.create_task(to_client())
+            _done, pending = await asyncio.wait(
+                {t1, t2}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+    except Exception as e:
+        log.warning(f"[API] /live/stream proxy error: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 API_ROUTES = [
     Route("/api/status", api_status, methods=["GET"]),
     Route("/api/yt-download", api_yt_download, methods=["POST"]),
@@ -4483,6 +4542,7 @@ API_ROUTES = [
     Route("/api/upload", api_upload, methods=["POST"]),
     Route("/api/live/health", api_live_health, methods=["GET"]),
     Route("/api/live/transcribe-chunk", api_live_chunk, methods=["POST"]),
+    WebSocketRoute("/api/live/stream", ws_live_stream),
 ]
 
 # Static mount for the React SPA (ui/dist). Registered ahead of the greedy

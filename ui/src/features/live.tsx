@@ -10,13 +10,9 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
-import { getLiveHealth, liveChunk } from "@/lib/api";
+import { getLiveHealth } from "@/lib/api";
 
 const TARGET_SR = 16000;
-const CHUNK_SECONDS = 2; // smallest window that still gives whisper usable context
-const CHUNK_SAMPLES = TARGET_SR * CHUNK_SECONDS;
-const SILENCE_PEAK = 0.002; // ~ -54 dBFS: below this a window is treated as silent
 const WAVE_HEIGHT = 72;
 
 // Linear-interpolation downsample of mono Float32 to 16 kHz Int16 PCM.
@@ -31,10 +27,15 @@ function downsampleToPcm16(input: Float32Array, inRate: number): Int16Array {
 	return out;
 }
 
+function streamUrl(): string {
+	const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+	return `${proto}//${window.location.host}/api/live/stream`;
+}
+
 export function LiveTab() {
 	const [recording, setRecording] = useState(false);
-	const [transcript, setTranscript] = useState("");
-	const [sending, setSending] = useState(false);
+	const [committed, setCommitted] = useState("");
+	const [partial, setPartial] = useState("");
 	const [trackInfo, setTrackInfo] = useState("");
 	const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
 	const [deviceId, setDeviceId] = useState<string>("");
@@ -54,59 +55,21 @@ export function LiveTab() {
 	const analyserRef = useRef<AnalyserNode | null>(null);
 	const canvasRef = useRef<HTMLCanvasElement | null>(null);
 	const rafRef = useRef<number | null>(null);
-	const columnsRef = useRef<Array<[number, number]>>([]); // [min,max] per x-pixel
-	const bufRef = useRef<Int16Array[]>([]);
-	const countRef = useRef(0);
-	const peakRef = useRef(0); // max |sample| in the current window
-	const transcriptRef = useRef("");
-	const sendingRef = useRef(false);
-
-	const flush = async () => {
-		if (sendingRef.current || countRef.current === 0) return;
-		sendingRef.current = true;
-		const chunks = bufRef.current;
-		const windowPeak = peakRef.current;
-		bufRef.current = [];
-		countRef.current = 0;
-		peakRef.current = 0;
-		// Skip effectively-silent windows: VAD would discard them anyway and
-		// it saves a GPU round-trip. The waveform still shows live input.
-		if (windowPeak < SILENCE_PEAK) {
-			sendingRef.current = false;
-			return;
-		}
-		setSending(true);
-		const total = chunks.reduce((n, c) => n + c.length, 0);
-		const merged = new Int16Array(total);
-		let off = 0;
-		for (const c of chunks) {
-			merged.set(c, off);
-			off += c.length;
-		}
-		try {
-			const { segments } = await liveChunk(
-				merged.buffer as ArrayBuffer,
-				transcriptRef.current.slice(-300),
-			);
-			const text = segments
-				.map((s) => s.text)
-				.join(" ")
-				.trim();
-			if (text) {
-				transcriptRef.current += (transcriptRef.current ? " " : "") + text;
-				setTranscript(transcriptRef.current);
-			}
-		} catch (e) {
-			toast.error((e as Error).message);
-		} finally {
-			sendingRef.current = false;
-			setSending(false);
-		}
-	};
+	const columnsRef = useRef<Array<[number, number]>>([]);
+	const wsRef = useRef<WebSocket | null>(null);
+	const committedRef = useRef("");
 
 	const stop = () => {
 		if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
 		rafRef.current = null;
+		const ws = wsRef.current;
+		if (ws && ws.readyState === WebSocket.OPEN) {
+			try {
+				ws.send("done");
+			} catch {}
+			ws.close();
+		}
+		wsRef.current = null;
 		procRef.current?.disconnect();
 		srcRef.current?.disconnect();
 		srcRef.current = null;
@@ -121,96 +84,14 @@ export function LiveTab() {
 		ctxRef.current = null;
 		setRecording(false);
 		setTrackInfo("");
-		flush(); // send the partial tail
 	};
 
-	const start = async () => {
-		if (!navigator.mediaDevices?.getUserMedia) {
-			toast.error("Microphone needs a secure context (https or localhost).");
-			return;
-		}
-		try {
-			// Known-working capture config (matches the version that worked end-
-			// to-end). autoGainControl is load-bearing: without it quiet USB mics
-			// sit under the silence threshold and read as "no signal".
-			const stream = await navigator.mediaDevices.getUserMedia({
-				audio: {
-					channelCount: 1,
-					echoCancellation: true,
-					noiseSuppression: true,
-					autoGainControl: true,
-					...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-				},
-			});
-			streamRef.current = stream;
-			// Labels are unlocked now that permission is granted; refresh the list.
-			if (devices.every((d) => !d.label)) loadDevices();
-			// Surface the actual captured track so a silent device is diagnosable.
-			const track = stream.getAudioTracks()[0];
-			const s = track?.getSettings?.() ?? {};
-			setTrackInfo(
-				`${track?.label || "?"} · ${s.sampleRate ?? "?"}Hz · ${
-					s.channelCount ?? "?"
-				}ch · muted=${track?.muted}`,
-			);
-			if (track?.muted) {
-				toast.error(
-					"This device reports muted at the OS level — unmute it in Windows sound settings.",
-				);
-			}
-			const ctx = new AudioContext();
-			if (ctx.state === "suspended") await ctx.resume();
-			ctxRef.current = ctx;
-			const src = ctx.createMediaStreamSource(stream);
-			srcRef.current = src;
-
-			const analyser = ctx.createAnalyser();
-			analyser.fftSize = 1024;
-			analyserRef.current = analyser;
-			src.connect(analyser);
-
-			const proc = ctx.createScriptProcessor(4096, 1, 1);
-			procRef.current = proc;
-			// Muted sink: ScriptProcessor only fires while connected to the graph,
-			// but routing the mic to the real output would cause speaker feedback.
-			const sink = ctx.createGain();
-			sink.gain.value = 0;
-			sinkRef.current = sink;
-			proc.onaudioprocess = (ev) => {
-				const input = ev.inputBuffer.getChannelData(0);
-				let peak = 0;
-				for (let i = 0; i < input.length; i++) {
-					const a = Math.abs(input[i]);
-					if (a > peak) peak = a;
-				}
-				if (peak > peakRef.current) peakRef.current = peak;
-				const pcm = downsampleToPcm16(input, ctx.sampleRate);
-				bufRef.current.push(pcm);
-				countRef.current += pcm.length;
-				if (countRef.current >= CHUNK_SAMPLES) flush();
-			};
-			src.connect(proc);
-			proc.connect(sink);
-			sink.connect(ctx.destination);
-
-			columnsRef.current = [];
-			setRecording(true);
-		} catch (e) {
-			toast.error(`Mic access failed: ${(e as Error).message}`);
-			setRecording(false);
-		}
-	};
-
-	// Enumerate audio inputs. Labels are only populated after mic permission has
-	// been granted once, so we request a throwaway stream first to unlock them.
 	const loadDevices = async () => {
 		if (!navigator.mediaDevices?.enumerateDevices) return;
 		try {
 			const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
 			for (const t of probe.getTracks()) t.stop();
-		} catch {
-			// permission denied / no device — enumerate still lists deviceIds
-		}
+		} catch {}
 		const all = await navigator.mediaDevices.enumerateDevices();
 		const mics = all.filter((d) => d.kind === "audioinput");
 		setDevices(mics);
@@ -226,8 +107,95 @@ export function LiveTab() {
 		return () => md.removeEventListener("devicechange", loadDevices);
 	}, []);
 
-	// Audacity-style scrolling waveform: one min/max column per x-pixel, shifted
-	// left each animation frame. Driven off recording state so it tears down clean.
+	const start = async () => {
+		if (!navigator.mediaDevices?.getUserMedia) {
+			toast.error("Microphone needs a secure context (https or localhost).");
+			return;
+		}
+		try {
+			// Known-working capture config. autoGainControl is load-bearing for
+			// quiet USB mics.
+			const stream = await navigator.mediaDevices.getUserMedia({
+				audio: {
+					channelCount: 1,
+					echoCancellation: true,
+					noiseSuppression: true,
+					autoGainControl: true,
+					...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+				},
+			});
+			streamRef.current = stream;
+			if (devices.every((d) => !d.label)) loadDevices();
+			const track = stream.getAudioTracks()[0];
+			const s = track?.getSettings?.() ?? {};
+			setTrackInfo(
+				`${track?.label || "?"} · ${s.sampleRate ?? "?"}Hz · ${
+					s.channelCount ?? "?"
+				}ch · muted=${track?.muted}`,
+			);
+
+			// Open the streaming WS to the sidecar (via same-origin proxy).
+			const ws = new WebSocket(streamUrl());
+			ws.binaryType = "arraybuffer";
+			wsRef.current = ws;
+			ws.onmessage = (ev) => {
+				let msg: { type?: string; text?: string; message?: string };
+				try {
+					msg = JSON.parse(ev.data);
+				} catch {
+					return;
+				}
+				if (msg.type === "commit" && msg.text) {
+					committedRef.current += (committedRef.current ? " " : "") + msg.text;
+					setCommitted(committedRef.current);
+					setPartial("");
+				} else if (msg.type === "partial") {
+					setPartial(msg.text ?? "");
+				} else if (msg.type === "error") {
+					toast.error(msg.message || "stream error");
+				}
+			};
+			ws.onerror = () => toast.error("Live stream connection failed");
+
+			const ctx = new AudioContext();
+			if (ctx.state === "suspended") await ctx.resume();
+			ctxRef.current = ctx;
+			const src = ctx.createMediaStreamSource(stream);
+			srcRef.current = src;
+
+			const analyser = ctx.createAnalyser();
+			analyser.fftSize = 1024;
+			analyserRef.current = analyser;
+			src.connect(analyser);
+
+			const proc = ctx.createScriptProcessor(4096, 1, 1);
+			procRef.current = proc;
+			const sink = ctx.createGain();
+			sink.gain.value = 0;
+			sinkRef.current = sink;
+			proc.onaudioprocess = (ev) => {
+				const pcm = downsampleToPcm16(
+					ev.inputBuffer.getChannelData(0),
+					ctx.sampleRate,
+				);
+				const sock = wsRef.current;
+				if (sock && sock.readyState === WebSocket.OPEN) {
+					sock.send(pcm.buffer as ArrayBuffer);
+				}
+			};
+			src.connect(proc);
+			proc.connect(sink);
+			sink.connect(ctx.destination);
+
+			columnsRef.current = [];
+			setRecording(true);
+		} catch (e) {
+			toast.error(`Mic access failed: ${(e as Error).message}`);
+			setRecording(false);
+		}
+	};
+
+	// Scrolling waveform driven off the analyser (visual feedback only).
 	useEffect(() => {
 		if (!recording) return;
 		const canvas = canvasRef.current;
@@ -242,11 +210,9 @@ export function LiveTab() {
 		g.scale(dpr, dpr);
 		const buf = new Float32Array(analyser.fftSize);
 		const cols = columnsRef.current;
-
 		const styles = getComputedStyle(document.documentElement);
 		const wave = `oklch(${styles.getPropertyValue("--primary").trim() || "0.65 0.19 41"})`;
 		const mid = "oklch(0.6 0 0 / 0.35)";
-
 		const draw = () => {
 			analyser.getFloatTimeDomainData(buf);
 			let lo = 1;
@@ -257,7 +223,6 @@ export function LiveTab() {
 			}
 			cols.push([lo, hi]);
 			while (cols.length > cssW) cols.shift();
-
 			g.clearRect(0, 0, cssW, WAVE_HEIGHT);
 			const cy = WAVE_HEIGHT / 2;
 			g.strokeStyle = mid;
@@ -265,7 +230,6 @@ export function LiveTab() {
 			g.moveTo(0, cy);
 			g.lineTo(cssW, cy);
 			g.stroke();
-
 			g.strokeStyle = wave;
 			g.lineWidth = 1;
 			g.beginPath();
@@ -289,6 +253,7 @@ export function LiveTab() {
 	useEffect(() => () => stop(), []);
 
 	const unavailable = health.data?.status === "unavailable";
+	const hasText = committed || partial;
 
 	return (
 		<div className="flex flex-col gap-4">
@@ -308,8 +273,7 @@ export function LiveTab() {
 				{recording && (
 					<span className="flex items-center gap-1.5 text-foreground">
 						<span className="inline-block size-2 animate-pulse rounded-full bg-destructive" />
-						recording
-						{sending && " · transcribing…"}
+						streaming
 					</span>
 				)}
 			</div>
@@ -372,27 +336,35 @@ export function LiveTab() {
 				<Button
 					variant="outline"
 					onClick={() => {
-						transcriptRef.current = "";
-						setTranscript("");
+						committedRef.current = "";
+						setCommitted("");
+						setPartial("");
 					}}
-					disabled={!transcript}
+					disabled={!hasText}
 				>
 					Clear
 				</Button>
 			</div>
 
-			<Textarea
-				readOnly
-				value={transcript}
-				placeholder={`Live transcript appears here. First result lands after ~${CHUNK_SECONDS}s of speech.`}
-				className="min-h-80 font-mono text-xs leading-relaxed"
-			/>
+			<div className="min-h-80 overflow-auto rounded border bg-card p-3 font-mono text-xs leading-relaxed">
+				{hasText ? (
+					<p className="whitespace-pre-wrap">
+						<span>{committed}</span>{" "}
+						<span className="text-muted-foreground italic">{partial}</span>
+					</p>
+				) : (
+					<span className="text-muted-foreground">
+						Live transcript appears here. Words commit (solid) once stable;
+						provisional words show dimmed.
+					</span>
+				)}
+			</div>
+
 			<p className="text-xs text-muted-foreground">
-				Audio is captured from your mic, downsampled to 16 kHz mono, and sent in{" "}
-				{CHUNK_SECONDS}s windows to the whisper-live sidecar via /api/live. The
-				waveform + level meter show live mic input — if they stay flat while you
-				speak, the browser is capturing the wrong device or has no mic
-				permission.
+				Mic audio streams continuously to the whisper-live sidecar, which runs
+				LocalAgreement streaming: it transcribes a growing buffer and commits
+				only words confirmed across consecutive passes — low latency without the
+				short-window hallucinations.
 			</p>
 		</div>
 	);

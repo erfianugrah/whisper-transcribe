@@ -11,6 +11,12 @@ WS   /ws-url              — client sends {"url": "..."} (text); server runs
                             yt-dlp|ffmpeg → PCM, streams {"type":"segment",...}
                             JSON lines, then {"type":"done","transcript":"..."}
                             when the live stream ends. Used by the Discord bot.
+WS   /ws-stream           — client streams raw 16 kHz mono int16 PCM (binary
+                            frames); server runs LocalAgreement streaming and
+                            replies {"type":"commit","text"} (stable, final) and
+                            {"type":"partial","text"} (provisional). Send text
+                            "done" (or disconnect) to flush + close. Used by the
+                            browser mic tab via the whisper-service WS proxy.
 """
 from __future__ import annotations
 
@@ -181,12 +187,76 @@ async def ws_url_endpoint(websocket: WebSocket) -> None:
         log.info(f"[ws-url] stream closed ({_active_streams}/{LIVE_MAX_STREAMS})")
 
 
+# ── WebSocket: browser mic PCM → streaming (LocalAgreement) transcript ──────────
+# Receiving and inference are decoupled: the receive loop only enqueues audio
+# (never blocks, so keepalive pings stay answered), and a separate task re-runs
+# inference on the current buffer at a fixed wall-clock cadence.
+PROCESS_INTERVAL = float(os.environ.get("LIVE_PROCESS_INTERVAL", "0.6"))
+
+
+async def ws_stream_endpoint(websocket: WebSocket) -> None:
+    global _active_streams
+    await websocket.accept()
+    if _active_streams >= LIVE_MAX_STREAMS:
+        await websocket.send_text(json.dumps({"type": "error", "message": "server at capacity"}))
+        await websocket.close(1013)
+        return
+    _active_streams += 1
+    session = _transcriber.new_session()
+    stop = asyncio.Event()
+    log.info(f"[ws-stream] opened ({_active_streams}/{LIVE_MAX_STREAMS})")
+
+    async def processor() -> None:
+        while not stop.is_set():
+            await asyncio.sleep(PROCESS_INTERVAL)
+            try:
+                committed, partial = await _transcriber.session_process(session)
+            except Exception as e:
+                log.error(f"[ws-stream] inference error: {e}")
+                continue
+            if committed:
+                await websocket.send_text(json.dumps({"type": "commit", "text": committed}))
+            if partial:
+                await websocket.send_text(json.dumps({"type": "partial", "text": partial}))
+
+    proc_task = asyncio.create_task(processor())
+    try:
+        while True:
+            msg = await websocket.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            data = msg.get("bytes")
+            if data:
+                session.insert_audio(data)
+                continue
+            text = msg.get("text")
+            if text and (text == "done" or '"done"' in text):
+                break
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        log.error(f"[ws-stream] error: {e}")
+    finally:
+        stop.set()
+        proc_task.cancel()
+        try:
+            final = await _transcriber.session_finish(session)
+            if final:
+                await websocket.send_text(json.dumps({"type": "commit", "text": final}))
+            await websocket.send_text(json.dumps({"type": "done"}))
+        except Exception:
+            pass
+        _active_streams -= 1
+        log.info(f"[ws-stream] closed ({_active_streams}/{LIVE_MAX_STREAMS})")
+
+
 app = Starlette(
     routes=[
         Route("/health", health),
         Route("/probe", probe),
         Route("/transcribe-chunk", transcribe_chunk, methods=["POST"]),
         WebSocketRoute("/ws-url", ws_url_endpoint),
+        WebSocketRoute("/ws-stream", ws_stream_endpoint),
     ],
     lifespan=_lifespan,
 )

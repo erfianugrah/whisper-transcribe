@@ -58,6 +58,12 @@ RUN pip uninstall -y torchcodec 2>/dev/null || true
 ARG YT_DLP_VERSION=2026.3.17
 RUN pip install --no-cache-dir --break-system-packages "yt-dlp>=${YT_DLP_VERSION}"
 
+# ─── WebSocket support (small, separate layer) ─────────────────────────────
+# uvicorn needs a WS implementation to serve the /api/live/stream proxy, and we
+# use the same lib as the upstream client. Kept out of the heavy requirements
+# layer so it doesn't trigger a multi-GB rebuild.
+RUN pip install --no-cache-dir --break-system-packages websockets
+
 # whisperX ships a Lightning v1.5.4 checkpoint that gets auto-upgraded at
 # runtime on every start. We previously ran the upgrade utility at build
 # time to make this persistent; it's now disabled because the upgrade CLI
