@@ -132,11 +132,17 @@ export function LiveTab() {
 			return;
 		}
 		try {
-			// Minimal constraints: just pin the device. No channelCount (forcing
-			// mono downmix silences some USB cams like the OBSBOT) and browser-
-			// default processing. We read channel 0 of whatever layout we get.
+			// Known-working capture config (matches the version that worked end-
+			// to-end). autoGainControl is load-bearing: without it quiet USB mics
+			// sit under the silence threshold and read as "no signal".
 			const stream = await navigator.mediaDevices.getUserMedia({
-				audio: deviceId ? { deviceId: { exact: deviceId } } : true,
+				audio: {
+					channelCount: 1,
+					echoCancellation: true,
+					noiseSuppression: true,
+					autoGainControl: true,
+					...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+				},
 			});
 			streamRef.current = stream;
 			// Labels are unlocked now that permission is granted; refresh the list.
