@@ -41,11 +41,11 @@ export const StatusSchema = z.object({
 		.object({
 			available: z.boolean(),
 			model: z.string(),
-			fps_interval: z.number().optional(),
-			max_frames: z.number().optional(),
+			fps_interval: z.number().nullish(),
+			max_frames: z.number().nullish(),
 		})
 		.partial()
-		.optional(),
+		.nullish(),
 });
 export type Status = z.infer<typeof StatusSchema>;
 export const getStatus = () => jget(StatusSchema, "/api/status");
@@ -53,14 +53,14 @@ export const getStatus = () => jget(StatusSchema, "/api/status");
 // ── /api/queue ───────────────────────────────────────────────────────────────
 const JobLike = z
 	.object({
-		id: z.string().optional(),
-		status: z.string().optional(),
-		consumer: z.string().optional(),
-		submitted_at: z.union([z.number(), z.string()]).optional(),
-		started_at: z.union([z.number(), z.string()]).optional(),
-		completed_at: z.union([z.number(), z.string()]).optional(),
-		position: z.number().optional(),
-		error: z.string().optional(),
+		id: z.string().nullish(),
+		status: z.string().nullish(),
+		consumer: z.string().nullish(),
+		submitted_at: z.union([z.number(), z.string()]).nullish(),
+		started_at: z.union([z.number(), z.string()]).nullish(),
+		completed_at: z.union([z.number(), z.string()]).nullish(),
+		position: z.number().nullish(),
+		error: z.string().nullish(),
 	})
 	.passthrough();
 
@@ -77,13 +77,13 @@ export const getQueue = () => jget(QueueSchema, "/api/queue");
 export const HistorySchema = z.array(
 	z
 		.object({
-			timestamp: z.string().optional(),
-			filename: z.string().optional(),
-			duration_str: z.string().optional(),
-			language: z.string().optional(),
-			speakers: z.union([z.number(), z.string()]).optional(),
-			speed: z.string().optional(),
-			segments: z.union([z.number(), z.string()]).optional(),
+			timestamp: z.string().nullish(),
+			filename: z.string().nullish(),
+			duration_str: z.string().nullish(),
+			language: z.string().nullish(),
+			speakers: z.union([z.number(), z.string()]).nullish(),
+			speed: z.string().nullish(),
+			segments: z.union([z.number(), z.string()]).nullish(),
 		})
 		.passthrough(),
 );
@@ -101,8 +101,8 @@ export const getMedia = (refresh = false) =>
 export const SubmitSchema = z.object({
 	job_id: z.string(),
 	status: z.string(),
-	submitted_at: z.union([z.number(), z.string()]).optional(),
-	position: z.number().optional(),
+	submitted_at: z.union([z.number(), z.string()]).nullish(),
+	position: z.number().nullish(),
 });
 
 export interface TranscribeOptions {
@@ -131,21 +131,21 @@ export const submitJob = (opts: TranscribeOptions) =>
 export const JobSchema = z
 	.object({
 		status: z.string(),
-		position: z.number().optional(),
-		submitted_at: z.union([z.number(), z.string()]).optional(),
-		started_at: z.union([z.number(), z.string()]).optional(),
-		completed_at: z.union([z.number(), z.string()]).optional(),
-		error: z.string().optional(),
-		permanent: z.boolean().optional(),
+		position: z.number().nullish(),
+		submitted_at: z.union([z.number(), z.string()]).nullish(),
+		started_at: z.union([z.number(), z.string()]).nullish(),
+		completed_at: z.union([z.number(), z.string()]).nullish(),
+		error: z.string().nullish(),
+		permanent: z.boolean().nullish(),
 		result: z
 			.object({
-				status: z.string().optional(),
-				transcript: z.string().optional(),
-				subtitle_file: z.string().nullable().optional(),
-				task: z.string().optional(),
+				status: z.string().nullish(),
+				transcript: z.string().nullish(),
+				subtitle_file: z.string().nullable().nullish(),
+				task: z.string().nullish(),
 			})
 			.passthrough()
-			.optional(),
+			.nullish(),
 	})
 	.passthrough();
 export type Job = z.infer<typeof JobSchema>;
@@ -164,9 +164,9 @@ export async function cancelJob(id: string): Promise<void> {
 // ── /api/yt-download ─────────────────────────────────────────────────────────
 export const YtDownloadSchema = z
 	.object({
-		filename: z.string().optional(),
-		title: z.string().optional(),
-		duration: z.union([z.number(), z.string()]).optional(),
+		filename: z.string().nullish(),
+		title: z.string().nullish(),
+		duration: z.union([z.number(), z.string()]).nullish(),
 	})
 	.passthrough();
 
@@ -197,9 +197,9 @@ export async function uploadFile(
 export const LiveHealthSchema = z
 	.object({
 		status: z.string(),
-		model: z.string().optional(),
-		max_streams: z.number().optional(),
-		active_streams: z.number().optional(),
+		model: z.string().nullish(),
+		max_streams: z.number().nullish(),
+		active_streams: z.number().nullish(),
 	})
 	.passthrough();
 export const getLiveHealth = () => jget(LiveHealthSchema, "/api/live/health");

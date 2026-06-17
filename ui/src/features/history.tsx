@@ -45,7 +45,7 @@ export function HistoryTab() {
 						</TableCell>
 						<TableCell
 							className="max-w-[18rem] truncate text-xs"
-							title={h.filename}
+							title={h.filename ?? undefined}
 						>
 							{h.filename}
 						</TableCell>
