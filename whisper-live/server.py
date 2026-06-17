@@ -192,6 +192,14 @@ async def ws_url_endpoint(websocket: WebSocket) -> None:
 # (never blocks, so keepalive pings stay answered), and a separate task re-runs
 # inference on the current buffer at a fixed wall-clock cadence.
 PROCESS_INTERVAL = float(os.environ.get("LIVE_PROCESS_INTERVAL", "0.6"))
+# Streaming/VAD knobs (env-tunable without a rebuild).
+_SESSION_KW = dict(
+    min_chunk_s=float(os.environ.get("LIVE_MIN_CHUNK_S", "1.0")),
+    trim_s=float(os.environ.get("LIVE_TRIM_S", "8.0")),
+    tail_silence_s=float(os.environ.get("LIVE_TAIL_SILENCE_S", "0.6")),
+    silence_rms=float(os.environ.get("LIVE_SILENCE_RMS", "0.006")),
+    min_silence_ms=int(os.environ.get("LIVE_MIN_SILENCE_MS", "300")),
+)
 
 
 async def ws_stream_endpoint(websocket: WebSocket) -> None:
@@ -202,7 +210,7 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
         await websocket.close(1013)
         return
     _active_streams += 1
-    session = _transcriber.new_session()
+    session = _transcriber.new_session(**_SESSION_KW)
     stop = asyncio.Event()
     log.info(f"[ws-stream] opened ({_active_streams}/{LIVE_MAX_STREAMS})")
 

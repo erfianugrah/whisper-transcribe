@@ -99,7 +99,10 @@ def _session(scripts, **kw):
     return OnlineSession(_ScriptedModel(scripts), **kw)
 
 
-_PCM_2S = (np.zeros(SAMPLE_RATE * 2, dtype=np.int16)).tobytes()
+# Non-silent (sine) so the tail-silence finalizer doesn't fire — these tests
+# exercise the LocalAgreement prefix logic specifically.
+_PCM_2S = _sine_pcm(2.0)
+_SILENT_2S = (np.zeros(SAMPLE_RATE * 2, dtype=np.int16)).tobytes()
 
 
 def test_hypothesis_commits_only_agreed_prefix():
@@ -142,6 +145,15 @@ def test_process_waits_for_min_chunk():
     sess.insert_audio((np.zeros(SAMPLE_RATE // 2, dtype=np.int16)).tobytes())  # 0.5s
     c, p = sess.process()
     assert c == "" and p == ""
+
+
+def test_tail_silence_finalizes_utterance():
+    """A trailing-silence pause commits the unconfirmed tail immediately
+    (end-of-utterance), without waiting for a second agreeing pass."""
+    sess = _session([[_w(0.0, 0.5, " hello"), _w(0.5, 1.0, " world")]])
+    sess.insert_audio(_SILENT_2S)
+    committed, _ = sess.process()
+    assert committed == "hello world"
 
 
 def test_finish_flushes_unconfirmed_tail():

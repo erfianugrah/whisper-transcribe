@@ -152,10 +152,21 @@ class OnlineSession:
     All `process`/`finish` calls run under the model lock (see
     StreamingTranscriber.session_*)."""
 
-    def __init__(self, model, min_chunk_s: float = 1.0, trim_s: float = 12.0) -> None:
+    def __init__(
+        self,
+        model,
+        min_chunk_s: float = 1.0,
+        trim_s: float = 8.0,
+        tail_silence_s: float = 0.6,
+        silence_rms: float = 0.006,
+        min_silence_ms: int = 300,
+    ) -> None:
         self._model = model
         self._min_samples = int(SAMPLE_RATE * min_chunk_s)
         self._trim_s = trim_s
+        self._tail_silence_s = tail_silence_s
+        self._silence_rms = silence_rms
+        self._min_silence_ms = min_silence_ms
         self.audio = np.zeros(0, dtype=np.float32)
         self.offset = 0.0  # absolute time of audio[0]
         self.hyp = HypothesisBuffer()
@@ -189,7 +200,7 @@ class OnlineSession:
             word_timestamps=True,
             condition_on_previous_text=False,
             vad_filter=True,
-            vad_parameters={"min_silence_duration_ms": 300},
+            vad_parameters={"min_silence_duration_ms": self._min_silence_ms},
             initial_prompt=self._prompt(),
         )
         words: list[Word] = []
@@ -207,11 +218,37 @@ class OnlineSession:
         if len(self.audio) < self._min_samples:
             return "", self._partial()
         self.hyp.insert(self._transcribe(), self.offset)
-        committed = self.hyp.flush()
+        committed = list(self.hyp.flush())
+        silent = self._tail_is_silent()
+        if silent and self.hyp.buffer:
+            # End-of-utterance: a trailing-silence pause means whisper saw the
+            # whole utterance, so the unconfirmed tail is safe to commit.
+            committed.extend(self.hyp.buffer)
+            self.hyp.buffer = []
         self.committed.extend(committed)
-        if len(self.audio) / SAMPLE_RATE > self._trim_s and self.committed:
+        if silent:
+            self._finalize_reset()  # drop the utterance's audio; start fresh
+        elif len(self.audio) / SAMPLE_RATE > self._trim_s and self.committed:
             self._trim(self.committed[-1][1])
         return "".join(w[2] for w in committed).strip(), self._partial()
+
+    def _tail_is_silent(self) -> bool:
+        n = int(self._tail_silence_s * SAMPLE_RATE)
+        if len(self.audio) < n:
+            return False
+        tail = self.audio[-n:]
+        return float(np.sqrt(np.mean(tail * tail))) < self._silence_rms
+
+    def _finalize_reset(self) -> None:
+        """Utterance boundary: keep only a short trailing window and reset the
+        agreement state so the next utterance starts clean."""
+        keep = int(0.3 * SAMPLE_RATE)
+        if len(self.audio) > keep:
+            self.offset += (len(self.audio) - keep) / SAMPLE_RATE
+            self.audio = self.audio[-keep:]
+        self.hyp.buffer = []
+        self.hyp.committed_in_buffer = []
+        self.hyp.last_committed_time = self.offset
 
     def _trim(self, t: float) -> None:
         cut = int((t - self.offset) * SAMPLE_RATE)
