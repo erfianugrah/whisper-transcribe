@@ -1,7 +1,7 @@
 FROM denoland/deno:bin-2.7.14 AS deno
 
 # ─── SPA build stage ─────────────────────────────────────────────────────
-# Compiles the React SPA in ui/ to a static bundle (dist/) served at /ui by
+# Compiles the React SPA in ui/ to a static bundle (dist/) served at / by app.py (Gradio demoted to /classic)
 # the Starlette app. Lockfile copied first so deps cache independently of
 # source edits. Output is ~600 KB of static assets — negligible vs the CUDA
 # layers below.
@@ -131,7 +131,7 @@ RUN for lang in $(echo "$ALIGN_LANGS" | tr ',' ' '); do \
         || echo "WARN: pre-warm for '$lang' failed (will download lazily)"; \
     done
 
-# ─── Built SPA (static assets, served at /ui) ─────────────────────────────
+# ─── Built SPA (static assets, served at /) ─────────────────────────────
 COPY --from=ui-build --chown=ubuntu:ubuntu /ui/dist ./ui/dist
 
 # ─── Source code (changes here invalidate only this layer + CMD) ─────────────

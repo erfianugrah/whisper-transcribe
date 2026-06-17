@@ -8,7 +8,7 @@ import { defineConfig } from "vite";
 
 const config = defineConfig({
 	// Served under /ui by the whisper Starlette app (Gradio owns "/").
-	base: "/ui/",
+	base: "/",
 	resolve: { tsconfigPaths: true },
 	plugins: [
 		devtools(),

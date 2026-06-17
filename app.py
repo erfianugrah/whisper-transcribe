@@ -4545,21 +4545,17 @@ API_ROUTES = [
     WebSocketRoute("/api/live/stream", ws_live_stream),
 ]
 
-# Static mount for the React SPA (ui/dist). Registered ahead of the greedy
-# Gradio mount at "/" so /ui/* resolves to the SPA. Conditional so dev runs
-# without a build don't crash — Gradio stays the only UI until ui/dist exists.
+# React SPA (ui/dist) is the primary UI at "/"; Gradio is demoted to /classic
+# as a fallback. The SPA mount is added AFTER the Gradio mount (below) so route
+# precedence is /api/* → /classic → / (SPA catch-all). Conditional so a dev run
+# without a build keeps Gradio at "/".
 UI_DIST = os.environ.get(
     "UI_DIST", os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui", "dist")
 )
-if os.path.isdir(UI_DIST):
-    from starlette.routing import Mount
-    from starlette.staticfiles import StaticFiles
-    API_ROUTES.append(
-        Mount("/ui", app=StaticFiles(directory=UI_DIST, html=True), name="ui")
-    )
-    log.info(f"Mounting SPA at /ui from {UI_DIST}")
-else:
-    log.info(f"SPA dist not found at {UI_DIST}; /ui disabled (Gradio only)")
+_HAS_SPA = os.path.isdir(UI_DIST)
+log.info(
+    f"SPA dist {'found at ' + UI_DIST + ' — serving at /' if _HAS_SPA else 'missing; Gradio at /'}"
+)
 
 
 # -- Launch --------------------------------------------------------------------
@@ -4586,7 +4582,9 @@ try:
             await _worker_shutdown()
 
     app = Starlette(routes=API_ROUTES, lifespan=_lifespan)
-    app = gr.mount_gradio_app(app, demo, path="/", theme=THEME, css=CSS, js="""
+    # SPA owns "/"; Gradio at "/classic" when the SPA build is present.
+    _gradio_path = "/classic" if _HAS_SPA else "/"
+    app = gr.mount_gradio_app(app, demo, path=_gradio_path, theme=THEME, css=CSS, js="""
 () => {
     const observer = new MutationObserver(() => {
         const el = document.querySelector('#transcript-html');
@@ -4603,6 +4601,27 @@ try:
     init();
 }
 """)
+    # Mount the SPA LAST so it's the catch-all under "/" — /api/* and /classic
+    # (Gradio) are matched first; everything else falls through to the SPA.
+    if _HAS_SPA:
+        from starlette.responses import RedirectResponse
+        from starlette.routing import Mount
+        from starlette.staticfiles import StaticFiles
+
+        # A mounted sub-app (Gradio at /classic) does NOT get Starlette's
+        # automatic trailing-slash redirect, so a bare "/classic" would fall
+        # through to the SPA catch-all and 404. Register an explicit redirect
+        # to "/classic/" ahead of the SPA mount.
+        async def _classic_redirect(_request):
+            return RedirectResponse(url="/classic/")
+
+        # Insert ahead of the Gradio Mount("/classic") so the exact-path match
+        # wins for a bare "/classic"; "/classic/" and deeper still hit Gradio.
+        app.router.routes.insert(0, Route("/classic", _classic_redirect))
+        app.router.routes.append(
+            Mount("/", app=StaticFiles(directory=UI_DIST, html=True), name="ui")
+        )
+        log.info("SPA mounted at / ; Gradio at /classic")
     log.info(f"Mounted {len(API_ROUTES)} API routes: {[r.path for r in API_ROUTES]}")
     uvicorn.run(app, host="0.0.0.0", port=7860, log_level="info")
 except Exception as e:

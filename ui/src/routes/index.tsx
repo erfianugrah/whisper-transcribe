@@ -74,7 +74,7 @@ function Home() {
 					<div className="flex items-center gap-3">
 						<ThemeToggle />
 						<a
-							href="/"
+							href="/classic/"
 							className="font-mono text-[11px] text-muted-foreground underline-offset-2 hover:underline"
 						>
 							classic UI →

@@ -13,7 +13,7 @@ const queryClient = new QueryClient({
 
 const router = createRouter({
 	routeTree,
-	basepath: "/ui",
+	basepath: "/",
 	defaultPreload: "intent",
 	scrollRestoration: true,
 	context: { queryClient },
