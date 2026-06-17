@@ -34,7 +34,6 @@ function downsampleToPcm16(input: Float32Array, inRate: number): Int16Array {
 export function LiveTab() {
 	const [recording, setRecording] = useState(false);
 	const [transcript, setTranscript] = useState("");
-	const [buffered, setBuffered] = useState(0); // seconds in the current window
 	const [sending, setSending] = useState(false);
 	const [level, setLevel] = useState(0); // 0..1 instantaneous mic peak
 	const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -67,7 +66,6 @@ export function LiveTab() {
 		bufRef.current = [];
 		countRef.current = 0;
 		peakRef.current = 0;
-		setBuffered(0);
 		// Skip effectively-silent windows: VAD would discard them anyway and
 		// it saves a GPU round-trip. The waveform still shows live input.
 		if (windowPeak < SILENCE_PEAK) {
@@ -168,7 +166,6 @@ export function LiveTab() {
 				const pcm = downsampleToPcm16(input, ctx.sampleRate);
 				bufRef.current.push(pcm);
 				countRef.current += pcm.length;
-				setBuffered(Math.floor(countRef.current / TARGET_SR));
 				if (countRef.current >= CHUNK_SAMPLES) flush();
 			};
 			src.connect(proc);
@@ -290,7 +287,7 @@ export function LiveTab() {
 				{recording && (
 					<span className="flex items-center gap-1.5 text-foreground">
 						<span className="inline-block size-2 animate-pulse rounded-full bg-destructive" />
-						recording · buffer {buffered}s/{CHUNK_SECONDS}s
+						recording
 						{sending && " · transcribing…"}
 					</span>
 				)}
