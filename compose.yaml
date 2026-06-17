@@ -74,6 +74,8 @@ services:
       # produce ~27 clusters; bumping to 180s leaves headroom for queue
       # waits without papering over actual UVM-fallback slowness).
       - LLM_SYNTHESIS_TIMEOUT=${LLM_SYNTHESIS_TIMEOUT:-180}
+      # whisper-live sidecar — used only by the Gradio Live tab (mic streaming).
+      - LIVE_SERVICE_URL=${LIVE_SERVICE_URL:-http://whisper-live:7861}
     ports:
       - "7860:7860"
     extra_hosts:
@@ -130,6 +132,46 @@ services:
               capabilities: [gpu, video]
     restart: unless-stopped
 
+  # ─── Live transcription sidecar ──────────────────────────────────────────
+  # faster-whisper streaming service. Owns its own yt-dlp + ffmpeg (the bot
+  # is python:3.13-slim and has neither — it delegates here over HTTP/WS just
+  # as it delegates batch downloads to the `whisper` service). Model stays
+  # resident so the first live job has no cold-load. Shares the GPU with
+  # `whisper`; on the 5090 (32 GB) raise LIVE_MAX_STREAMS freely.
+  whisper-live:
+    image: erfianugrah/whisper-live:latest
+    build:
+      context: ./whisper-live
+    pull_policy: missing
+    environment:
+      - LIVE_MODEL=${LIVE_MODEL:-large-v3-turbo}
+      - DEVICE=cuda
+      - COMPUTE_TYPE=${LIVE_COMPUTE_TYPE:-float16}
+      - LIVE_MAX_STREAMS=${LIVE_MAX_STREAMS:-4}
+      - LIVE_PORT=7861
+      - LIVE_CHUNK_SECONDS=${LIVE_CHUNK_SECONDS:-10}
+    ports:
+      - "7861:7861"
+    networks:
+      - default
+    volumes:
+      - live-model-cache:/root/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:7861/health',timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+
   # ─── Web scraper (for the URL-summary "tldr" reply trigger) ───────────────
   # Crawl4AI: Playwright-based scraper, returns clean Markdown via /md.
   # Handles JS-rendered pages, basic stealth. ~400 MB image (Chromium baked in).
@@ -173,6 +215,7 @@ services:
     environment:
       # In-stack services reached by name.
       - WHISPER_API_URL=http://whisper:7860
+      - WHISPER_LIVE_URL=http://whisper-live:7861
       - SCRAPER_API_URL=http://crawl4ai:11235
       - FLARESOLVERR_API_URL=http://flaresolverr:8191/v1
       # OpenAI-compatible endpoint for summaries. Default targets the
@@ -201,6 +244,8 @@ services:
     depends_on:
       whisper:
         condition: service_healthy
+      whisper-live:
+        condition: service_healthy
       # Bot starts even if scraper is unhealthy (URL flow degrades gracefully;
       # video flow is unaffected). Hence service_started, not service_healthy.
       crawl4ai:
@@ -214,6 +259,7 @@ volumes:
   model-cache:    # HuggingFace + torch.hub model downloads
   bot-cache:      # bot's transcript cache
   valkey-data:    # job queue state + transcript cache (AOF + periodic snapshots)
+  live-model-cache:  # faster-whisper HuggingFace model downloads (whisper-live)
 
 networks:
   # In-stack: bot ↔ whisper ↔ valkey ↔ scrapers.

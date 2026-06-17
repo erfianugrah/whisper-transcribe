@@ -1529,6 +1529,10 @@ THEME = gr.themes.Base(
     font_mono=["JetBrains Mono", "Fira Code", "monospace"],
 )
 
+# whisper-live sidecar (mic streaming for the Live tab). Read at module level
+# so the Gradio handler can reference it as a global at call time.
+LIVE_SERVICE_URL = os.environ.get("LIVE_SERVICE_URL", "http://localhost:7861")
+
 with gr.Blocks(title="WhisperX Transcription") as demo:
     demo.queue()
 
@@ -1569,12 +1573,81 @@ with gr.Blocks(title="WhisperX Transcription") as demo:
                     container=False,
                 )
                 yt_fetch_btn = gr.Button("Fetch", scale=1, size="sm", variant="primary", elem_id="yt-fetch-btn")
+        with gr.Tab("Live"):
+            gr.Markdown(
+                "Transcribe from microphone in real time. Click **Record**, "
+                "speak, and the transcript accumulates below. **Clear** resets it."
+            )
+            live_audio_input = gr.Audio(
+                streaming=True,
+                sources=["microphone"],
+                label="Microphone",
+            )
+            live_transcript_box = gr.Textbox(
+                label="Live Transcript",
+                lines=12,
+                interactive=False,
+                placeholder="Transcript will appear here as you speak…",
+            )
+            live_state = gr.State({"buffer": b"", "transcript": ""})
+            live_clear_btn = gr.Button("Clear", variant="secondary")
+
+    def _live_chunk(audio_chunk, state):
+        """Per-mic-chunk callback. Accumulates PCM in state; flushes to
+        whisper-live every ~10 s (matches server CHUNK_SECONDS). Uses stdlib
+        urllib (no `requests` dependency — not in the whisper image).
+        Gradio runs handlers in a thread pool, so a blocking call is fine."""
+        import json as _json
+        import urllib.parse
+        import urllib.request
+
+        if audio_chunk is None:
+            return state["transcript"], state
+        sr, arr = audio_chunk
+        if arr.dtype != np.int16:
+            arr = (arr.clip(-1.0, 1.0) * 32767).astype(np.int16)
+        if sr != 16000:
+            from scipy.signal import resample_poly
+            arr = resample_poly(arr, 16000, sr).astype(np.int16)
+        state["buffer"] += arr.tobytes()
+
+        THRESHOLD = 16000 * 2 * 10  # 10 s of 16 kHz int16
+        if len(state["buffer"]) < THRESHOLD:
+            return state["transcript"], state
+
+        try:
+            qs = urllib.parse.urlencode({"context": state["transcript"][-300:]})
+            req = urllib.request.Request(
+                f"{LIVE_SERVICE_URL}/transcribe-chunk?{qs}",
+                data=bytes(state["buffer"]),
+                headers={"Content-Type": "application/octet-stream"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                payload = _json.loads(resp.read().decode())
+            for seg in payload.get("segments", []):
+                state["transcript"] += seg["text"] + " "
+        except Exception as exc:
+            log.warning(f"[live] chunk POST failed: {exc}")
+        state["buffer"] = b""
+        return state["transcript"], state
 
     def _refresh_media():
         # Manual refresh bypasses the TTL cache.
         return gr.update(choices=scan_media_files(force=True))
 
     refresh_media_btn.click(fn=_refresh_media, outputs=[local_path_input])
+
+    live_audio_input.stream(
+        fn=_live_chunk,
+        inputs=[live_audio_input, live_state],
+        outputs=[live_transcript_box, live_state],
+        show_progress=False,
+    )
+    live_clear_btn.click(
+        fn=lambda: ("", {"buffer": b"", "transcript": ""}),
+        outputs=[live_transcript_box, live_state],
+    )
 
     # yt_fetch_btn event wiring is registered later (after status_text is defined)
 
