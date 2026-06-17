@@ -126,11 +126,15 @@ export function LiveTab() {
 		}
 		try {
 			const stream = await navigator.mediaDevices.getUserMedia({
+				// Processing OFF: (1) lets multiple tabs open the SAME physical
+				// device — Chromium's APM (echo/NS/AGC) doesn't cleanly share one
+				// device across consumers, so a 2nd tab with it on gets silence;
+				// (2) raw audio transcribes better than voice-call-filtered audio.
 				audio: {
 					channelCount: 1,
-					echoCancellation: true,
-					noiseSuppression: true,
-					autoGainControl: true,
+					echoCancellation: false,
+					noiseSuppression: false,
+					autoGainControl: false,
 					...(deviceId ? { deviceId: { exact: deviceId } } : {}),
 				},
 			});
