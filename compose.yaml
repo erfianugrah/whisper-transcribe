@@ -144,7 +144,7 @@ services:
       context: ./whisper-live
     pull_policy: missing
     environment:
-      - LIVE_MODEL=${LIVE_MODEL:-large-v3-turbo}
+      - LIVE_MODEL=${LIVE_MODEL:-large-v3}
       - DEVICE=cuda
       - COMPUTE_TYPE=${LIVE_COMPUTE_TYPE:-float16}
       - LIVE_MAX_STREAMS=${LIVE_MAX_STREAMS:-4}

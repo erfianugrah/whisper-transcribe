@@ -60,6 +60,19 @@ async def _lifespan(app):
     global _transcriber
     log.info(f"Loading model {MODEL_NAME!r} on {DEVICE} ({COMPUTE_TYPE})…")
     _transcriber = StreamingTranscriber(MODEL_NAME, DEVICE, COMPUTE_TYPE)
+    # Warm up the streaming path: the first word_timestamps transcribe
+    # JIT-compiles CTranslate2 kernels (~10-18 s). Do it now on a synthetic
+    # 1 s tone so the first real utterance isn't slow.
+    try:
+        import numpy as np
+        t = np.linspace(0, 1.0, 16000, endpoint=False)
+        tone = (np.sin(2 * np.pi * 220 * t) * 8000).astype(np.int16).tobytes()
+        warm = _transcriber.new_session()
+        warm.insert_audio(tone)
+        warm.process()
+        log.info("Streaming model warmed up.")
+    except Exception as e:
+        log.warning(f"warmup skipped: {e}")
     log.info(f"Ready — max concurrent streams: {LIVE_MAX_STREAMS}")
     yield
 
@@ -195,10 +208,14 @@ PROCESS_INTERVAL = float(os.environ.get("LIVE_PROCESS_INTERVAL", "0.6"))
 # Streaming/VAD knobs (env-tunable without a rebuild).
 _SESSION_KW = dict(
     min_chunk_s=float(os.environ.get("LIVE_MIN_CHUNK_S", "1.0")),
-    trim_s=float(os.environ.get("LIVE_TRIM_S", "8.0")),
+    trim_s=float(os.environ.get("LIVE_TRIM_S", "6.0")),
     tail_silence_s=float(os.environ.get("LIVE_TAIL_SILENCE_S", "0.6")),
     silence_rms=float(os.environ.get("LIVE_SILENCE_RMS", "0.006")),
     min_silence_ms=int(os.environ.get("LIVE_MIN_SILENCE_MS", "300")),
+    # Greedy decode (beam=1) roughly halves large-v3 per-pass latency vs
+    # beam=5 with minor accuracy cost — the right trade for the live path.
+    # Bump LIVE_BEAM_SIZE=5 if you want max accuracy and can tolerate lag.
+    beam_size=int(os.environ.get("LIVE_BEAM_SIZE", "1")),
 )
 
 

@@ -160,10 +160,12 @@ class OnlineSession:
         tail_silence_s: float = 0.6,
         silence_rms: float = 0.006,
         min_silence_ms: int = 300,
+        beam_size: int = 1,
     ) -> None:
         self._model = model
         self._min_samples = int(SAMPLE_RATE * min_chunk_s)
         self._trim_s = trim_s
+        self._beam_size = beam_size
         self._tail_silence_s = tail_silence_s
         self._silence_rms = silence_rms
         self._min_silence_ms = min_silence_ms
@@ -196,7 +198,7 @@ class OnlineSession:
     def _transcribe(self) -> list[Word]:
         segments, _info = self._model.transcribe(
             self.audio,
-            beam_size=5,
+            beam_size=self._beam_size,
             word_timestamps=True,
             condition_on_previous_text=False,
             vad_filter=True,
