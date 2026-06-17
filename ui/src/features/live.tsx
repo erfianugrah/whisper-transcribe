@@ -36,6 +36,7 @@ export function LiveTab() {
 	const [transcript, setTranscript] = useState("");
 	const [sending, setSending] = useState(false);
 	const [level, setLevel] = useState(0); // 0..1 instantaneous mic peak
+	const [trackInfo, setTrackInfo] = useState("");
 	const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
 	const [deviceId, setDeviceId] = useState<string>("");
 	const health = useQuery({
@@ -116,6 +117,7 @@ export function LiveTab() {
 		ctxRef.current = null;
 		setRecording(false);
 		setLevel(0);
+		setTrackInfo("");
 		flush(); // send the partial tail
 	};
 
@@ -125,17 +127,28 @@ export function LiveTab() {
 			return;
 		}
 		try {
+			// Minimal constraints: just pin the device. No channelCount (forcing
+			// mono downmix silences some USB cams like the OBSBOT) and browser-
+			// default processing. We read channel 0 of whatever layout we get.
 			const stream = await navigator.mediaDevices.getUserMedia({
-				// Use browser-default audio processing (echo/NS/AGC on). Forcing
-				// these off silenced some USB webcam-mics (OBSBOT) and isn't needed
-				// for multi-tab capture — defaults already allow it.
-				audio: deviceId
-					? { channelCount: 1, deviceId: { exact: deviceId } }
-					: { channelCount: 1 },
+				audio: deviceId ? { deviceId: { exact: deviceId } } : true,
 			});
 			streamRef.current = stream;
 			// Labels are unlocked now that permission is granted; refresh the list.
 			if (devices.every((d) => !d.label)) loadDevices();
+			// Surface the actual captured track so a silent device is diagnosable.
+			const track = stream.getAudioTracks()[0];
+			const s = track?.getSettings?.() ?? {};
+			setTrackInfo(
+				`${track?.label || "?"} · ${s.sampleRate ?? "?"}Hz · ${
+					s.channelCount ?? "?"
+				}ch · muted=${track?.muted}`,
+			);
+			if (track?.muted) {
+				toast.error(
+					"This device reports muted at the OS level — unmute it in Windows sound settings.",
+				);
+			}
 			const ctx = new AudioContext();
 			if (ctx.state === "suspended") await ctx.resume();
 			ctxRef.current = ctx;
@@ -319,6 +332,11 @@ export function LiveTab() {
 							</span>
 						)}
 					</div>
+					{trackInfo && (
+						<div className="font-mono text-[10px] text-muted-foreground">
+							track: {trackInfo}
+						</div>
+					)}
 				</div>
 			)}
 
