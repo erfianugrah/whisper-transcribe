@@ -2955,12 +2955,26 @@ def _run_transcription(file_path, model_name="turbo", language="Auto-detect",
         task=task,
     ):
         last_status, last_html, last_text, last_file = status, html, text, subtitle_file
-    return {
+    result = {
         "status": last_status,
         "transcript": last_text,
         "subtitle_file": last_file,
         "task": task,
     }
+    # Read the generated subtitle file content back into the result so API
+    # consumers (the SPA download button) can save a format-correct file
+    # (srt/vtt/json) without us serving an ephemeral /tmp path. The file is
+    # then redundant for the queue path, but we leave it in place for the
+    # legacy sync /api/transcribe callers that still read `subtitle_file`.
+    if last_file and os.path.isfile(last_file):
+        try:
+            with open(last_file, encoding="utf-8") as fh:
+                result["subtitle_content"] = fh.read()
+            result["subtitle_name"] = os.path.basename(last_file)
+            result["format"] = output_format
+        except OSError as e:
+            log.warning(f"[api] could not read subtitle file {last_file}: {e}")
+    return result
 
 
 async def api_transcribe(request: Request):

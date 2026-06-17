@@ -29,6 +29,37 @@ type Source = "youtube" | "server" | "upload";
 
 const TERMINAL = new Set(["done", "failed", "cancelled"]);
 
+// ── Transcription options ────────────────────────────────────────────────
+// Everything the worker accepts lives in one object so adding a knob is a
+// single key here + one <Field> in the form below — no new useState wiring.
+interface Opts {
+	model: string;
+	format: string;
+	language: string;
+	translate: "auto" | "true" | "false";
+	diarize: boolean;
+	minSpeakers: string;
+	maxSpeakers: string;
+	batchSize: string;
+	hotwords: string;
+	initialPrompt: string;
+	suppressNumerals: boolean;
+}
+
+const DEFAULT_OPTS: Opts = {
+	model: "turbo",
+	format: "srt",
+	language: "Auto-detect",
+	translate: "auto",
+	diarize: false,
+	minSpeakers: "",
+	maxSpeakers: "",
+	batchSize: "",
+	hotwords: "",
+	initialPrompt: "",
+	suppressNumerals: false,
+};
+
 function Field({
 	label,
 	children,
@@ -44,6 +75,54 @@ function Field({
 	);
 }
 
+function SelectField({
+	label,
+	value,
+	onChange,
+	options,
+}: {
+	label: string;
+	value: string;
+	onChange: (v: string) => void;
+	options: readonly string[];
+}) {
+	return (
+		<Field label={label}>
+			<Select value={value} onValueChange={onChange}>
+				<SelectTrigger>
+					<SelectValue />
+				</SelectTrigger>
+				<SelectContent>
+					{options.map((o) => (
+						<SelectItem key={o} value={o}>
+							{o}
+						</SelectItem>
+					))}
+				</SelectContent>
+			</Select>
+		</Field>
+	);
+}
+
+// Whole-label SPEAKER_xx → friendly-name replace. Works on plain transcript,
+// srt/vtt ("[SPEAKER_xx]") and json ('"speaker": "SPEAKER_xx"') alike.
+function applyRenames(text: string, renames: Record<string, string>): string {
+	let out = text;
+	for (const [label, name] of Object.entries(renames)) {
+		if (name.trim()) out = out.replaceAll(label, name.trim());
+	}
+	return out;
+}
+
+function download(name: string, content: string, mime = "text/plain") {
+	const blob = new Blob([content], { type: mime });
+	const a = document.createElement("a");
+	a.href = URL.createObjectURL(blob);
+	a.download = name;
+	a.click();
+	URL.revokeObjectURL(a.href);
+}
+
 export function TranscribeTab() {
 	const qc = useQueryClient();
 	const [source, setSource] = useState<Source>("youtube");
@@ -51,20 +130,14 @@ export function TranscribeTab() {
 	const [serverPath, setServerPath] = useState("");
 	const [file, setFile] = useState<File | null>(null);
 
-	const [model, setModel] = useState("turbo");
-	const [format, setFormat] = useState("srt");
-	const [language, setLanguage] = useState("Auto-detect");
-	const [translate, setTranslate] = useState<"auto" | "true" | "false">("auto");
-	const [diarize, setDiarize] = useState(false);
-	const [minSpeakers, setMinSpeakers] = useState("");
-	const [maxSpeakers, setMaxSpeakers] = useState("");
-	const [hotwords, setHotwords] = useState("");
-	const [initialPrompt, setInitialPrompt] = useState("");
-	const [suppressNumerals, setSuppressNumerals] = useState(false);
+	const [opts, setOpts] = useState<Opts>(DEFAULT_OPTS);
+	const set = <K extends keyof Opts>(key: K, value: Opts[K]) =>
+		setOpts((o) => ({ ...o, [key]: value }));
 
 	const [jobId, setJobId] = useState<string | null>(null);
 	// Client-side SPEAKER_xx → friendly-name remap applied to the result.
 	const [renames, setRenames] = useState<Record<string, string>>({});
+	const [filter, setFilter] = useState("");
 
 	const media = useQuery({
 		queryKey: ["media"],
@@ -101,25 +174,33 @@ export function TranscribeTab() {
 				file_path = up.file_path;
 				cleanup = true;
 			}
-			const opts: TranscribeOptions = {
+			const payload: TranscribeOptions = {
 				file_path,
-				model,
-				format,
-				language,
-				translate,
-				diarize,
-				min_speakers: diarize && minSpeakers ? Number(minSpeakers) : undefined,
-				max_speakers: diarize && maxSpeakers ? Number(maxSpeakers) : undefined,
-				hotwords: hotwords.trim() || undefined,
-				initial_prompt: initialPrompt.trim() || undefined,
-				suppress_numerals: suppressNumerals || undefined,
+				model: opts.model,
+				format: opts.format,
+				language: opts.language,
+				translate: opts.translate,
+				diarize: opts.diarize,
+				min_speakers:
+					opts.diarize && opts.minSpeakers
+						? Number(opts.minSpeakers)
+						: undefined,
+				max_speakers:
+					opts.diarize && opts.maxSpeakers
+						? Number(opts.maxSpeakers)
+						: undefined,
+				batch_size: opts.batchSize ? Number(opts.batchSize) : undefined,
+				hotwords: opts.hotwords.trim() || undefined,
+				initial_prompt: opts.initialPrompt.trim() || undefined,
+				suppress_numerals: opts.suppressNumerals || undefined,
 				cleanup,
 			};
-			return submitJob(opts);
+			return submitJob(payload);
 		},
 		onSuccess: (r) => {
 			setJobId(r.job_id);
 			setRenames({});
+			setFilter("");
 			qc.invalidateQueries({ queryKey: ["queue"] });
 			toast.success(
 				`Queued ${r.job_id.slice(0, 8)} (position ${r.position ?? "?"})`,
@@ -138,16 +219,20 @@ export function TranscribeTab() {
 		return [...found].sort();
 	}, [result?.transcript]);
 
-	// Apply the SPEAKER_xx → friendly-name remap to the transcript for display,
-	// copy, and download. Whole-label replace so partial overlaps can't collide.
-	const displayed = useMemo(() => {
-		if (!result?.transcript) return "";
-		let out = result.transcript;
-		for (const [label, name] of Object.entries(renames)) {
-			if (name.trim()) out = out.replaceAll(label, name.trim());
-		}
-		return out;
-	}, [result?.transcript, renames]);
+	// Renamed transcript for display / copy / .txt download.
+	const displayed = useMemo(
+		() => (result?.transcript ? applyRenames(result.transcript, renames) : ""),
+		[result?.transcript, renames],
+	);
+
+	// Lines filtered by the in-transcript search box.
+	const filteredLines = useMemo(() => {
+		if (!filter.trim()) return null;
+		const q = filter.toLowerCase();
+		return displayed.split("\n").filter((l) => l.toLowerCase().includes(q));
+	}, [displayed, filter]);
+
+	const fmt = result?.format || opts.format;
 
 	return (
 		<div className="grid gap-4 lg:grid-cols-[minmax(0,340px)_1fr]">
@@ -178,18 +263,32 @@ export function TranscribeTab() {
 				)}
 				{source === "server" && (
 					<Field label={`Server file (${media.data?.files.length ?? 0} found)`}>
-						<Select value={serverPath} onValueChange={setServerPath}>
-							<SelectTrigger>
-								<SelectValue placeholder="Select a media file…" />
-							</SelectTrigger>
-							<SelectContent>
-								{media.data?.files.map((f) => (
-									<SelectItem key={f.path} value={f.path}>
-										{f.name}
-									</SelectItem>
-								))}
-							</SelectContent>
-						</Select>
+						<div className="flex gap-2">
+							<Select value={serverPath} onValueChange={setServerPath}>
+								<SelectTrigger className="flex-1">
+									<SelectValue placeholder="Select a media file…" />
+								</SelectTrigger>
+								<SelectContent>
+									{media.data?.files.map((f) => (
+										<SelectItem key={f.path} value={f.path}>
+											{f.name}
+										</SelectItem>
+									))}
+								</SelectContent>
+							</Select>
+							<Button
+								variant="outline"
+								size="icon"
+								title="Rescan /media"
+								disabled={media.isFetching}
+								onClick={async () => {
+									await getMedia(true);
+									qc.invalidateQueries({ queryKey: ["media"] });
+								}}
+							>
+								↻
+							</Button>
+						</div>
 					</Field>
 				)}
 				{source === "upload" && (
@@ -203,52 +302,28 @@ export function TranscribeTab() {
 				)}
 
 				<div className="grid grid-cols-2 gap-3">
-					<Field label="Model">
-						<Select value={model} onValueChange={setModel}>
-							<SelectTrigger>
-								<SelectValue />
-							</SelectTrigger>
-							<SelectContent>
-								{MODELS.map((m) => (
-									<SelectItem key={m} value={m}>
-										{m}
-									</SelectItem>
-								))}
-							</SelectContent>
-						</Select>
-					</Field>
-					<Field label="Format">
-						<Select value={format} onValueChange={setFormat}>
-							<SelectTrigger>
-								<SelectValue />
-							</SelectTrigger>
-							<SelectContent>
-								{FORMATS.map((f) => (
-									<SelectItem key={f} value={f}>
-										{f}
-									</SelectItem>
-								))}
-							</SelectContent>
-						</Select>
-					</Field>
-					<Field label="Language">
-						<Select value={language} onValueChange={setLanguage}>
-							<SelectTrigger>
-								<SelectValue />
-							</SelectTrigger>
-							<SelectContent>
-								{LANGUAGES.map((l) => (
-									<SelectItem key={l} value={l}>
-										{l}
-									</SelectItem>
-								))}
-							</SelectContent>
-						</Select>
-					</Field>
+					<SelectField
+						label="Model"
+						value={opts.model}
+						onChange={(v) => set("model", v)}
+						options={MODELS}
+					/>
+					<SelectField
+						label="Format"
+						value={opts.format}
+						onChange={(v) => set("format", v)}
+						options={FORMATS}
+					/>
+					<SelectField
+						label="Language"
+						value={opts.language}
+						onChange={(v) => set("language", v)}
+						options={LANGUAGES}
+					/>
 					<Field label="Translate → EN">
 						<Select
-							value={translate}
-							onValueChange={(v) => setTranslate(v as typeof translate)}
+							value={opts.translate}
+							onValueChange={(v) => set("translate", v as Opts["translate"])}
 						>
 							<SelectTrigger>
 								<SelectValue />
@@ -262,23 +337,34 @@ export function TranscribeTab() {
 					</Field>
 				</div>
 
+				<Field label="Batch size (blank = auto / VRAM-derived)">
+					<Input
+						type="number"
+						min={1}
+						max={64}
+						value={opts.batchSize}
+						onChange={(e) => set("batchSize", e.target.value)}
+						placeholder="auto"
+					/>
+				</Field>
+
 				<label className="flex items-center gap-2 text-sm">
 					<input
 						type="checkbox"
-						checked={diarize}
-						onChange={(e) => setDiarize(e.target.checked)}
+						checked={opts.diarize}
+						onChange={(e) => set("diarize", e.target.checked)}
 					/>
 					Speaker diarization
 				</label>
 
-				{diarize && (
+				{opts.diarize && (
 					<div className="grid grid-cols-2 gap-3">
 						<Field label="Min speakers">
 							<Input
 								type="number"
 								min={1}
-								value={minSpeakers}
-								onChange={(e) => setMinSpeakers(e.target.value)}
+								value={opts.minSpeakers}
+								onChange={(e) => set("minSpeakers", e.target.value)}
 								placeholder="auto"
 							/>
 						</Field>
@@ -286,8 +372,8 @@ export function TranscribeTab() {
 							<Input
 								type="number"
 								min={1}
-								value={maxSpeakers}
-								onChange={(e) => setMaxSpeakers(e.target.value)}
+								value={opts.maxSpeakers}
+								onChange={(e) => set("maxSpeakers", e.target.value)}
 								placeholder="auto"
 							/>
 						</Field>
@@ -297,24 +383,24 @@ export function TranscribeTab() {
 				<label className="flex items-center gap-2 text-sm">
 					<input
 						type="checkbox"
-						checked={suppressNumerals}
-						onChange={(e) => setSuppressNumerals(e.target.checked)}
+						checked={opts.suppressNumerals}
+						onChange={(e) => set("suppressNumerals", e.target.checked)}
 					/>
 					Suppress numerals (spell out numbers)
 				</label>
 
 				<Field label="Hotwords (comma-separated)">
 					<Input
-						value={hotwords}
-						onChange={(e) => setHotwords(e.target.value)}
+						value={opts.hotwords}
+						onChange={(e) => set("hotwords", e.target.value)}
 						placeholder="optional"
 					/>
 				</Field>
 
 				<Field label="Initial prompt (context / spelling hints)">
 					<Textarea
-						value={initialPrompt}
-						onChange={(e) => setInitialPrompt(e.target.value)}
+						value={opts.initialPrompt}
+						onChange={(e) => set("initialPrompt", e.target.value)}
 						placeholder="optional — biases the decoder toward this vocabulary/style"
 						className="min-h-16 text-xs"
 					/>
@@ -359,7 +445,7 @@ export function TranscribeTab() {
 
 						{result?.transcript && (
 							<>
-								<div className="flex gap-2">
+								<div className="flex flex-wrap gap-2">
 									<Button
 										size="sm"
 										variant="outline"
@@ -373,27 +459,35 @@ export function TranscribeTab() {
 									<Button
 										size="sm"
 										variant="outline"
-										onClick={() => {
-											const blob = new Blob([displayed], {
-												type: "text/plain",
-											});
-											const a = document.createElement("a");
-											a.href = URL.createObjectURL(blob);
-											a.download = `transcript-${jobId.slice(0, 8)}.txt`;
-											a.click();
-											URL.revokeObjectURL(a.href);
-										}}
+										onClick={() =>
+											download(`transcript-${jobId.slice(0, 8)}.txt`, displayed)
+										}
 									>
 										Download .txt
 									</Button>
+									{result.subtitle_content && fmt !== "txt" && (
+										<Button
+											size="sm"
+											onClick={() =>
+												download(
+													`transcript-${jobId.slice(0, 8)}.${fmt}`,
+													applyRenames(result.subtitle_content ?? "", renames),
+													fmt === "json" ? "application/json" : "text/plain",
+												)
+											}
+										>
+											Download .{fmt}
+										</Button>
+									)}
 									{result.task && (
 										<Badge variant="outline">{result.task}</Badge>
 									)}
 								</div>
+
 								{speakers.length > 0 && (
 									<div className="flex flex-col gap-2 rounded border bg-muted/30 p-2">
 										<Label className="text-xs text-muted-foreground">
-											Rename speakers
+											Rename speakers (applies to copy + all downloads)
 										</Label>
 										<div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
 											{speakers.map((s) => (
@@ -409,11 +503,38 @@ export function TranscribeTab() {
 										</div>
 									</div>
 								)}
-								<Textarea
-									readOnly
-									value={displayed}
-									className="min-h-80 font-mono text-xs leading-relaxed"
+
+								<Input
+									value={filter}
+									onChange={(e) => setFilter(e.target.value)}
+									placeholder="Search transcript…"
+									className="text-xs"
 								/>
+
+								{filteredLines ? (
+									<div className="min-h-80 overflow-auto rounded border bg-background p-3 font-mono text-xs leading-relaxed">
+										<div className="mb-2 text-[10px] text-muted-foreground">
+											{filteredLines.length} matching line
+											{filteredLines.length === 1 ? "" : "s"}
+										</div>
+										{filteredLines.length === 0 ? (
+											<span className="text-muted-foreground">no matches</span>
+										) : (
+											filteredLines.map((l, i) => (
+												// biome-ignore lint/suspicious/noArrayIndexKey: read-only display list, lines can duplicate
+												<p key={i} className="whitespace-pre-wrap">
+													{l}
+												</p>
+											))
+										)}
+									</div>
+								) : (
+									<Textarea
+										readOnly
+										value={displayed}
+										className="min-h-80 font-mono text-xs leading-relaxed"
+									/>
+								)}
 							</>
 						)}
 					</div>

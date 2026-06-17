@@ -114,6 +114,7 @@ export interface TranscribeOptions {
 	diarize: boolean;
 	min_speakers?: number;
 	max_speakers?: number;
+	batch_size?: number;
 	hotwords?: string;
 	initial_prompt?: string;
 	suppress_numerals?: boolean;
@@ -142,6 +143,9 @@ export const JobSchema = z
 				status: z.string().nullish(),
 				transcript: z.string().nullish(),
 				subtitle_file: z.string().nullable().nullish(),
+				subtitle_content: z.string().nullish(),
+				subtitle_name: z.string().nullish(),
+				format: z.string().nullish(),
 				task: z.string().nullish(),
 			})
 			.passthrough()

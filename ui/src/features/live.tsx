@@ -348,6 +348,38 @@ export function LiveTab() {
 				<Button
 					variant="outline"
 					onClick={() => {
+						const text = (committed + (partial ? ` ${partial}` : "")).trim();
+						if (!text) return;
+						navigator.clipboard.writeText(text);
+						toast.success("Copied transcript");
+					}}
+					disabled={!hasText}
+				>
+					Copy
+				</Button>
+				<Button
+					variant="outline"
+					onClick={() => {
+						const text = (committed + (partial ? ` ${partial}` : "")).trim();
+						if (!text) return;
+						const blob = new Blob([`${text}\n`], { type: "text/plain" });
+						const a = document.createElement("a");
+						a.href = URL.createObjectURL(blob);
+						const ts = new Date()
+							.toISOString()
+							.replace(/[:.]/g, "-")
+							.slice(0, 19);
+						a.download = `live-transcript-${ts}.txt`;
+						a.click();
+						URL.revokeObjectURL(a.href);
+					}}
+					disabled={!hasText}
+				>
+					Export .txt
+				</Button>
+				<Button
+					variant="outline"
+					onClick={() => {
 						committedRef.current = "";
 						setCommitted("");
 						setPartial("");

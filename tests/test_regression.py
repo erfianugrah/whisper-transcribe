@@ -3861,6 +3861,16 @@ def test_app_endpoints_registered():
         assert f'Route("{route}"' in APP_SRC, f"missing route: {route}"
 
 
+def test_run_transcription_returns_subtitle_content():
+    """The queued job result must inline the generated subtitle file content
+    (srt/vtt/json) so the web UI can offer a format-correct download without
+    us serving an ephemeral /tmp path. Regression guard for SPA parity with
+    the retired Gradio gr.File download."""
+    assert 'result["subtitle_content"] = fh.read()' in APP_SRC
+    assert 'result["subtitle_name"]' in APP_SRC
+    assert 'result["format"] = output_format' in APP_SRC
+
+
 def test_app_helpers_at_module_scope():
     """Helpers must be at module scope (not forward-referenced inside closures)."""
     expected = [
