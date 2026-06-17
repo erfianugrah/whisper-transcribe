@@ -14,7 +14,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { getLiveHealth, liveChunk } from "@/lib/api";
 
 const TARGET_SR = 16000;
-const CHUNK_SECONDS = 6;
+const CHUNK_SECONDS = 2; // smallest window that still gives whisper usable context
 const CHUNK_SAMPLES = TARGET_SR * CHUNK_SECONDS;
 const SILENCE_PEAK = 0.002; // ~ -54 dBFS: below this a window is treated as silent
 const WAVE_HEIGHT = 72;
@@ -35,7 +35,6 @@ export function LiveTab() {
 	const [recording, setRecording] = useState(false);
 	const [transcript, setTranscript] = useState("");
 	const [sending, setSending] = useState(false);
-	const [level, setLevel] = useState(0); // 0..1 instantaneous mic peak
 	const [trackInfo, setTrackInfo] = useState("");
 	const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
 	const [deviceId, setDeviceId] = useState<string>("");
@@ -121,7 +120,6 @@ export function LiveTab() {
 		ctxRef.current?.close().catch(() => {});
 		ctxRef.current = null;
 		setRecording(false);
-		setLevel(0);
 		setTrackInfo("");
 		flush(); // send the partial tail
 	};
@@ -185,7 +183,6 @@ export function LiveTab() {
 					const a = Math.abs(input[i]);
 					if (a > peak) peak = a;
 				}
-				setLevel(peak);
 				if (peak > peakRef.current) peakRef.current = peak;
 				const pcm = downsampleToPcm16(input, ctx.sampleRate);
 				bufRef.current.push(pcm);
@@ -324,26 +321,6 @@ export function LiveTab() {
 						className="w-full"
 						style={{ height: WAVE_HEIGHT }}
 					/>
-					<div className="flex items-center gap-2">
-						<span className="w-8 font-mono text-[11px] text-muted-foreground">
-							lvl
-						</span>
-						<div className="h-2 flex-1 overflow-hidden rounded-sm bg-secondary">
-							<div
-								className={
-									level > 0.01
-										? "h-full bg-emerald-500"
-										: "h-full bg-muted-foreground/40"
-								}
-								style={{ width: `${Math.min(100, Math.round(level * 140))}%` }}
-							/>
-						</div>
-						{level <= SILENCE_PEAK && (
-							<span className="font-mono text-[11px] text-destructive">
-								no signal
-							</span>
-						)}
-					</div>
 					{trackInfo && (
 						<div className="font-mono text-[10px] text-muted-foreground">
 							track: {trackInfo}
