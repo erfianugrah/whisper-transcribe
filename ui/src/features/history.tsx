@@ -38,8 +38,10 @@ export function HistoryTab() {
 				</TableRow>
 			</TableHeader>
 			<TableBody>
-				{data.map((h, i) => (
-					<TableRow key={`${h.timestamp ?? ""}-${h.filename ?? ""}-${i}`}>
+				{data.map((h) => (
+					<TableRow
+						key={`${h.timestamp ?? ""}|${h.filename ?? ""}|${h.segments ?? ""}|${h.speed ?? ""}`}
+					>
 						<TableCell className="font-mono text-xs whitespace-nowrap">
 							{h.timestamp}
 						</TableCell>
