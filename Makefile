@@ -38,12 +38,15 @@ help: ## Show this help
 
 # ─── Build ────────────────────────────────────────────────────────────────────
 
-.PHONY: build build-whisper build-bot
-build: build-whisper build-bot ## Build both images
+.PHONY: build build-whisper build-bot build-live
+build: build-whisper build-live build-bot ## Build all service images
 
 build-whisper: ## Build whisper service image (auto-bumps yt-dlp to latest PyPI release)
 	@echo "Building whisper with yt-dlp $(YT_DLP_VERSION)"
 	$(COMPOSE_RUNTIME) build --build-arg YT_DLP_VERSION=$(YT_DLP_VERSION) whisper
+
+build-live: ## Build whisper-live streaming sidecar image
+	$(COMPOSE_RUNTIME) build whisper-live
 
 build-bot: ## Build bot image
 	$(COMPOSE_RUNTIME) build bot
