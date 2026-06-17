@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -56,9 +56,15 @@ export function TranscribeTab() {
 	const [language, setLanguage] = useState("Auto-detect");
 	const [translate, setTranslate] = useState<"auto" | "true" | "false">("auto");
 	const [diarize, setDiarize] = useState(false);
+	const [minSpeakers, setMinSpeakers] = useState("");
+	const [maxSpeakers, setMaxSpeakers] = useState("");
 	const [hotwords, setHotwords] = useState("");
+	const [initialPrompt, setInitialPrompt] = useState("");
+	const [suppressNumerals, setSuppressNumerals] = useState(false);
 
 	const [jobId, setJobId] = useState<string | null>(null);
+	// Client-side SPEAKER_xx → friendly-name remap applied to the result.
+	const [renames, setRenames] = useState<Record<string, string>>({});
 
 	const media = useQuery({
 		queryKey: ["media"],
@@ -102,13 +108,18 @@ export function TranscribeTab() {
 				language,
 				translate,
 				diarize,
+				min_speakers: diarize && minSpeakers ? Number(minSpeakers) : undefined,
+				max_speakers: diarize && maxSpeakers ? Number(maxSpeakers) : undefined,
 				hotwords: hotwords.trim() || undefined,
+				initial_prompt: initialPrompt.trim() || undefined,
+				suppress_numerals: suppressNumerals || undefined,
 				cleanup,
 			};
 			return submitJob(opts);
 		},
 		onSuccess: (r) => {
 			setJobId(r.job_id);
+			setRenames({});
 			qc.invalidateQueries({ queryKey: ["queue"] });
 			toast.success(
 				`Queued ${r.job_id.slice(0, 8)} (position ${r.position ?? "?"})`,
@@ -119,6 +130,24 @@ export function TranscribeTab() {
 
 	const j = job.data;
 	const result = j?.result;
+
+	// Distinct SPEAKER_xx labels present in the diarized transcript.
+	const speakers = useMemo(() => {
+		if (!result?.transcript) return [] as string[];
+		const found = new Set(result.transcript.match(/SPEAKER_\d+/g) ?? []);
+		return [...found].sort();
+	}, [result?.transcript]);
+
+	// Apply the SPEAKER_xx → friendly-name remap to the transcript for display,
+	// copy, and download. Whole-label replace so partial overlaps can't collide.
+	const displayed = useMemo(() => {
+		if (!result?.transcript) return "";
+		let out = result.transcript;
+		for (const [label, name] of Object.entries(renames)) {
+			if (name.trim()) out = out.replaceAll(label, name.trim());
+		}
+		return out;
+	}, [result?.transcript, renames]);
 
 	return (
 		<div className="grid gap-4 lg:grid-cols-[minmax(0,340px)_1fr]">
@@ -242,11 +271,52 @@ export function TranscribeTab() {
 					Speaker diarization
 				</label>
 
+				{diarize && (
+					<div className="grid grid-cols-2 gap-3">
+						<Field label="Min speakers">
+							<Input
+								type="number"
+								min={1}
+								value={minSpeakers}
+								onChange={(e) => setMinSpeakers(e.target.value)}
+								placeholder="auto"
+							/>
+						</Field>
+						<Field label="Max speakers">
+							<Input
+								type="number"
+								min={1}
+								value={maxSpeakers}
+								onChange={(e) => setMaxSpeakers(e.target.value)}
+								placeholder="auto"
+							/>
+						</Field>
+					</div>
+				)}
+
+				<label className="flex items-center gap-2 text-sm">
+					<input
+						type="checkbox"
+						checked={suppressNumerals}
+						onChange={(e) => setSuppressNumerals(e.target.checked)}
+					/>
+					Suppress numerals (spell out numbers)
+				</label>
+
 				<Field label="Hotwords (comma-separated)">
 					<Input
 						value={hotwords}
 						onChange={(e) => setHotwords(e.target.value)}
 						placeholder="optional"
+					/>
+				</Field>
+
+				<Field label="Initial prompt (context / spelling hints)">
+					<Textarea
+						value={initialPrompt}
+						onChange={(e) => setInitialPrompt(e.target.value)}
+						placeholder="optional — biases the decoder toward this vocabulary/style"
+						className="min-h-16 text-xs"
 					/>
 				</Field>
 
@@ -294,7 +364,7 @@ export function TranscribeTab() {
 										size="sm"
 										variant="outline"
 										onClick={() => {
-											navigator.clipboard.writeText(result.transcript!);
+											navigator.clipboard.writeText(displayed);
 											toast.success("Copied transcript");
 										}}
 									>
@@ -304,7 +374,7 @@ export function TranscribeTab() {
 										size="sm"
 										variant="outline"
 										onClick={() => {
-											const blob = new Blob([result.transcript!], {
+											const blob = new Blob([displayed], {
 												type: "text/plain",
 											});
 											const a = document.createElement("a");
@@ -320,9 +390,28 @@ export function TranscribeTab() {
 										<Badge variant="outline">{result.task}</Badge>
 									)}
 								</div>
+								{speakers.length > 0 && (
+									<div className="flex flex-col gap-2 rounded border bg-muted/30 p-2">
+										<Label className="text-xs text-muted-foreground">
+											Rename speakers
+										</Label>
+										<div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+											{speakers.map((s) => (
+												<Input
+													key={s}
+													value={renames[s] ?? ""}
+													placeholder={s}
+													onChange={(e) =>
+														setRenames((r) => ({ ...r, [s]: e.target.value }))
+													}
+												/>
+											))}
+										</div>
+									</div>
+								)}
 								<Textarea
 									readOnly
-									value={result.transcript}
+									value={displayed}
 									className="min-h-80 font-mono text-xs leading-relaxed"
 								/>
 							</>
