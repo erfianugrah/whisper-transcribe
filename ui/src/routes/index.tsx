@@ -1,11 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useState } from "react";
+import { ThemeToggle } from "@/components/theme-toggle";
 import { HistoryTab } from "@/features/history";
 import { LiveTab } from "@/features/live";
 import { QueueTab } from "@/features/queue";
 import { TranscribeTab } from "@/features/transcribe";
 import { getStatus } from "@/lib/api";
+import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/")({ component: Home });
 
@@ -15,23 +17,22 @@ function StatusBar() {
 		queryFn: getStatus,
 		refetchInterval: 5000,
 	});
+	const dot = isError
+		? "bg-destructive"
+		: data?.busy
+			? "bg-primary"
+			: "bg-emerald-500";
 	return (
-		<div className="flex flex-wrap items-center gap-x-4 gap-y-1 font-mono text-xs text-muted-foreground">
-			<span className="flex items-center gap-1.5">
-				<span
-					className={
-						isError
-							? "inline-block size-2 rounded-full bg-destructive"
-							: data?.busy
-								? "inline-block size-2 rounded-full bg-primary"
-								: "inline-block size-2 rounded-full bg-emerald-500"
-					}
-				/>
+		<div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-muted-foreground">
+			<span className="flex items-center gap-1.5 text-foreground">
+				<span className={cn("inline-block size-2 rounded-full", dot)} />
 				{isError ? "offline" : data?.busy ? "busy" : "ready"}
 			</span>
 			{data && (
 				<>
+					<span className="text-border">|</span>
 					<span>{data.gpu}</span>
+					<span className="text-border">|</span>
 					<span>
 						{data.device}/{data.compute_type}
 					</span>
@@ -43,46 +44,62 @@ function StatusBar() {
 	);
 }
 
+const TABS = [
+	{ id: "transcribe", label: "Transcribe" },
+	{ id: "queue", label: "Queue" },
+	{ id: "history", label: "History" },
+	{ id: "live", label: "Live" },
+] as const;
+type TabId = (typeof TABS)[number]["id"];
+
 function Home() {
+	const [tab, setTab] = useState<TabId>("transcribe");
 	return (
-		<div className="mx-auto max-w-5xl px-4 py-6">
-			<header className="mb-5 border-b pb-4">
-				<div className="flex items-baseline justify-between">
-					<h1 className="text-lg font-bold tracking-tight">
+		<div className="mx-auto max-w-5xl px-4 py-5">
+			<header className="mb-4">
+				<div className="flex items-center justify-between gap-4">
+					<h1 className="text-base font-bold tracking-tight">
 						whisper<span className="text-primary">·</span>transcribe
 					</h1>
-					<a
-						href="/"
-						className="font-mono text-xs text-muted-foreground underline-offset-2 hover:underline"
-					>
-						classic UI →
-					</a>
+					<div className="flex items-center gap-3">
+						<ThemeToggle />
+						<a
+							href="/"
+							className="font-mono text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+						>
+							classic UI →
+						</a>
+					</div>
 				</div>
 				<div className="mt-2">
 					<StatusBar />
 				</div>
 			</header>
 
-			<Tabs defaultValue="transcribe">
-				<TabsList>
-					<TabsTrigger value="transcribe">Transcribe</TabsTrigger>
-					<TabsTrigger value="queue">Queue</TabsTrigger>
-					<TabsTrigger value="history">History</TabsTrigger>
-					<TabsTrigger value="live">Live</TabsTrigger>
-				</TabsList>
-				<TabsContent value="transcribe" className="mt-4">
-					<TranscribeTab />
-				</TabsContent>
-				<TabsContent value="queue" className="mt-4">
-					<QueueTab />
-				</TabsContent>
-				<TabsContent value="history" className="mt-4">
-					<HistoryTab />
-				</TabsContent>
-				<TabsContent value="live" className="mt-4">
-					<LiveTab />
-				</TabsContent>
-			</Tabs>
+			<nav className="flex items-center gap-1 border-b">
+				{TABS.map((t) => (
+					<button
+						key={t.id}
+						type="button"
+						onClick={() => setTab(t.id)}
+						className={cn(
+							"-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors",
+							tab === t.id
+								? "border-primary text-foreground"
+								: "border-transparent text-muted-foreground hover:text-foreground",
+						)}
+					>
+						{t.label}
+					</button>
+				))}
+			</nav>
+
+			<main className="py-5">
+				{tab === "transcribe" && <TranscribeTab />}
+				{tab === "queue" && <QueueTab />}
+				{tab === "history" && <HistoryTab />}
+				{tab === "live" && <LiveTab />}
+			</main>
 		</div>
 	);
 }

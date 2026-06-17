@@ -121,9 +121,9 @@ export function TranscribeTab() {
 	const result = j?.result;
 
 	return (
-		<div className="grid gap-6 lg:grid-cols-[minmax(0,360px)_1fr]">
+		<div className="grid gap-4 lg:grid-cols-[minmax(0,340px)_1fr]">
 			{/* ── Controls ── */}
-			<div className="flex flex-col gap-4">
+			<div className="flex flex-col gap-3 rounded border bg-card p-3">
 				<div className="flex gap-1">
 					{(["youtube", "server", "upload"] as const).map((s) => (
 						<Button
@@ -256,9 +256,9 @@ export function TranscribeTab() {
 			</div>
 
 			{/* ── Result ── */}
-			<div className="min-w-0">
+			<div className="min-w-0 rounded border bg-card p-3">
 				{!jobId && (
-					<div className="flex h-full min-h-40 items-center justify-center rounded border border-dashed text-sm text-muted-foreground">
+					<div className="flex h-full min-h-80 items-center justify-center text-sm text-muted-foreground">
 						Submit a job to see the transcript here.
 					</div>
 				)}
