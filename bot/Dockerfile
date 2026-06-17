@@ -17,12 +17,19 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 WORKDIR /app
 
+# libopus is required for Discord voice receive (discord.opus._load_default()
+# decodes Opus -> PCM). The slim image has no audio libs. Cheap layer, kept
+# above the pip layer so it caches independently of requirements.txt churn.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libopus0 \
+ && rm -rf /var/lib/apt/lists/*
+
 # Install deps first (cached unless requirements.txt changes). Pip install
 # happens as root so /usr/local/lib remains root-owned (correct).
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=bot:bot main.py prompts.py ./
+COPY --chown=bot:bot main.py prompts.py voice.py ./
 
 # Transcript cache lives here; mount as a volume to persist across restarts.
 # Pre-created and owned by uid 1000 so the named volume in compose inherits

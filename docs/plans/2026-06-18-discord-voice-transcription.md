@@ -8,7 +8,7 @@ Author: erfi
 
 | Phase | State | Notes |
 |---|---|---|
-| 0 — deps + decode proof | 🚧 in progress | numpy/voice deps, libopus, py3.13 import gate, feature-flagged connect+BasicSink |
+| 0 — deps + decode proof | ✅ code + tests done | voice.py (guarded import, numpy resample/mix/SilenceInjector, feature-flagged connect+BasicSink), deps+libopus, 16 unit/structural tests green. Live in-call verify + py3.13 image-build gate pending. |
 | 1 — single mixed-stream MVP | ⬜ not started | |
 | 2 — per-user attribution | ⬜ not started | |
 | 3 — summary on leave | ⬜ not started | |

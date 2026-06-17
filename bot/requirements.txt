@@ -8,5 +8,13 @@
 #   - Range bounds the major version so breaking changes still gate.
 # Bump the floor (e.g. >=2.8) when you've verified a new major.minor; the
 # upper bound prevents a future major release from breaking unannounced.
-discord.py>=2.7,<3
+discord.py[voice]>=2.7,<3
 aiohttp>=3.13,<4
+
+# Voice-call live transcription (docs/plans/2026-06-18-discord-voice-transcription.md).
+# discord-ext-voice-recv adds the voice RECEIVE path discord.py lacks; pinned
+# exactly because it's alpha (no stability guarantees). numpy does the
+# 48 kHz-stereo -> 16 kHz-mono resample + wall-clock silence reconstruction
+# (audioop is gone in py3.13+). Both are no-ops unless VOICE_TRANSCRIBE_ENABLED.
+discord-ext-voice-recv==0.5.2a179
+numpy>=2,<3

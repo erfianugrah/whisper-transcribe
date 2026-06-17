@@ -4965,6 +4965,124 @@ def test_slash_commands_registered():
     assert not missing, f"missing slash command handlers: {missing}"
 
 
+# ─── Voice transcription (Phase 0) ──────────────────────────────
+import numpy as np  # noqa: E402
+
+import voice as voicemod  # noqa: E402  (import-safe: voice_recv guarded)
+
+VOICE_SRC = open(os.path.join(os.path.dirname(__file__), "..", "bot", "voice.py")).read()
+
+
+def test_voice_module_import_safe_without_extension():
+    """voice.py must import even when discord-ext-voice-recv is absent (the test
+    stub layer has no voice_recv) — the import is guarded."""
+    assert voicemod.VOICE_RECV_AVAILABLE is False  # not installed on the test host
+    assert hasattr(voicemod, "register_voice_commands")
+
+
+def test_resample_48k_stereo_to_16k_mono_ratio():
+    """1 s of 48 kHz stereo → ~16000 mono int16 samples (3:1 decimation)."""
+    n = 48000
+    stereo = np.zeros((n, 2), dtype="<i2")
+    out = voicemod.resample_48k_stereo_to_16k_mono(stereo.tobytes())
+    samples = np.frombuffer(out, dtype="<i2")
+    assert abs(len(samples) - 16000) <= 1
+    assert len(out) % 2 == 0
+
+
+def test_resample_downmix_and_decimate_values():
+    """Downmix averages L+R; decimate averages 3 consecutive mono samples."""
+    # 6 stereo frames: L=R=constant 300 → mono 300; decimate-3 → two samples of 300.
+    stereo = np.full((6, 2), 300, dtype="<i2")
+    out = np.frombuffer(
+        voicemod.resample_48k_stereo_to_16k_mono(stereo.tobytes()), dtype="<i2"
+    )
+    assert out.tolist() == [300, 300]
+
+
+def test_resample_silence_is_silence():
+    out = voicemod.resample_48k_stereo_to_16k_mono(np.zeros((300, 2), dtype="<i2").tobytes())
+    assert set(np.frombuffer(out, dtype="<i2").tolist()) <= {0}
+
+
+def test_resample_handles_empty_and_subframe():
+    assert voicemod.resample_48k_stereo_to_16k_mono(b"") == b""
+    assert voicemod.resample_48k_stereo_to_16k_mono(b"\x01") == b""  # < 1 stereo frame
+
+
+def test_mixed_stream_sums_and_clips():
+    """Two simultaneous speakers sum; result clips to int16, no overflow wrap."""
+    a = np.full(4, 20000, dtype="<i2").tobytes()
+    b = np.full(4, 20000, dtype="<i2").tobytes()
+    out = np.frombuffer(voicemod.mix_streams([a, b]), dtype="<i2")
+    assert out.tolist() == [32767, 32767, 32767, 32767]  # 40000 clipped, not wrapped
+
+
+def test_mixed_stream_zero_pads_shorter():
+    a = np.full(6, 100, dtype="<i2").tobytes()
+    b = np.full(2, 100, dtype="<i2").tobytes()
+    out = np.frombuffer(voicemod.mix_streams([a, b]), dtype="<i2")
+    assert out.tolist() == [200, 200, 100, 100, 100, 100]
+
+
+def test_silence_injector_pads_gaps():
+    """A 1 s wall-clock gap yields ~16000 zero samples; contiguous frames → none;
+    padding is capped at VOICE_MAX_SILENCE_S."""
+    inj = voicemod.SilenceInjector(sample_rate=16000, max_silence_s=2.0, min_gap_s=0.04)
+    assert inj.silence_before(0.0, 0.02) == b""  # first packet, no padding
+    # contiguous next packet at t=0.02 (== next_expected) → no padding
+    assert inj.silence_before(0.02, 0.02) == b""
+    # 1 s gap → ~16000 samples * 2 bytes
+    pad = inj.silence_before(1.04, 0.02)
+    n = len(pad) // 2
+    assert abs(n - 16000) <= 800
+    assert set(np.frombuffer(pad, dtype="<i2").tolist()) <= {0}
+
+
+def test_silence_injector_caps_long_idle():
+    inj = voicemod.SilenceInjector(sample_rate=16000, max_silence_s=2.0)
+    inj.silence_before(0.0, 0.02)
+    pad = inj.silence_before(600.0, 0.02)  # 10-minute idle
+    assert len(pad) // 2 == 32000  # capped at 2 s, not 10 min
+
+
+def test_voice_uses_ws_stream_not_ws_url():
+    """Voice path must target whisper-live /ws-stream (binary PCM), distinct from
+    the existing /ws-url livestream path. (Phase 0 has no WS yet; assert the
+    resample target rate is the 16 kHz /ws-stream expects.)"""
+    assert voicemod.TARGET_SAMPLE_RATE == 16000
+    assert "/ws-url" not in VOICE_SRC  # don't accidentally reuse the URL path
+
+
+def test_voice_opus_load_guarded():
+    assert "def opus_loaded(" in VOICE_SRC
+    assert "_load_default()" in VOICE_SRC
+    assert "except Exception" in VOICE_SRC  # failure disables, never crashes
+
+
+def test_voice_consent_notice_present():
+    assert "being transcribed" in voicemod._CONSENT_NOTICE
+    assert "do not consent" in voicemod._CONSENT_NOTICE
+
+
+def test_voice_feature_flag_gated():
+    """register_voice_commands no-ops unless the flag is set; main.py guards it."""
+    assert "VOICE_TRANSCRIBE_ENABLED" in VOICE_SRC
+    assert "if not VOICE_TRANSCRIBE_ENABLED" in VOICE_SRC
+    assert "voice.register_voice_commands(bot)" in BOT_SRC
+    assert "_voice_enabled" in BOT_SRC
+
+
+def test_voice_requirements_and_dockerfile():
+    reqs = open(os.path.join(os.path.dirname(__file__), "..", "bot", "requirements.txt")).read()
+    assert "discord.py[voice]" in reqs
+    assert "discord-ext-voice-recv==" in reqs  # exact pin (alpha)
+    assert "numpy" in reqs
+    dockerfile = open(os.path.join(os.path.dirname(__file__), "..", "bot", "Dockerfile")).read()
+    assert "libopus0" in dockerfile
+    assert "voice.py" in dockerfile  # copied into the image
+
+
 # ─── Test runner ─────────────────────────────────────────────────────────────
 
 

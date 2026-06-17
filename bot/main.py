@@ -82,6 +82,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import voice  # voice-call live transcription (import-safe even if ext absent)
+
 class _JsonFormatter(logging.Formatter):
     """Single-line JSON per log record. Easy to grep, ship, or feed to a
     real log aggregator later. Adds any `extra=` fields verbatim."""
@@ -1334,6 +1336,7 @@ intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 queue: asyncio.Queue[Job] = asyncio.Queue()
+_voice_enabled = False  # set True once voice slash commands are registered
 # Shared session; populated in on_ready(). Each network helper guards with an
 # explicit `if http is None: raise` so the check survives `python -O`.
 http: aiohttp.ClientSession | None = None
@@ -1350,6 +1353,16 @@ async def on_ready():
     # to operators that the LLM endpoint is unreachable (and the worker
     # would burn 130s of retry backoff before posting "❌ Failed").
     bot.loop.create_task(llm_health_loop())
+    # Register voice-transcription slash commands BEFORE the sync so they ship
+    # in the same tree push. Guarded against on_ready firing twice on reconnect
+    # (tree.command raises on duplicate registration). No-op unless
+    # VOICE_TRANSCRIBE_ENABLED + the extension + libopus are all present.
+    global _voice_enabled
+    if not _voice_enabled:
+        try:
+            _voice_enabled = voice.register_voice_commands(bot)
+        except Exception as e:
+            log.error("voice: registration failed: %s", e)
     try:
         await _sync_slash_commands()
     except Exception as e:
