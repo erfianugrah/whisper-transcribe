@@ -52,8 +52,18 @@ const TABS = [
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
 
+function initialTab(): TabId {
+	const h = window.location.hash.replace("#", "");
+	return TABS.some((t) => t.id === h) ? (h as TabId) : "transcribe";
+}
+
 function Home() {
-	const [tab, setTab] = useState<TabId>("transcribe");
+	const [tab, setTabState] = useState<TabId>(initialTab);
+	const setTab = (id: TabId) => {
+		setTabState(id);
+		// Reflect in the URL hash so a refresh restores the same tab.
+		window.history.replaceState(null, "", `#${id}`);
+	};
 	return (
 		<div className="mx-auto max-w-5xl px-4 py-5">
 			<header className="mb-4">
