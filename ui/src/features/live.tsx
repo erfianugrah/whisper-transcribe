@@ -49,6 +49,9 @@ export function LiveTab() {
 	const streamRef = useRef<MediaStream | null>(null);
 	const procRef = useRef<ScriptProcessorNode | null>(null);
 	const sinkRef = useRef<GainNode | null>(null);
+	// Firefox GCs an unreferenced MediaStreamAudioSourceNode even while it's
+	// connected, silencing the whole graph. Hold a ref to keep it alive.
+	const srcRef = useRef<MediaStreamAudioSourceNode | null>(null);
 	const analyserRef = useRef<AnalyserNode | null>(null);
 	const canvasRef = useRef<HTMLCanvasElement | null>(null);
 	const rafRef = useRef<number | null>(null);
@@ -106,6 +109,8 @@ export function LiveTab() {
 		if (rafRef.current != null) cancelAnimationFrame(rafRef.current);
 		rafRef.current = null;
 		procRef.current?.disconnect();
+		srcRef.current?.disconnect();
+		srcRef.current = null;
 		sinkRef.current?.disconnect();
 		analyserRef.current?.disconnect();
 		procRef.current = null;
@@ -153,6 +158,7 @@ export function LiveTab() {
 			if (ctx.state === "suspended") await ctx.resume();
 			ctxRef.current = ctx;
 			const src = ctx.createMediaStreamSource(stream);
+			srcRef.current = src;
 
 			const analyser = ctx.createAnalyser();
 			analyser.fftSize = 1024;
