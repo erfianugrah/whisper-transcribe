@@ -218,12 +218,14 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
         while not stop.is_set():
             await asyncio.sleep(PROCESS_INTERVAL)
             try:
-                committed, partial = await _transcriber.session_process(session)
+                committed, partial, eou = await _transcriber.session_process(session)
             except Exception as e:
                 log.error(f"[ws-stream] inference error: {e}")
                 continue
-            if committed:
-                await websocket.send_text(json.dumps({"type": "commit", "text": committed}))
+            if committed or eou:
+                await websocket.send_text(
+                    json.dumps({"type": "commit", "text": committed, "eou": eou})
+                )
             if partial:
                 await websocket.send_text(json.dumps({"type": "partial", "text": partial}))
 
@@ -250,7 +252,9 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
         try:
             final = await _transcriber.session_finish(session)
             if final:
-                await websocket.send_text(json.dumps({"type": "commit", "text": final}))
+                await websocket.send_text(
+                    json.dumps({"type": "commit", "text": final, "eou": True})
+                )
             await websocket.send_text(json.dumps({"type": "done"}))
         except Exception:
             pass

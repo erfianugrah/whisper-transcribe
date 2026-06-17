@@ -114,10 +114,10 @@ def test_hypothesis_commits_only_agreed_prefix():
         ]
     )
     sess.insert_audio(_PCM_2S)
-    c1, _ = sess.process()  # first pass: nothing agreed yet
+    c1, _, _ = sess.process()  # first pass: nothing agreed yet
     assert c1 == ""
     sess.insert_audio(_PCM_2S)
-    c2, partial = sess.process()  # second pass: prefix now agreed
+    c2, partial, _ = sess.process()  # second pass: prefix now agreed
     assert c2 == "hello world"
     assert "bar" in partial  # divergent tail still provisional
 
@@ -143,7 +143,7 @@ def test_process_waits_for_min_chunk():
     """Below the min-chunk threshold, no inference / no commit."""
     sess = _session([[_w(0.0, 0.5, " hi")]], min_chunk_s=1.0)
     sess.insert_audio((np.zeros(SAMPLE_RATE // 2, dtype=np.int16)).tobytes())  # 0.5s
-    c, p = sess.process()
+    c, p, _ = sess.process()
     assert c == "" and p == ""
 
 
@@ -152,8 +152,9 @@ def test_tail_silence_finalizes_utterance():
     (end-of-utterance), without waiting for a second agreeing pass."""
     sess = _session([[_w(0.0, 0.5, " hello"), _w(0.5, 1.0, " world")]])
     sess.insert_audio(_SILENT_2S)
-    committed, _ = sess.process()
+    committed, _, eou = sess.process()
     assert committed == "hello world"
+    assert eou is True  # trailing silence closed the utterance
 
 
 def test_finish_flushes_unconfirmed_tail():

@@ -212,11 +212,13 @@ class OnlineSession:
                 words.append((seg.start, seg.end, seg.text))
         return words
 
-    def process(self) -> tuple[str, str]:
-        """One pass. Returns (newly_committed_text, current_partial_text)."""
+    def process(self) -> tuple[str, str, bool]:
+        """One pass. Returns (committed_text, partial_text, end_of_utterance).
+        `end_of_utterance` is True when a trailing-silence pause closed an
+        utterance — the caller uses it to insert a line break."""
         self._drain()
         if len(self.audio) < self._min_samples:
-            return "", self._partial()
+            return "", self._partial(), False
         self.hyp.insert(self._transcribe(), self.offset)
         committed = list(self.hyp.flush())
         silent = self._tail_is_silent()
@@ -230,7 +232,7 @@ class OnlineSession:
             self._finalize_reset()  # drop the utterance's audio; start fresh
         elif len(self.audio) / SAMPLE_RATE > self._trim_s and self.committed:
             self._trim(self.committed[-1][1])
-        return "".join(w[2] for w in committed).strip(), self._partial()
+        return "".join(w[2] for w in committed).strip(), self._partial(), silent
 
     def _tail_is_silent(self) -> bool:
         n = int(self._tail_silence_s * SAMPLE_RATE)

@@ -139,15 +139,27 @@ export function LiveTab() {
 			ws.binaryType = "arraybuffer";
 			wsRef.current = ws;
 			ws.onmessage = (ev) => {
-				let msg: { type?: string; text?: string; message?: string };
+				let msg: {
+					type?: string;
+					text?: string;
+					eou?: boolean;
+					message?: string;
+				};
 				try {
 					msg = JSON.parse(ev.data);
 				} catch {
 					return;
 				}
-				if (msg.type === "commit" && msg.text) {
-					committedRef.current += (committedRef.current ? " " : "") + msg.text;
-					setCommitted(committedRef.current);
+				if (msg.type === "commit") {
+					let c = committedRef.current;
+					if (msg.text) {
+						c += (c && !c.endsWith("\n") ? " " : "") + msg.text;
+					}
+					// End-of-utterance (trailing-silence pause) → line break so
+					// separate utterances render on their own lines.
+					if (msg.eou && c.trim()) c = `${c.replace(/\s+$/, "")}\n`;
+					committedRef.current = c;
+					setCommitted(c);
 					setPartial("");
 				} else if (msg.type === "partial") {
 					setPartial(msg.text ?? "");
