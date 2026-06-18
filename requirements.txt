@@ -13,3 +13,12 @@ easyocr==1.7.2
 # Backing store for /api/jobs (queue) and shared transcript cache.
 # valkey-py is API-compatible with redis-py so the same URL scheme works.
 valkey==6.1.1
+# Web stack — Starlette ASGI app (API routes + SPA static mount) + uvicorn
+# server + httpx client (live-transcription proxy). These were previously
+# transitive via gradio; pinned explicitly now that the Gradio UI is retired.
+starlette==1.3.1
+uvicorn[standard]==0.49.0
+httpx==0.28.1
+# Backs Starlette's request.form() for the /api/upload + /api/image multipart
+# endpoints (Starlette raises without it installed).
+python-multipart==0.0.32
