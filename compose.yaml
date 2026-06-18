@@ -74,7 +74,7 @@ services:
       # produce ~27 clusters; bumping to 180s leaves headroom for queue
       # waits without papering over actual UVM-fallback slowness).
       - LLM_SYNTHESIS_TIMEOUT=${LLM_SYNTHESIS_TIMEOUT:-180}
-      # whisper-live sidecar — used only by the Gradio Live tab (mic streaming).
+      # whisper-live sidecar — used by the SPA Live tab (mic streaming).
       - LIVE_SERVICE_URL=${LIVE_SERVICE_URL:-http://whisper-live:7861}
     ports:
       - "7860:7860"
@@ -102,7 +102,7 @@ services:
       # `docker compose cp whisper:/data/history.json -` if needed.
       - uploads:/data
       - model-cache:/home/ubuntu/.cache/huggingface
-      # Optional read-only media library mount. Lets the Gradio "Local file"
+      # Optional read-only media library mount. Lets the SPA "Local file"
       # tab list videos from your filesystem without re-uploading. Set
       # MEDIA_LIBRARY_PATH in `.env` (default disables by pointing at /dev/null
       # which mounts harmlessly empty).

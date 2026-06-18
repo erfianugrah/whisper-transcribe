@@ -28,6 +28,7 @@ embeds.
 | `/transcribe-join` | Join your voice channel and live-transcribe it (per-speaker, attributed, timestamped) into a thread. Needs `VOICE_TRANSCRIBE_ENABLED=1`. |
 | `/transcribe-leave` | Stop live transcription, leave the channel, archive the thread (with Export/Delete buttons). |
 | `/transcribe-cleanup older_than_days:<N>` | Delete old transcript threads (admin). `0` wipes all. |
+| `/transcribe-optout` | Toggle: exclude your own voice from transcription. |
 | `/myconfig model:<name> diarize:true` | Your personal defaults — applied in any channel. |
 | `/help topic:<overview\|triggers\|admin\|limits\|errors\|translate>` | Ephemeral help cards. |
 | `/status verbose:true` | Queue depth, service health, plus per-job phase/elapsed when verbose. |
@@ -393,14 +394,32 @@ Consent notice posted on join:
 > 🔴 **This voice channel is now being transcribed.** Audio is converted
 > to text live and not stored. Leave the channel if you do not consent.
 
+Per-speaker streams **auto-reconnect** if whisper-live drops mid-call
+(restart / network blip): the stream re-dials with exponential backoff up
+to `VOICE_MAX_RECONNECTS` times before giving up (it then re-opens fresh on
+the speaker's next utterance). Live transcription survives a whisper-live
+bounce without a rejoin.
+
+```
+/transcribe-optout
+```
+
+Toggle — exclude **your own** voice from transcription. Opting out drops any
+live stream for you immediately and prevents one from opening on future
+calls; run it again to opt back in. Process-local (resets on bot restart, so
+re-consent is the default).
+
 ```
 /transcribe-leave
 ```
 
 Flushes any buffered audio, closes every per-speaker stream (freeing the
-whisper-live slots), disconnects from the voice channel, posts a final
-message with **📄 Export** / **🗑️ Delete** buttons, and archives the thread
-so it drops out of the active list.
+whisper-live slots), disconnects from the voice channel, and — in the
+background — posts an **LLM summary** of the call (via the same `summarize()`
+pipeline used for videos), then a final message with **📄 Export** / **🗑️
+Delete** buttons, and archives the thread so it drops out of the active list.
+A per-call stats line (`utterances`, `peak_speakers`, `reconnects`,
+`transcript_chars`) is logged for capacity visibility.
 
 ### Per-thread buttons
 
@@ -650,6 +669,7 @@ object:
 | Diarized output with renaming | `/transcribe diarize:true` then 🏷️ Rename speakers |
 | Live-transcribe an ongoing voice call | `/transcribe-join` (then `/transcribe-leave` to stop) |
 | Tidy up old voice transcripts | Auto-purge (retention) or `/transcribe-cleanup` (admin); per-thread 🗑️ Delete / 📄 Export buttons |
+| Don't want to be transcribed in a call | `/transcribe-optout` (toggle) |
 
 The auto-paste, reply-trigger, and slash paths all share the same job
 queue, rate limits, and cache. None of them replace each other — pick

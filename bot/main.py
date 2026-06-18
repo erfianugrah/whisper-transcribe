@@ -1342,6 +1342,30 @@ _voice_enabled = False  # set True once voice slash commands are registered
 http: aiohttp.ClientSession | None = None
 
 
+async def _voice_post_summary(thread, transcript_text: str) -> None:
+    """Phase 3: summarise a finished voice call and post it into the thread.
+
+    Injected into voice.register_voice_commands so the LLM + embed machinery
+    stays in main (where summarize()/prompts/send_long_embed live). Best-effort:
+    a summary failure must never break the /transcribe-leave teardown.
+    """
+    text = (transcript_text or "").strip()
+    if len(text) < 40:  # too little was said to be worth a summary
+        return
+    try:
+        brief = await summarize(
+            text, PROMPT_BRIEF, LLM_MAX_TOKENS_BRIEF,
+            reduce_template=REDUCE_BRIEF,
+            title="Voice call", duration="", reference_block="",
+        )
+        brief = sanitize_llm_output(brief)
+    except Exception as e:
+        log.error("voice: summary generation failed: %s", e)
+        return
+    if brief.strip():
+        await send_long_embed(thread, "\U0001f399\ufe0f Voice call summary", brief, 0x5865F2)
+
+
 @bot.event
 async def on_ready():
     global http
@@ -1360,7 +1384,8 @@ async def on_ready():
     global _voice_enabled
     if not _voice_enabled:
         try:
-            _voice_enabled = voice.register_voice_commands(bot)
+            _voice_enabled = voice.register_voice_commands(
+                bot, summarize_cb=_voice_post_summary)
         except Exception as e:
             log.error("voice: registration failed: %s", e)
     try:

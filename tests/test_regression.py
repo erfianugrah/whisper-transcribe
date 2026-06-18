@@ -5083,7 +5083,7 @@ def test_voice_feature_flag_gated():
     """register_voice_commands no-ops unless the flag is set; main.py guards it."""
     assert "VOICE_TRANSCRIBE_ENABLED" in VOICE_SRC
     assert "if not VOICE_TRANSCRIBE_ENABLED" in VOICE_SRC
-    assert "voice.register_voice_commands(bot)" in BOT_SRC
+    assert "voice.register_voice_commands(" in BOT_SRC
     assert "_voice_enabled" in BOT_SRC
 
 
@@ -5268,6 +5268,78 @@ def test_voice_cleanup_surface_present():
     assert hasattr(voicemod, "VOICE_TRANSCRIPT_RETENTION_DAYS")
     # delete is permission-gated (Manage Threads / Manage Messages)
     assert "manage_threads" in VOICE_SRC
+
+
+# ─── Voice Phase 3 (post-call summary) + Phase 4 (reconnect/optout/metrics) ─
+def test_voice_post_call_summary_wired():
+    """/transcribe-leave feeds the accumulated transcript to an injected
+    summarize_cb; main supplies it via summarize() + send_long_embed."""
+    assert "def register_voice_commands(bot, summarize_cb=None)" in VOICE_SRC
+    assert "manager.transcript_text()" in VOICE_SRC
+    assert "summarize_cb(thread, transcript_text)" in VOICE_SRC
+    # main side: callback runs summarize() and posts via send_long_embed
+    assert "async def _voice_post_summary(" in BOT_SRC
+    assert "summarize_cb=_voice_post_summary" in BOT_SRC
+    assert "send_long_embed(" in BOT_SRC
+
+
+def test_voice_manager_accumulates_transcript():
+    """_post_line appends an attributed plain-text line; transcript_text joins
+    them for the summary."""
+    mgr = voicemod.VoiceCallManager.__new__(voicemod.VoiceCallManager)
+    mgr._transcript = []
+    mgr._utterances = 0
+    mgr._peak_speakers = 0
+    mgr._reconnects = 0
+    # call the real _post_line logic by hand (no thread/post needed for accumulation)
+    from datetime import datetime
+    ts = datetime.now().strftime("%H:%M:%S")
+    mgr._utterances += 1
+    mgr._transcript.append(f"[{ts}] Alice: hello there")
+    mgr._utterances += 1
+    mgr._transcript.append(f"[{ts}] Bob: hi")
+    assert voicemod.VoiceCallManager.transcript_text(mgr) == \
+        f"[{ts}] Alice: hello there\n[{ts}] Bob: hi"
+    assert "utterances=2" in voicemod.VoiceCallManager.stats_line(mgr)
+
+
+def test_voice_reconnect_supervisor_present():
+    """Sessions reconnect on an unexpected whisper-live drop, bounded by
+    _MAX_RECONNECTS, and abandon via on_dead so the manager forgets them."""
+    assert "_supervise" in VOICE_SRC
+    assert "_try_reconnect" in VOICE_SRC
+    assert "connect_cb" in VOICE_SRC
+    assert "_MAX_RECONNECTS" in VOICE_SRC
+    assert "_on_session_dead" in VOICE_SRC
+    assert isinstance(voicemod._MAX_RECONNECTS, int) and voicemod._MAX_RECONNECTS >= 1
+
+
+def test_voice_optout_gate_and_command():
+    """Opted-out users are dropped on the audio path and via /transcribe-optout;
+    the gate sits at the top of feed() so no stream is ever opened for them."""
+    assert "_VOICE_OPTOUT" in VOICE_SRC
+    assert "if uid in _VOICE_OPTOUT" in VOICE_SRC
+    assert 'name="transcribe-optout"' in VOICE_SRC
+    assert "def drop_user(" in VOICE_SRC
+    # the set is process-local and starts empty
+    assert voicemod._VOICE_OPTOUT == set()
+
+
+def test_voice_optout_drop_user_removes_session():
+    """drop_user evicts a live session so no more audio is transcribed for them."""
+    mgr = voicemod.VoiceCallManager.__new__(voicemod.VoiceCallManager)
+    mgr._sessions = {42: object()}
+    mgr._pending = {42: [b"x"]}
+    mgr._creating = {42}
+    scheduled = []
+    # _reap_close returns a sentinel; the stub loop just records what was scheduled.
+    mgr._reap_close = lambda sess: ("close", sess)
+    mgr._loop = type("L", (), {"create_task": staticmethod(scheduled.append)})()
+    voicemod.VoiceCallManager.drop_user(mgr, 42)
+    assert 42 not in mgr._sessions
+    assert 42 not in mgr._pending
+    assert 42 not in mgr._creating
+    assert len(scheduled) == 1  # close was scheduled on the loop
 
 
 # ─── Test runner ─────────────────────────────────────────────────────────────

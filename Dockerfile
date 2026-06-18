@@ -1,7 +1,7 @@
 FROM denoland/deno:bin-2.7.14 AS deno
 
 # ─── SPA build stage ─────────────────────────────────────────────────────
-# Compiles the React SPA in ui/ to a static bundle (dist/) served at / by app.py (Gradio demoted to /classic)
+# Compiles the React SPA in ui/ to a static bundle (dist/) served at / by app.py
 # the Starlette app. Lockfile copied first so deps cache independently of
 # source edits. Output is ~600 KB of static assets — negligible vs the CUDA
 # layers below.
@@ -38,7 +38,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     SOURCE_DATE_EPOCH=1704067200
 
 # ─── Heavy stable layer ──────────────────────────────────────────────────────
-# whisperx + gradio pull in torch + cuDNN + transformers (~4 GB on disk).
+# whisperx pulls in torch + cuDNN + transformers (~4 GB on disk).
 # This layer is rebuilt only when requirements.txt changes; without
 # PIP_NO_COMPILE it changes on every build.
 COPY requirements.txt /tmp/requirements.txt

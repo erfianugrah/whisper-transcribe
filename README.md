@@ -8,7 +8,7 @@ GPU-accelerated transcription + Discord TL;DW bot. Five content flows:
 4. **AI litmus test** → regex stylistic scan + Wayback / AdSense / author-byline metadata + ambiguous-case LLM qualitative read → forensic signals report (no verdict). Triggered by replying `litmus` to a URL message.
 5. **Images** (screenshots, memes, documents, photos) → EasyOCR text extraction + VLM scene description → LLM summary. Triggered by replying `tldr` to a Discord message with image attachments — OCR handles faithful transcription of any visible text, the vision model describes the scene, and the LLM combines both into a concise summary.
 
-Gradio UI + HTTP API for the whisper service; Discord bot for hands-off summarisation.
+React SPA + HTTP API for the whisper service; Discord bot for hands-off summarisation.
 
 ## Quick Start
 
@@ -66,8 +66,8 @@ hosted APIs), override `LLM_API_URL` / `LLM_MODEL` / `LLM_VISION_API_URL`
 - **`tldr` reply trigger** on image attachments → EasyOCR + VLM describe + LLM summary. Up to 4 images per message; per-image cap 32MB. Screenshots, documents, memes, photos all supported.
 - **`litmus` reply trigger** → AI-litmus forensic report (LLM-tic phrases, em-dash density, Wayback domain age, AdSense, author byline; LLM qualitative read on ambiguous middle range)
 - **Silent-video fallback** — VLM frame descriptions when speech density is low
-- **Voice-channel live transcription**: `/transcribe-join` streams the live voice call to whisper-live and posts a running transcript — **one stream per speaker**, attributed by display name and timestamped — into a dedicated per-call thread; `/transcribe-leave` stops. Transparently handles Discord's mandatory DAVE end-to-end voice encryption (discord.py 2.7.1+). See [docs/discord-bot-guide.md](docs/discord-bot-guide.md#voice-channel-live-transcription).
-- **Slash commands**: `/summarize`, `/transcribe`, `/status`, `/find`, `/config`, `/serverconfig`, `/transcribe-join`, `/transcribe-leave`, `/transcribe-cleanup`
+- **Voice-channel live transcription**: `/transcribe-join` streams the live voice call to whisper-live and posts a running transcript — **one stream per speaker**, attributed by display name and timestamped — into a dedicated per-call thread; `/transcribe-leave` stops and posts an **LLM summary** of the call. Per-speaker streams **auto-reconnect** if whisper-live blips; `/transcribe-optout` lets a participant exclude themselves. Transparently handles Discord's mandatory DAVE end-to-end voice encryption (discord.py 2.7.1+). See [docs/discord-bot-guide.md](docs/discord-bot-guide.md#voice-channel-live-transcription).
+- **Slash commands**: `/summarize`, `/transcribe`, `/status`, `/find`, `/config`, `/serverconfig`, `/transcribe-join`, `/transcribe-leave`, `/transcribe-cleanup`, `/transcribe-optout`
 - **Per-channel + per-guild config**: model override, VLM toggle, YT-comments toggle, diarize default, summary archive channel
 - **Speaker rename**: button on diarized summaries lets users label SPEAKER_xx → real names
 - **Rate limiting**: per-user sliding window + global queue cap
@@ -97,7 +97,7 @@ Returns: `{"filename": "...", "title": "...", "duration": 123}`
 
 ### POST /api/jobs (preferred)
 
-Async job submission. All consumers (bot, MCP, Gradio UI, ad-hoc curl)
+Async job submission. All consumers (bot, MCP, web SPA, ad-hoc curl)
 share a single Valkey-backed FIFO — no more 409 races on concurrent
 submits. Submitter gets a `job_id` immediately and polls
 `GET /api/jobs/{id}` until terminal.
@@ -274,6 +274,7 @@ Used by the SPA mic Live tab and the Discord voice bot (both stream raw 16 kHz m
 | `VOICE_TRANSCRIPT_CHANNEL_ID` | `0` | Channel ID where per-call transcript threads are created. `0`/unset = the channel the command was invoked in. |
 | `VOICE_MAX_SPEAKERS` | `4` | Max simultaneous per-speaker streams (each uses one whisper-live slot; capped by `LIVE_MAX_STREAMS`). |
 | `VOICE_SPEAKER_IDLE_S` | `45` | Close a speaker's stream after this many seconds of silence, freeing a slot (re-opens on next speech). |
+| `VOICE_MAX_RECONNECTS` | `5` | Consecutive whisper-live reconnect attempts (exp. backoff) before a speaker's stream is abandoned; it re-opens fresh on their next utterance. |
 | `VOICE_SEND_INTERVAL` | `0.15` | How often buffered PCM is flushed to whisper-live (lower = snappier, more requests). |
 | `VOICE_MAX_SILENCE_S` | `2.0` | Cap on reconstructed silence injected for a pause (gives whisper-live its end-of-utterance boundary). |
 | `VOICE_TRANSCRIPT_RETENTION_DAYS` | `7` | Auto-purge deletes per-call transcript threads older than this. `0` disables the background purge (also off unless `VOICE_TRANSCRIPT_CHANNEL_ID` is set). |
@@ -286,7 +287,7 @@ See `.env.example` and `bot/.env.example` for the full list.
 ## Architecture
 
 ```
-                       ┌─ Gradio UI (:7860)
+                       ┌─ React SPA (:7860/)
 [whisper service]──────┤                                          GPU (~32GB)
   whisperX + alignment │
   + diarization +      ├─ HTTP API (:7860/api/*)
@@ -310,7 +311,7 @@ See `.env.example` and `bot/.env.example` for the full list.
 [flaresolverr]         ┘  CF-challenge fallback
 ```
 
-Job queue: all consumers (Discord bot, MCP server, Gradio UI, ad-hoc curl)
+Job queue: all consumers (Discord bot, MCP server, web SPA, ad-hoc curl)
 submit through `POST /api/jobs` and poll `GET /api/jobs/{id}`. The
 async worker pool inside the whisper container `BLPOP`s from Valkey,
 runs whisperx, writes the result back. Persistent (AOF) so a crash

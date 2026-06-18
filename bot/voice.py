@@ -83,6 +83,14 @@ VOICE_CLEANUP_INTERVAL_H = float(os.environ.get("VOICE_CLEANUP_INTERVAL_H", "6")
 # Per-call threads are named "🎙️ <channel> — <date> <time>"; this prefix plus
 # bot ownership is how cleanup distinguishes our threads from human-made ones.
 _THREAD_NAME_PREFIX = "\U0001f399"
+# Max consecutive whisper-live reconnect attempts before a speaker's stream is
+# abandoned (it re-opens fresh on their next utterance).
+_MAX_RECONNECTS = int(os.environ.get("VOICE_MAX_RECONNECTS", "5"))
+
+# Process-local set of user IDs that opted out of voice transcription via
+# /transcribe-optout. Not persisted — resets on bot restart (re-consent is the
+# safe default). Read on the audio path, mutated by the slash command.
+_VOICE_OPTOUT: set[int] = set()
 
 
 _CONSENT_NOTICE = (
@@ -276,7 +284,8 @@ class VoiceUserSession:
 
     def __init__(self, loop, ws, user_id, display_name, post_cb,
                  max_silence_s: float = VOICE_MAX_SILENCE_S,
-                 send_interval: float = VOICE_SEND_INTERVAL):
+                 send_interval: float = VOICE_SEND_INTERVAL,
+                 connect_cb=None, on_dead=None):
         self._loop = loop
         self._ws = ws
         self.user_id = user_id
@@ -286,8 +295,12 @@ class VoiceUserSession:
         self._injector = SilenceInjector(max_silence_s=max_silence_s)
         self._send_interval = send_interval
         self._stop = asyncio.Event()
-        self._sender_task = None
-        self._reader_task = None
+        # connect_cb: async () -> ws, used to re-dial whisper-live on an
+        # unexpected drop. None disables reconnection (e.g. in tests).
+        self._connect_cb = connect_cb
+        self._on_dead = on_dead  # fn(uid) called when the stream is abandoned
+        self._supervisor_task = None
+        self.reconnects = 0
         self._last_audio = time.monotonic()
 
     # — event loop (called from the manager, which is fed off the recv thread) —
@@ -305,8 +318,60 @@ class VoiceUserSession:
         return time.monotonic() - self._last_audio
 
     def start(self) -> None:
-        self._sender_task = self._loop.create_task(self._sender_loop())
-        self._reader_task = self._loop.create_task(self._reader_loop())
+        self._supervisor_task = self._loop.create_task(self._supervise())
+
+    async def _supervise(self) -> None:
+        """Run sender+reader on the current socket; reconnect on unexpected drop.
+
+        close() sets _stop and sends "done", so a clean shutdown breaks the loop.
+        An unexpected ws close (whisper-live restart / network blip) re-dials via
+        connect_cb with capped exponential backoff; after _MAX_RECONNECTS failed
+        attempts the session is abandoned (on_dead lets the manager drop it so a
+        later frame from this speaker opens a fresh stream).
+        """
+        while not self._stop.is_set():
+            sender = self._loop.create_task(self._sender_loop())
+            try:
+                await self._reader_loop()  # returns when the ws closes
+            finally:
+                sender.cancel()
+            if self._stop.is_set() or self._connect_cb is None:
+                break
+            log.warning("voice: whisper-live stream dropped for %s — reconnecting",
+                        self.display_name)
+            new_ws = await self._try_reconnect()
+            if new_ws is None:
+                break
+            self._ws = new_ws
+
+    async def _try_reconnect(self):
+        """Re-dial whisper-live with backoff. Returns a fresh ws or None."""
+        backoff = 1.0
+        for attempt in range(1, _MAX_RECONNECTS + 1):
+            if self._stop.is_set():
+                return None
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 10.0)
+            try:
+                ws = await self._connect_cb()
+            except asyncio.CancelledError:
+                return None
+            except Exception as e:
+                log.error("voice: reconnect %d/%d failed for %s: %s",
+                          attempt, _MAX_RECONNECTS, self.display_name, e)
+                continue
+            self.reconnects += 1
+            log.info("voice: reconnected stream for %s (attempt %d)",
+                     self.display_name, attempt)
+            return ws
+        log.error("voice: giving up on stream for %s after %d attempts",
+                  self.display_name, _MAX_RECONNECTS)
+        if self._on_dead is not None:
+            try:
+                self._on_dead(self.user_id)
+            except Exception:
+                pass
+        return None
 
     async def _drain_once(self) -> bytes:
         parts = []
@@ -367,8 +432,6 @@ class VoiceUserSession:
     async def close(self) -> None:
         """Flush remaining audio, signal done, drain final commits, close WS."""
         self._stop.set()
-        if self._sender_task:
-            self._sender_task.cancel()
         try:
             pcm = await self._drain_once()
             if pcm:
@@ -376,11 +439,11 @@ class VoiceUserSession:
             await self._ws.send_str("done")
         except Exception:
             pass
-        if self._reader_task:
+        if self._supervisor_task:
             try:
-                await asyncio.wait_for(self._reader_task, timeout=10)
+                await asyncio.wait_for(self._supervisor_task, timeout=10)
             except Exception:
-                self._reader_task.cancel()
+                self._supervisor_task.cancel()
         try:
             await self._ws.close()
         except Exception:
@@ -412,7 +475,41 @@ class VoiceCallManager:
         self._pending: dict[int, list[bytes]] = {}
         self._capacity_notified = False
         self._stop = asyncio.Event()
+        # Phase 3: running transcript (plain text) for the post-call summary.
+        self._transcript: list[str] = []
+        # Phase 4 metrics: counters logged as a stats line when the call ends.
+        self._utterances = 0
+        self._peak_speakers = 0
+        self._reconnects = 0
         self._reaper_task = loop.create_task(self._reaper())
+
+    def _connect(self):
+        """Coroutine factory for a fresh whisper-live stream socket."""
+        return self._http.ws_connect(f"{self._ws_url}/ws-stream", timeout=30)
+
+    def transcript_text(self) -> str:
+        """Full plain-text transcript accumulated this call (for summarise())."""
+        return "\n".join(self._transcript)
+
+    def stats_line(self) -> str:
+        chars = sum(len(x) for x in self._transcript)
+        return (f"utterances={self._utterances} peak_speakers={self._peak_speakers} "
+                f"reconnects={self._reconnects} transcript_chars={chars}")
+
+    def drop_user(self, uid: int) -> None:
+        """Stop transcribing a user mid-call (opt-out): close + forget their stream."""
+        sess = self._sessions.pop(uid, None)
+        if sess is not None:
+            self._loop.create_task(self._reap_close(sess))
+        self._pending.pop(uid, None)
+        self._creating.discard(uid)
+
+    def _on_session_dead(self, uid: int) -> None:
+        """A speaker's stream gave up reconnecting — forget it so a later frame
+        re-opens cleanly."""
+        self._sessions.pop(uid, None)
+        log.info("voice: dropped dead stream uid=%s (%d active)",
+                 uid, len(self._sessions))
 
     # — recv thread —
     def submit(self, uid: int, name: str, mono16: bytes) -> None:
@@ -425,6 +522,8 @@ class VoiceCallManager:
 
     # — event loop —
     def feed(self, uid: int, name: str, mono16: bytes) -> None:
+        if uid in _VOICE_OPTOUT:  # opted out of transcription
+            return
         sess = self._sessions.get(uid)
         if sess is not None:
             sess.feed(mono16)
@@ -445,23 +544,27 @@ class VoiceCallManager:
 
     async def _open(self, uid: int, name: str) -> None:
         try:
-            ws = await self._http.ws_connect(f"{self._ws_url}/ws-stream", timeout=30)
+            ws = await self._connect()
         except Exception as e:
             log.error("voice: failed to open whisper-live stream for %s: %s", name, e)
             self._creating.discard(uid)
             self._pending.pop(uid, None)
             return
         sess = VoiceUserSession(
-            self._loop, ws, uid, name, self._post_line, self._max_silence_s)
+            self._loop, ws, uid, name, self._post_line, self._max_silence_s,
+            connect_cb=self._connect, on_dead=self._on_session_dead)
         sess.start()
         self._sessions[uid] = sess
         self._creating.discard(uid)
+        self._peak_speakers = max(self._peak_speakers, len(self._sessions))
         for frame in self._pending.pop(uid, []):
             sess.feed(frame)
         log.info("voice: opened stream for %s (%d active)", name, len(self._sessions))
 
     async def _post_line(self, name: str, text: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
+        self._utterances += 1
+        self._transcript.append(f"[{ts}] {name}: {text}")
         await self._post(f"`[{ts}]` **{name}:** {text}")
 
     async def _post(self, body: str) -> None:
@@ -494,6 +597,8 @@ class VoiceCallManager:
         if self._reaper_task:
             self._reaper_task.cancel()
         sessions = list(self._sessions.values())
+        # Capture reconnect totals before clearing (for the stats line).
+        self._reconnects = sum(getattr(s, "reconnects", 0) for s in sessions)
         self._sessions.clear()
         for sess in sessions:
             try:
@@ -640,8 +745,12 @@ async def voice_transcript_cleanup_loop(bot) -> None:
         await asyncio.sleep(interval_s)
 
 
-def register_voice_commands(bot) -> bool:
-    """Register /transcribe-join + /transcribe-leave. Returns whether enabled.
+def register_voice_commands(bot, summarize_cb=None) -> bool:
+    """Register the /transcribe-* voice commands. Returns whether enabled.
+
+    `summarize_cb` (optional) is an async fn(thread, transcript_text) used to
+    post a post-call summary when a session ends (Phase 3). Injected from main
+    so the LLM/embed logic stays where summarize()/prompts live.
 
     No-op (returns False) unless VOICE_TRANSCRIBE_ENABLED and the extension +
     libopus are both available — so a misconfigured deploy degrades to "feature
@@ -816,30 +925,74 @@ def register_voice_commands(bot) -> bool:
             pass
         state = _live.pop(interaction.guild.id, None)
         thread = None
+        transcript_text = ""
         if state:
             thread = state.get("thread")
+            manager = state.get("manager")
             try:
-                await state["manager"].close()
+                await manager.close()
             except Exception as e:
                 log.debug("voice: manager close error: %s", e)
+            if manager is not None:
+                transcript_text = manager.transcript_text()
+                log.info("voice: call ended (guild %s) — %s",
+                         interaction.guild.id, manager.stats_line())
             try:
                 await state["http"].close()
             except Exception:
                 pass
         await vc.disconnect()
-        # Post Export/Delete controls, then archive so it drops out of the
-        # active-threads list (auto-purge deletes it after the retention window).
-        if thread is not None and hasattr(thread, "send") and thread is not interaction.channel:
-            try:
-                await thread.send(
-                    "— transcription ended — use the buttons to export or delete this thread.",
-                    view=TranscriptControlView(),
-                )
-                await thread.edit(archived=True)
-            except Exception as e:
-                log.debug("voice: leave finalize failed: %s", e)
         await interaction.followup.send("Left the voice channel.", ephemeral=True)
+        # Finalize the thread in the background so the slash reply isn't held
+        # open for the (potentially slow) LLM summary pass.
+        if thread is not None and hasattr(thread, "send") and thread is not interaction.channel:
+            async def _finalize(thread=thread, transcript_text=transcript_text):
+                # Phase 3: best-effort post-call summary before the controls.
+                if summarize_cb is not None and transcript_text.strip():
+                    try:
+                        await summarize_cb(thread, transcript_text)
+                    except Exception as e:
+                        log.error("voice: summary callback failed: %s", e)
+                try:
+                    await thread.send(
+                        "— transcription ended — use the buttons to export or delete this thread.",
+                        view=TranscriptControlView(),
+                    )
+                    await thread.edit(archived=True)
+                except Exception as e:
+                    log.debug("voice: leave finalize failed: %s", e)
+            bot.loop.create_task(_finalize())
         log.info("voice: left voice channel (guild %s)", interaction.guild.id)
+
+    @bot.tree.command(
+        name="transcribe-optout",
+        description="Toggle: exclude your own voice from live transcription",
+    )
+    async def transcribe_optout(interaction: "discord.Interaction"):
+        uid = interaction.user.id
+        if uid in _VOICE_OPTOUT:
+            _VOICE_OPTOUT.discard(uid)
+            await interaction.response.send_message(
+                "✅ You're back in — your voice will be transcribed in future calls.",
+                ephemeral=True,
+            )
+            log.info("voice: uid=%s opted back IN", uid)
+            return
+        _VOICE_OPTOUT.add(uid)
+        # Drop any live stream for this user right now, across active calls.
+        for st in _live.values():
+            mgr = st.get("manager")
+            if mgr is not None:
+                try:
+                    mgr.drop_user(uid)
+                except Exception:
+                    pass
+        await interaction.response.send_message(
+            "🔇 You've opted out — your voice won't be transcribed. "
+            "Run this again to opt back in.",
+            ephemeral=True,
+        )
+        log.info("voice: uid=%s opted OUT", uid)
 
     @bot.tree.command(
         name="transcribe-cleanup",
@@ -869,6 +1022,7 @@ def register_voice_commands(bot) -> bool:
         log.info("voice: /transcribe-cleanup removed %d thread(s) (scope=%s)", n, scope)
 
     log.info(
-        "voice: /transcribe-join + /transcribe-leave + /transcribe-cleanup registered"
+        "voice: /transcribe-join + /transcribe-leave + /transcribe-cleanup "
+        "+ /transcribe-optout registered"
     )
     return True
