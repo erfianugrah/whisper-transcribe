@@ -7878,12 +7878,30 @@ async def _sync_slash_commands():
     operators with multiple servers get instant sync in all of them.
     """
     if DISCORD_GUILD_IDS:
+        # Per-guild try/except: a single guild the bot can't sync to (e.g.
+        # invited without the applications.commands scope → 403 Missing Access)
+        # must NOT abort syncing for the other guilds in the list.
+        ok = 0
         for gid in DISCORD_GUILD_IDS:
             guild = discord.Object(id=gid)
-            bot.tree.copy_global_to(guild=guild)
-            synced = await bot.tree.sync(guild=guild)
+            try:
+                bot.tree.copy_global_to(guild=guild)
+                synced = await bot.tree.sync(guild=guild)
+            except discord.Forbidden as e:
+                log.error(
+                    "Slash sync skipped for guild %d: %s. Re-invite the bot to "
+                    "that guild with the applications.commands scope, or drop it "
+                    "from DISCORD_GUILD_ID.", gid, e,
+                )
+                continue
+            except Exception as e:
+                log.error("Slash sync failed for guild %d: %s", gid, e)
+                continue
+            ok += 1
             log.info("Slash commands synced to guild %d (%d commands)",
                      gid, len(synced))
+        log.info("Slash sync complete: %d/%d guild(s) succeeded",
+                 ok, len(DISCORD_GUILD_IDS))
     else:
         synced = await bot.tree.sync()
         log.info("Slash commands synced globally (%d commands; ~1 hour propagation)",

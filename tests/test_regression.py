@@ -3719,6 +3719,20 @@ def test_sync_loops_per_guild():
     assert "await bot.tree.sync(guild=guild)" in src
 
 
+def test_sync_per_guild_is_fault_isolated():
+    """A 403 (Missing Access) on one guild must NOT abort sync for the others.
+    The per-guild body is wrapped in try/except with `continue` so a bot that
+    was invited to one guild without the applications.commands scope still
+    syncs every other configured guild."""
+    src = BOT_SRC[BOT_SRC.index("async def _sync_slash_commands"):
+                   BOT_SRC.index("async def _sync_slash_commands") + 2000]
+    assert "except discord.Forbidden" in src
+    assert "continue" in src
+    # the loop variable is the guild, and the except references it for the
+    # operator-facing re-invite hint
+    assert "applications.commands" in src
+
+
 # ─── Speaker rename helpers ────────────────────────────────────────────────
 
 
