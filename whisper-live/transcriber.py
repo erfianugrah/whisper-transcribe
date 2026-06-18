@@ -161,11 +161,17 @@ class OnlineSession:
         silence_rms: float = 0.006,
         min_silence_ms: int = 300,
         beam_size: int = 1,
+        hallucination_silence_s: float = 2.0,
     ) -> None:
         self._model = model
         self._min_samples = int(SAMPLE_RATE * min_chunk_s)
         self._trim_s = trim_s
         self._beam_size = beam_size
+        # faster-whisper anti-hallucination: with word_timestamps it skips
+        # silent gaps longer than this where whisper invents continuation text
+        # (the classic "...and this is looks like you" garble on low-signal
+        # audio). 0 / None disables. Env: LIVE_HALLUCINATION_SILENCE_S.
+        self._hallucination_silence_s = hallucination_silence_s or None
         self._tail_silence_s = tail_silence_s
         self._silence_rms = silence_rms
         self._min_silence_ms = min_silence_ms
@@ -204,6 +210,7 @@ class OnlineSession:
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": self._min_silence_ms},
             initial_prompt=self._prompt(),
+            hallucination_silence_threshold=self._hallucination_silence_s,
         )
         words: list[Word] = []
         for seg in segments:

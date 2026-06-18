@@ -216,6 +216,10 @@ _SESSION_KW = dict(
     # beam=5 with minor accuracy cost — the right trade for the live path.
     # Bump LIVE_BEAM_SIZE=5 if you want max accuracy and can tolerate lag.
     beam_size=int(os.environ.get("LIVE_BEAM_SIZE", "1")),
+    # Skip silent gaps > this many seconds where whisper hallucinates
+    # continuation text. 0 disables. word_timestamps (always on in streaming)
+    # is required for it to take effect.
+    hallucination_silence_s=float(os.environ.get("LIVE_HALLUCINATION_SILENCE_S", "2.0")),
 )
 
 
