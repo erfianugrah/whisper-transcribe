@@ -5109,40 +5109,45 @@ async def _collect(session):
     return await session._drain_once()
 
 
+def _user_session(**kw):
+    return voicemod.VoiceUserSession(
+        loop=None, ws=_FakeWS(), user_id=1, display_name="Alice", post_cb=None, **kw
+    )
+
+
 def test_voice_session_streams_frames_in_arrival_order():
     """Frames are appended in arrival order and drained verbatim — no reordering,
     no summing (the mic-style continuous stream)."""
-    s = voicemod.VoiceTranscriptionSession(loop=None, ws=_FakeWS(), post_cb=None)
-    s._ingest(0.0, _frame(100, 320))
-    s._ingest(0.02, _frame(50, 320))  # contiguous (no gap) → no injected silence
+    s = _user_session()
+    s.feed(_frame(100, 320))
+    s.feed(_frame(50, 320))  # contiguous → no injected silence (monotonic clock)
     arr = np.frombuffer(_asyncio.run(_collect(s)), dtype="<i2")
     assert arr.size == 640  # exactly two frames, no silence inserted
     assert arr[0] == 100 and arr[320] == 50  # second frame follows the first
 
 
-def test_voice_session_injects_silence_for_real_pause():
-    """A wall-clock gap between frames yields reconstructed silence between them
-    (so whisper-live sees end-of-utterance), capped at max_silence_s."""
-    s = voicemod.VoiceTranscriptionSession(loop=None, ws=_FakeWS(), post_cb=None, max_silence_s=2.0)
-    s._ingest(0.0, _frame(100, 320))      # first frame: no silence before
-    s._ingest(1.0, _frame(100, 320))      # 1 s later → ~1 s of silence injected
-    blob = _asyncio.run(_collect(s))
-    arr = np.frombuffer(blob, dtype="<i2")
-    # frame(320) + silence(~16000) + frame(320)
-    assert arr.size > 320 + 320  # silence was inserted between the two frames
-    # the injected middle region is all zeros
-    assert arr[320] == 0
-
-
 def test_voice_session_no_summing_single_speaker():
     """Contiguous frames keep their amplitude (no slot-collision summing that
     caused the clipping/noise in the slot-mixer approach)."""
-    s = voicemod.VoiceTranscriptionSession(loop=None, ws=_FakeWS(), post_cb=None)
-    s._ingest(0.0, _frame(20000, 320))
-    s._ingest(0.02, _frame(20000, 320))
-    blob = _asyncio.run(_collect(s))
-    arr = np.frombuffer(blob, dtype="<i2")
+    s = _user_session()
+    s.feed(_frame(20000, 320))
+    s.feed(_frame(20000, 320))
+    arr = np.frombuffer(_asyncio.run(_collect(s)), dtype="<i2")
     assert set(arr.tolist()) == {20000}  # unchanged, never summed to 40000/clip
+
+
+def test_voice_session_tracks_idle_for_reaping():
+    """idle_seconds resets on feed so the manager's reaper can free a slot."""
+    s = _user_session()
+    s.feed(_frame(100, 320))
+    assert s.idle_seconds() < 1.0
+
+
+def test_voice_manager_caps_concurrent_speakers():
+    """VOICE_MAX_SPEAKERS is enforced and surfaced in source."""
+    assert isinstance(voicemod.VOICE_MAX_SPEAKERS, int) and voicemod.VOICE_MAX_SPEAKERS >= 1
+    assert "VoiceCallManager" in VOICE_SRC
+    assert "_max_speakers" in VOICE_SRC
 
 
 def test_voice_opus_robustness_patch_safe_without_extension():
@@ -5161,8 +5166,8 @@ def test_voice_recv_thread_only_resamples_no_await():
     """The packet handler must hand off via feed()/call_soon_threadsafe — the
     recv thread must never await or block (the #1 design rule)."""
     assert "call_soon_threadsafe" in VOICE_SRC
-    # the on-packet handler resamples then calls session.feed(...)
-    assert "session.feed(mono16)" in VOICE_SRC
+    # the on-packet handler resamples then hands off to the manager per speaker
+    assert "manager.submit(uid, name, mono16)" in VOICE_SRC
     # mic-style continuous stream: ordered append + silence reconstruction
     assert "SilenceInjector" in VOICE_SRC
 

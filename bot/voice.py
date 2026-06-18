@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 
 import numpy as np
 
@@ -63,6 +64,14 @@ WHISPER_LIVE_WS = WHISPER_LIVE_URL.replace("http://", "ws://", 1).replace(
 VOICE_TRANSCRIPT_CHANNEL_ID = int(
     os.environ.get("VOICE_TRANSCRIPT_CHANNEL_ID", "0") or "0"
 )
+# Max simultaneous per-speaker transcription streams (each uses one whisper-live
+# slot; whisper-live's LIVE_MAX_STREAMS caps the pool, default 4).
+VOICE_MAX_SPEAKERS = int(os.environ.get("VOICE_MAX_SPEAKERS", "4"))
+# Close a speaker's stream after this many seconds of silence, freeing the slot
+# for another speaker and flushing their final utterance.
+VOICE_SPEAKER_IDLE_S = float(os.environ.get("VOICE_SPEAKER_IDLE_S", "45"))
+# How often each speaker's sender drains buffered PCM to whisper-live (latency).
+VOICE_SEND_INTERVAL = float(os.environ.get("VOICE_SEND_INTERVAL", "0.15"))
 
 
 _CONSENT_NOTICE = (
@@ -243,63 +252,52 @@ def install_opus_robustness_patch() -> bool:
     return True
 
 
-class VoiceTranscriptionSession:
-    """Streams Discord voice to whisper-live exactly like the browser-mic Live
-    tab does — one continuous, in-order 16 kHz mono PCM stream.
+class VoiceUserSession:
+    """One speaker's continuous 16 kHz mono stream to whisper-live.
 
-    Audio arrives on the receive (router) thread via `feed()`, which only
-    resamples and hands the frame to the event loop (never blocks/awaits — the
-    router thread must stay non-blocking). The event loop appends frames to a
-    queue **in arrival order** (the library's per-speaker jitter buffer already
-    delivers them sequenced), inserting reconstructed silence for real pauses
-    (`SilenceInjector`) so whisper-live can detect end-of-utterance. A sender
-    task drains the queue to the WebSocket; a reader task posts committed
-    utterances to Discord.
-
-    NOTE: this is a single mixed stream. Concurrent speakers interleave rather
-    than sum (true overlap mixing + per-speaker attribution is Phase 2). For the
-    common turn-taking case this produces clean, intelligible audio — matching
-    the proven mic path instead of reinventing timing/mixing.
+    Mirrors the browser-mic Live tab: resampled frames are appended in arrival
+    order (the per-speaker jitter buffer already sequences them), real pauses
+    are reconstructed with `SilenceInjector` (so whisper-live detects
+    end-of-utterance), a sender task streams the queue to the socket, and a
+    reader task posts each committed utterance — attributed to this speaker and
+    timestamped — via `post_cb(display_name, text)`.
     """
 
-    SEND_INTERVAL = 0.25  # how often the sender drains the queue to the WS
-
-    def __init__(self, loop, ws, post_cb, max_silence_s: float = VOICE_MAX_SILENCE_S):
+    def __init__(self, loop, ws, user_id, display_name, post_cb,
+                 max_silence_s: float = VOICE_MAX_SILENCE_S,
+                 send_interval: float = VOICE_SEND_INTERVAL):
         self._loop = loop
         self._ws = ws
-        self._post_cb = post_cb  # async fn(text: str)
+        self.user_id = user_id
+        self.display_name = display_name
+        self._post_cb = post_cb  # async fn(display_name: str, text: str)
         self._queue: "asyncio.Queue[bytes]" = asyncio.Queue()
         self._injector = SilenceInjector(max_silence_s=max_silence_s)
+        self._send_interval = send_interval
         self._stop = asyncio.Event()
         self._sender_task = None
         self._reader_task = None
-        self._sent_bytes = 0
+        self._last_audio = time.monotonic()
 
-    # — recv thread —
+    # — event loop (called from the manager, which is fed off the recv thread) —
     def feed(self, mono16: bytes) -> None:
-        """Enqueue one resampled 16 kHz mono frame, in arrival order. Called
-        off-loop on the recv thread; no awaits, no blocking."""
         if not mono16:
             return
-        try:
-            self._loop.call_soon_threadsafe(self._ingest, time.monotonic(), mono16)
-        except RuntimeError:
-            pass  # loop closed mid-call
-
-    # — event loop —
-    def _ingest(self, now: float, mono16: bytes) -> None:
+        self._last_audio = time.monotonic()
         frame_s = (len(mono16) // 2) / TARGET_SAMPLE_RATE
-        sil = self._injector.silence_before(now, frame_s)
+        sil = self._injector.silence_before(time.monotonic(), frame_s)
         if sil:
             self._queue.put_nowait(sil)
         self._queue.put_nowait(mono16)
+
+    def idle_seconds(self) -> float:
+        return time.monotonic() - self._last_audio
 
     def start(self) -> None:
         self._sender_task = self._loop.create_task(self._sender_loop())
         self._reader_task = self._loop.create_task(self._reader_loop())
 
     async def _drain_once(self) -> bytes:
-        """Concatenate everything currently queued into one PCM blob."""
         parts = []
         while not self._queue.empty():
             parts.append(self._queue.get_nowait())
@@ -308,15 +306,14 @@ class VoiceTranscriptionSession:
     async def _sender_loop(self) -> None:
         try:
             while not self._stop.is_set():
-                await asyncio.sleep(self.SEND_INTERVAL)
+                await asyncio.sleep(self._send_interval)
                 pcm = await self._drain_once()
                 if pcm:
-                    self._sent_bytes += len(pcm)
                     await self._ws.send_bytes(pcm)
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            log.error("voice: sender loop error: %s", e)
+            log.error("voice: sender loop error (%s): %s", self.display_name, e)
 
     async def _reader_loop(self) -> None:
         import aiohttp
@@ -335,33 +332,29 @@ class VoiceTranscriptionSession:
                             line = " ".join(pending).strip()
                             pending.clear()
                             if line:
-                                await self._post_cb(line)
+                                await self._post_cb(self.display_name, line)
                     elif t == "done":
                         break
                     elif t == "error":
                         log.error("voice: whisper-live error: %s", data.get("message"))
-                        await self._post_cb(
-                            "⚠️ transcription backend rejected the stream: "
-                            f"{data.get('message')}"
-                        )
                         break
                 elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
                     break
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            log.error("voice: reader loop error: %s", e)
+            log.error("voice: reader loop error (%s): %s", self.display_name, e)
         finally:
             if pending:
                 line = " ".join(pending).strip()
                 if line:
                     try:
-                        await self._post_cb(line)
+                        await self._post_cb(self.display_name, line)
                     except Exception:
                         pass
 
     async def close(self) -> None:
-        """Flush remaining audio, signal whisper-live done, drain final commits."""
+        """Flush remaining audio, signal done, drain final commits, close WS."""
         self._stop.set()
         if self._sender_task:
             self._sender_task.cancel()
@@ -377,6 +370,125 @@ class VoiceTranscriptionSession:
                 await asyncio.wait_for(self._reader_task, timeout=10)
             except Exception:
                 self._reader_task.cancel()
+        try:
+            await self._ws.close()
+        except Exception:
+            pass
+
+
+class VoiceCallManager:
+    """Fans Discord voice out to one whisper-live stream per active speaker and
+    posts attributed, timestamped lines to a per-call thread.
+
+    `feed(uid, name, mono16)` runs on the event loop (scheduled off the recv
+    thread). The first frame from a new speaker opens a dedicated whisper-live
+    socket (capacity-gated by VOICE_MAX_SPEAKERS); a reaper closes streams idle
+    for VOICE_SPEAKER_IDLE_S to free slots. Idle speakers re-open transparently
+    when they speak again.
+    """
+
+    def __init__(self, loop, http, ws_url, thread,
+                 max_speakers: int = VOICE_MAX_SPEAKERS,
+                 max_silence_s: float = VOICE_MAX_SILENCE_S):
+        self._loop = loop
+        self._http = http
+        self._ws_url = ws_url
+        self._thread = thread
+        self._max_speakers = max_speakers
+        self._max_silence_s = max_silence_s
+        self._sessions: dict[int, VoiceUserSession] = {}
+        self._creating: set[int] = set()
+        self._pending: dict[int, list[bytes]] = {}
+        self._capacity_notified = False
+        self._stop = asyncio.Event()
+        self._reaper_task = loop.create_task(self._reaper())
+
+    # — recv thread —
+    def submit(self, uid: int, name: str, mono16: bytes) -> None:
+        if not mono16 or not uid:
+            return
+        try:
+            self._loop.call_soon_threadsafe(self.feed, uid, name, mono16)
+        except RuntimeError:
+            pass  # loop closed mid-call
+
+    # — event loop —
+    def feed(self, uid: int, name: str, mono16: bytes) -> None:
+        sess = self._sessions.get(uid)
+        if sess is not None:
+            sess.feed(mono16)
+            return
+        if uid in self._creating:
+            self._pending.setdefault(uid, []).append(mono16)
+            return
+        if len(self._sessions) >= self._max_speakers:
+            if not self._capacity_notified:
+                self._capacity_notified = True
+                self._loop.create_task(self._post(
+                    f"⚠️ More than {self._max_speakers} people speaking at once — "
+                    "some audio isn't being transcribed."))
+            return
+        self._creating.add(uid)
+        self._pending.setdefault(uid, []).append(mono16)
+        self._loop.create_task(self._open(uid, name))
+
+    async def _open(self, uid: int, name: str) -> None:
+        try:
+            ws = await self._http.ws_connect(f"{self._ws_url}/ws-stream", timeout=30)
+        except Exception as e:
+            log.error("voice: failed to open whisper-live stream for %s: %s", name, e)
+            self._creating.discard(uid)
+            self._pending.pop(uid, None)
+            return
+        sess = VoiceUserSession(
+            self._loop, ws, uid, name, self._post_line, self._max_silence_s)
+        sess.start()
+        self._sessions[uid] = sess
+        self._creating.discard(uid)
+        for frame in self._pending.pop(uid, []):
+            sess.feed(frame)
+        log.info("voice: opened stream for %s (%d active)", name, len(self._sessions))
+
+    async def _post_line(self, name: str, text: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        await self._post(f"`[{ts}]` **{name}:** {text}")
+
+    async def _post(self, body: str) -> None:
+        try:
+            await self._thread.send(body[:2000])
+        except Exception as e:
+            log.error("voice: failed to post to thread: %s", e)
+
+    async def _reaper(self) -> None:
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(5)
+                for uid, sess in list(self._sessions.items()):
+                    if sess.idle_seconds() > VOICE_SPEAKER_IDLE_S:
+                        self._sessions.pop(uid, None)
+                        self._loop.create_task(self._reap_close(sess))
+        except asyncio.CancelledError:
+            pass
+
+    async def _reap_close(self, sess: VoiceUserSession) -> None:
+        try:
+            await sess.close()
+            log.info("voice: closed idle stream for %s (%d active)",
+                     sess.display_name, len(self._sessions))
+        except Exception:
+            pass
+
+    async def close(self) -> None:
+        self._stop.set()
+        if self._reaper_task:
+            self._reaper_task.cancel()
+        sessions = list(self._sessions.values())
+        self._sessions.clear()
+        for sess in sessions:
+            try:
+                await sess.close()
+            except Exception:
+                pass
 
 
 def opus_loaded() -> bool:
@@ -413,8 +525,8 @@ def register_voice_commands(bot) -> bool:
     import aiohttp
     import discord
 
-    # Per-guild live state: guild_id -> {"session", "http", "ws"} so /leave can
-    # tear everything down cleanly even across reconnects.
+    # Per-guild live state: guild_id -> {"manager", "http", "thread"} so /leave
+    # can tear everything down cleanly even across reconnects.
     _live: dict[int, dict] = {}
 
     def _resolve_post_channel(interaction):
@@ -451,27 +563,19 @@ def register_voice_commands(bot) -> bool:
         post_channel = _resolve_post_channel(interaction)
         loop = asyncio.get_running_loop()
 
-        async def _post(line: str) -> None:
-            try:
-                await post_channel.send(line[:2000])
-            except Exception as e:
-                log.error("voice: failed to post transcript line: %s", e)
-
-        # Open the whisper-live streaming socket BEFORE joining voice, so a
-        # backend outage fails the command cleanly (no orphaned VC connection).
-        client = aiohttp.ClientSession()
+        # Create a per-call thread so each session's transcript is self-contained.
+        # Falls back to posting in the channel if the bot lacks thread perms.
+        thread = post_channel
         try:
-            ws = await client.ws_connect(f"{WHISPER_LIVE_WS}/ws-stream", timeout=30)
-        except Exception as e:
-            await client.close()
-            log.error("voice: could not reach whisper-live /ws-stream: %s", e)
-            await interaction.followup.send(
-                "❌ Couldn't reach the transcription backend (whisper-live). Try again later.",
-                ephemeral=True,
+            thread = await post_channel.create_thread(
+                name=f"\U0001f399\ufe0f {channel.name} — {datetime.now():%Y-%m-%d %H:%M}",
+                type=discord.ChannelType.public_thread,
             )
-            return
+        except Exception as e:
+            log.warning("voice: could not create thread (%s) — posting in channel", e)
 
-        session = VoiceTranscriptionSession(loop, ws, _post)
+        client = aiohttp.ClientSession()
+        manager = VoiceCallManager(loop, client, WHISPER_LIVE_WS, thread)
         vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
 
         def _on_packet(speaker, data) -> None:
@@ -480,28 +584,27 @@ def register_voice_commands(bot) -> bool:
                 pcm = getattr(data, "pcm", None)
                 if not pcm:
                     return
+                uid = getattr(speaker, "id", 0) or 0
+                name = (getattr(speaker, "display_name", None)
+                        or getattr(speaker, "name", None) or "Unknown")
                 mono16 = resample_48k_stereo_to_16k_mono(pcm)
-                if mono16:
-                    session.feed(mono16)
+                if mono16 and uid:
+                    manager.submit(uid, name, mono16)
             except Exception as e:  # never raise on the recv thread
                 log.debug("voice: packet handler error: %s", e)
 
-        session.start()
         vc.listen(voice_recv.BasicSink(_on_packet))
-        _live[interaction.guild.id] = {"session": session, "http": client, "ws": ws}
+        _live[interaction.guild.id] = {"manager": manager, "http": client, "thread": thread}
 
-        await post_channel.send(_CONSENT_NOTICE)
-        where = (
-            f" Transcript → <#{post_channel.id}>."
-            if post_channel.id != channel.id else ""
-        )
+        await thread.send(_CONSENT_NOTICE)
         await interaction.followup.send(
-            f"Joined **{channel.name}** — live transcription active.{where}",
+            f"Joined **{channel.name}** — live transcription active. "
+            f"Transcript → {thread.mention if hasattr(thread, 'mention') else ''}",
             ephemeral=True,
         )
         log.info(
-            "voice: joined %s (guild %s) → streaming to whisper-live, posting in %s",
-            channel.name, interaction.guild.id, post_channel.id,
+            "voice: joined %s (guild %s) → per-speaker streams, thread=%s",
+            channel.name, interaction.guild.id, getattr(thread, "id", "?"),
         )
 
     @bot.tree.command(
@@ -521,20 +624,25 @@ def register_voice_commands(bot) -> bool:
         except Exception:
             pass
         state = _live.pop(interaction.guild.id, None)
+        thread = None
         if state:
+            thread = state.get("thread")
             try:
-                await state["session"].close()
+                await state["manager"].close()
             except Exception as e:
-                log.debug("voice: session close error: %s", e)
-            try:
-                await state["ws"].close()
-            except Exception:
-                pass
+                log.debug("voice: manager close error: %s", e)
             try:
                 await state["http"].close()
             except Exception:
                 pass
         await vc.disconnect()
+        # Archive the per-call thread so it drops out of the active list.
+        if thread is not None and hasattr(thread, "edit") and thread is not interaction.channel:
+            try:
+                await thread.send("— transcription ended —")
+                await thread.edit(archived=True)
+            except Exception:
+                pass
         await interaction.followup.send("Left the voice channel.", ephemeral=True)
         log.info("voice: left voice channel (guild %s)", interaction.guild.id)
 
