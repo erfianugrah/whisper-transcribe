@@ -5083,6 +5083,90 @@ def test_voice_requirements_and_dockerfile():
     assert "voice.py" in dockerfile  # copied into the image
 
 
+# ─── Voice transcription (Phase 1: mixer + streaming) ───────────
+import asyncio as _asyncio  # noqa: E402
+
+
+class _FakeWS:
+    """Captures bytes sent over the (faked) whisper-live socket."""
+    def __init__(self):
+        self.sent = []
+        self.strings = []
+
+    async def send_bytes(self, b):
+        self.sent.append(b)
+
+    async def send_str(self, s):
+        self.strings.append(s)
+
+
+def _frame(value, n=320):
+    return np.full(n, value, dtype="<i2").tobytes()
+
+
+async def _collect(session):
+    """Drain the session's queue into one PCM blob (mirrors _sender_loop)."""
+    return await session._drain_once()
+
+
+def test_voice_session_streams_frames_in_arrival_order():
+    """Frames are appended in arrival order and drained verbatim — no reordering,
+    no summing (the mic-style continuous stream)."""
+    s = voicemod.VoiceTranscriptionSession(loop=None, ws=_FakeWS(), post_cb=None)
+    s._ingest(0.0, _frame(100, 320))
+    s._ingest(0.02, _frame(50, 320))  # contiguous (no gap) → no injected silence
+    arr = np.frombuffer(_asyncio.run(_collect(s)), dtype="<i2")
+    assert arr.size == 640  # exactly two frames, no silence inserted
+    assert arr[0] == 100 and arr[320] == 50  # second frame follows the first
+
+
+def test_voice_session_injects_silence_for_real_pause():
+    """A wall-clock gap between frames yields reconstructed silence between them
+    (so whisper-live sees end-of-utterance), capped at max_silence_s."""
+    s = voicemod.VoiceTranscriptionSession(loop=None, ws=_FakeWS(), post_cb=None, max_silence_s=2.0)
+    s._ingest(0.0, _frame(100, 320))      # first frame: no silence before
+    s._ingest(1.0, _frame(100, 320))      # 1 s later → ~1 s of silence injected
+    blob = _asyncio.run(_collect(s))
+    arr = np.frombuffer(blob, dtype="<i2")
+    # frame(320) + silence(~16000) + frame(320)
+    assert arr.size > 320 + 320  # silence was inserted between the two frames
+    # the injected middle region is all zeros
+    assert arr[320] == 0
+
+
+def test_voice_session_no_summing_single_speaker():
+    """Contiguous frames keep their amplitude (no slot-collision summing that
+    caused the clipping/noise in the slot-mixer approach)."""
+    s = voicemod.VoiceTranscriptionSession(loop=None, ws=_FakeWS(), post_cb=None)
+    s._ingest(0.0, _frame(20000, 320))
+    s._ingest(0.02, _frame(20000, 320))
+    blob = _asyncio.run(_collect(s))
+    arr = np.frombuffer(blob, dtype="<i2")
+    assert set(arr.tolist()) == {20000}  # unchanged, never summed to 40000/clip
+
+
+def test_voice_opus_robustness_patch_safe_without_extension():
+    """install_opus_robustness_patch no-ops (returns False) when the extension
+    is absent (the test host) — never raises."""
+    assert voicemod.install_opus_robustness_patch() is False
+
+
+def test_voice_streams_to_ws_stream_endpoint():
+    assert "/ws-stream" in VOICE_SRC
+    assert "install_opus_robustness_patch()" in VOICE_SRC  # wired into register
+    assert "VOICE_TRANSCRIPT_CHANNEL_ID" in VOICE_SRC
+
+
+def test_voice_recv_thread_only_resamples_no_await():
+    """The packet handler must hand off via feed()/call_soon_threadsafe — the
+    recv thread must never await or block (the #1 design rule)."""
+    assert "call_soon_threadsafe" in VOICE_SRC
+    # the on-packet handler resamples then calls session.feed(...)
+    assert "session.feed(mono16)" in VOICE_SRC
+    # mic-style continuous stream: ordered append + silence reconstruction
+    assert "SilenceInjector" in VOICE_SRC
+
+
 # ─── Test runner ─────────────────────────────────────────────────────────────
 
 
