@@ -5172,6 +5172,90 @@ def test_voice_recv_thread_only_resamples_no_await():
     assert "SilenceInjector" in VOICE_SRC
 
 
+# ─── Voice transcript cleanup (export + delete + auto-purge) ─────
+class _FakeThread:
+    """Minimal stand-in for a discord.Thread for cleanup-predicate tests."""
+    def __init__(self, tid, owner_id, name, created_at=None):
+        self.id = tid
+        self.owner_id = owner_id
+        self.name = name
+        self.created_at = created_at
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
+
+
+class _FakeChannel:
+    def __init__(self, threads):
+        self.threads = threads
+
+    def archived_threads(self, limit=None):
+        async def _gen():
+            for _ in ():
+                yield _
+        return _gen()
+
+
+MIC = "\U0001f399"
+BOT_ID = 999
+
+
+def test_voice_is_bot_call_thread_predicate():
+    """Only bot-owned threads carrying the 🎙️ prefix are ours — both guards
+    required so cleanup never touches a human-made thread."""
+    ours = _FakeThread(1, BOT_ID, f"{MIC} General — 2026-06-18 11:00")
+    human = _FakeThread(2, 123, f"{MIC} fake")           # right name, wrong owner
+    botother = _FakeThread(3, BOT_ID, "random thread")    # right owner, no prefix
+    assert voicemod._is_bot_call_thread(ours, BOT_ID) is True
+    assert voicemod._is_bot_call_thread(human, BOT_ID) is False
+    assert voicemod._is_bot_call_thread(botother, BOT_ID) is False
+
+
+def test_voice_purge_respects_age_and_ownership():
+    """_purge_old_threads deletes only old bot-owned threads; recent ones and
+    human threads survive."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    old = _FakeThread(1, BOT_ID, f"{MIC} a", created_at=now - timedelta(days=10))
+    recent = _FakeThread(2, BOT_ID, f"{MIC} b", created_at=now - timedelta(days=1))
+    human = _FakeThread(3, 123, f"{MIC} c", created_at=now - timedelta(days=99))
+    ch = _FakeChannel([old, recent, human])
+    n = _asyncio.run(voicemod._purge_old_threads(ch, BOT_ID, older_than_days=7))
+    assert n == 1
+    assert old.deleted is True
+    assert recent.deleted is False  # inside retention window
+    assert human.deleted is False   # not bot-owned
+
+
+def test_voice_purge_zero_days_wipes_all_bot_threads():
+    """older_than_days<=0 is the one-off bulk wipe: every bot-owned thread goes,
+    regardless of age; human threads still survive."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    a = _FakeThread(1, BOT_ID, f"{MIC} a", created_at=now)
+    b = _FakeThread(2, BOT_ID, f"{MIC} b", created_at=now)
+    human = _FakeThread(3, 123, f"{MIC} c", created_at=now)
+    ch = _FakeChannel([a, b, human])
+    n = _asyncio.run(voicemod._purge_old_threads(ch, BOT_ID, older_than_days=0))
+    assert n == 2
+    assert a.deleted and b.deleted and not human.deleted
+
+
+def test_voice_cleanup_surface_present():
+    """Export/Delete buttons, the /transcribe-cleanup command, and the auto-purge
+    loop are all wired into the source."""
+    assert 'custom_id="voice:export"' in VOICE_SRC
+    assert 'custom_id="voice:delete"' in VOICE_SRC
+    assert "TranscriptControlView" in VOICE_SRC
+    assert "bot.add_view(" in VOICE_SRC          # persistent across restarts
+    assert 'name="transcribe-cleanup"' in VOICE_SRC
+    assert "voice_transcript_cleanup_loop" in VOICE_SRC
+    assert hasattr(voicemod, "VOICE_TRANSCRIPT_RETENTION_DAYS")
+    # delete is permission-gated (Manage Threads / Manage Messages)
+    assert "manage_threads" in VOICE_SRC
+
+
 # ─── Test runner ─────────────────────────────────────────────────────────────
 
 

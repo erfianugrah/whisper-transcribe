@@ -21,7 +21,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
@@ -72,6 +72,17 @@ VOICE_MAX_SPEAKERS = int(os.environ.get("VOICE_MAX_SPEAKERS", "4"))
 VOICE_SPEAKER_IDLE_S = float(os.environ.get("VOICE_SPEAKER_IDLE_S", "45"))
 # How often each speaker's sender drains buffered PCM to whisper-live (latency).
 VOICE_SEND_INTERVAL = float(os.environ.get("VOICE_SEND_INTERVAL", "0.15"))
+# Per-call transcript threads older than this are deleted by the background
+# cleanup loop. 0 (or VOICE_TRANSCRIPT_CHANNEL_ID unset) disables auto-purge.
+VOICE_TRANSCRIPT_RETENTION_DAYS = float(
+    os.environ.get("VOICE_TRANSCRIPT_RETENTION_DAYS", "7")
+)
+# How often the auto-purge loop runs.
+VOICE_CLEANUP_INTERVAL_H = float(os.environ.get("VOICE_CLEANUP_INTERVAL_H", "6"))
+
+# Per-call threads are named "🎙️ <channel> — <date> <time>"; this prefix plus
+# bot ownership is how cleanup distinguishes our threads from human-made ones.
+_THREAD_NAME_PREFIX = "\U0001f399"
 
 
 _CONSENT_NOTICE = (
@@ -505,6 +516,130 @@ def opus_loaded() -> bool:
         return False
 
 
+# ── Transcript export + thread cleanup ──────────────────────────────────────
+def _is_bot_call_thread(thread, bot_user_id: int) -> bool:
+    """True only for per-call transcript threads WE created.
+
+    Two guards so cleanup never touches a human-made thread: the thread must be
+    owned by the bot AND carry the 🎙️ name prefix that `/transcribe-join` uses.
+    """
+    try:
+        owner_ok = getattr(thread, "owner_id", None) == bot_user_id
+        name_ok = (getattr(thread, "name", "") or "").startswith(_THREAD_NAME_PREFIX)
+        return bool(owner_ok and name_ok)
+    except Exception:
+        return False
+
+
+async def _build_transcript_file(thread):
+    """Read a thread's full history (oldest-first) into a downloadable .txt File.
+
+    Skips the consent notice and the control/marker lines so the export is just
+    the attributed transcript. Returns (discord.File, line_count) or (None, 0).
+    """
+    import io
+
+    import discord
+
+    lines: list[str] = []
+    try:
+        async for msg in thread.history(limit=None, oldest_first=True):
+            content = (msg.content or "").strip()
+            if not content:
+                continue
+            if content.startswith("\U0001f534"):  # 🔴 consent notice
+                continue
+            if content in ("— transcription ended —",):
+                continue
+            if content.startswith("— ") and content.endswith(" —"):
+                continue
+            lines.append(content)
+    except Exception as e:
+        log.error("voice: transcript export read failed: %s", e)
+        return None, 0
+    if not lines:
+        return None, 0
+    header = (
+        f"# Transcript — {getattr(thread, 'name', 'voice call')}\n"
+        f"# exported {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC}\n\n"
+    )
+    body = header + "\n".join(lines) + "\n"
+    buf = io.BytesIO(body.encode("utf-8"))
+    fname = f"transcript-{getattr(thread, 'id', 'call')}.txt"
+    return discord.File(buf, filename=fname), len(lines)
+
+
+async def _iter_call_threads(channel, bot_user_id: int):
+    """Yield every bot-created per-call thread in `channel` (active + archived)."""
+    seen: set[int] = set()
+    for t in list(getattr(channel, "threads", []) or []):
+        if _is_bot_call_thread(t, bot_user_id):
+            seen.add(t.id)
+            yield t
+    try:
+        async for t in channel.archived_threads(limit=None):
+            if t.id in seen:
+                continue
+            if _is_bot_call_thread(t, bot_user_id):
+                yield t
+    except Exception as e:
+        log.debug("voice: archived_threads scan failed: %s", e)
+
+
+async def _purge_old_threads(channel, bot_user_id: int, older_than_days: float) -> int:
+    """Delete bot-created call threads older than `older_than_days`.
+
+    `older_than_days <= 0` deletes ALL bot-created call threads (the one-off
+    bulk wipe). Returns the number of threads deleted.
+    """
+    cutoff = None
+    if older_than_days > 0:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=older_than_days)
+    deleted = 0
+    async for t in _iter_call_threads(channel, bot_user_id):
+        created = getattr(t, "created_at", None)
+        if cutoff is not None and created is not None and created > cutoff:
+            continue
+        try:
+            await t.delete()
+            deleted += 1
+        except Exception as e:
+            log.warning("voice: failed to delete thread %s: %s", getattr(t, "id", "?"), e)
+    return deleted
+
+
+async def voice_transcript_cleanup_loop(bot) -> None:
+    """Background loop: delete per-call threads older than the retention window.
+
+    No-op unless a dedicated transcript channel is configured and retention > 0
+    (without a fixed channel we can't safely know which threads are ours).
+    """
+    if not VOICE_TRANSCRIPT_CHANNEL_ID or VOICE_TRANSCRIPT_RETENTION_DAYS <= 0:
+        log.info(
+            "voice: transcript auto-purge disabled "
+            "(channel=%s retention_days=%s)",
+            VOICE_TRANSCRIPT_CHANNEL_ID, VOICE_TRANSCRIPT_RETENTION_DAYS,
+        )
+        return
+    await bot.wait_until_ready()
+    interval_s = max(300.0, VOICE_CLEANUP_INTERVAL_H * 3600.0)
+    while not bot.is_closed():
+        try:
+            channel = bot.get_channel(VOICE_TRANSCRIPT_CHANNEL_ID)
+            if channel is not None:
+                n = await _purge_old_threads(
+                    channel, bot.user.id, VOICE_TRANSCRIPT_RETENTION_DAYS
+                )
+                if n:
+                    log.info(
+                        "voice: auto-purge removed %d transcript thread(s) older "
+                        "than %s day(s)", n, VOICE_TRANSCRIPT_RETENTION_DAYS,
+                    )
+        except Exception as e:
+            log.error("voice: cleanup loop error: %s", e)
+        await asyncio.sleep(interval_s)
+
+
 def register_voice_commands(bot) -> bool:
     """Register /transcribe-join + /transcribe-leave. Returns whether enabled.
 
@@ -528,6 +663,62 @@ def register_voice_commands(bot) -> bool:
     # Per-guild live state: guild_id -> {"manager", "http", "thread"} so /leave
     # can tear everything down cleanly even across reconnects.
     _live: dict[int, dict] = {}
+
+    # ── Per-thread control buttons (Export / Delete) ────────────────────────
+    # Persistent view: static custom_ids + timeout=None so the buttons keep
+    # working after a bot restart. The interaction's channel IS the thread the
+    # button lives in, so no per-thread state needs to survive.
+    class TranscriptControlView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=None)
+
+        @discord.ui.button(
+            label="Export", emoji="\U0001f4c4",
+            style=discord.ButtonStyle.secondary,
+            custom_id="voice:export",
+        )
+        async def export(self, interaction, button):
+            await interaction.response.defer(ephemeral=True)
+            thread = interaction.channel
+            file, n = await _build_transcript_file(thread)
+            if file is None:
+                await interaction.followup.send(
+                    "Nothing to export — this transcript is empty.", ephemeral=True
+                )
+                return
+            await interaction.followup.send(
+                f"📄 Transcript export — {n} line(s).", file=file, ephemeral=True
+            )
+
+        @discord.ui.button(
+            label="Delete", emoji="\U0001f5d1\ufe0f",
+            style=discord.ButtonStyle.danger,
+            custom_id="voice:delete",
+        )
+        async def delete(self, interaction, button):
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and (perms.manage_threads or perms.manage_messages)):
+                await interaction.response.send_message(
+                    "You need **Manage Threads** to delete this transcript.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                "Deleting this transcript thread…", ephemeral=True
+            )
+            try:
+                await interaction.channel.delete()
+            except Exception as e:
+                log.warning("voice: button delete failed: %s", e)
+
+    # Register the persistent view so its buttons survive restarts.
+    try:
+        bot.add_view(TranscriptControlView())
+    except Exception as e:
+        log.debug("voice: add_view failed (already registered?): %s", e)
+
+    # Background auto-purge of old transcript threads (no-op unless configured).
+    bot.loop.create_task(voice_transcript_cleanup_loop(bot))
 
     def _resolve_post_channel(interaction):
         """Where transcript lines go: the configured channel, else the invoking one."""
@@ -636,15 +827,48 @@ def register_voice_commands(bot) -> bool:
             except Exception:
                 pass
         await vc.disconnect()
-        # Archive the per-call thread so it drops out of the active list.
-        if thread is not None and hasattr(thread, "edit") and thread is not interaction.channel:
+        # Post Export/Delete controls, then archive so it drops out of the
+        # active-threads list (auto-purge deletes it after the retention window).
+        if thread is not None and hasattr(thread, "send") and thread is not interaction.channel:
             try:
-                await thread.send("— transcription ended —")
+                await thread.send(
+                    "— transcription ended — use the buttons to export or delete this thread.",
+                    view=TranscriptControlView(),
+                )
                 await thread.edit(archived=True)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("voice: leave finalize failed: %s", e)
         await interaction.followup.send("Left the voice channel.", ephemeral=True)
         log.info("voice: left voice channel (guild %s)", interaction.guild.id)
 
-    log.info("voice: /transcribe-join + /transcribe-leave registered")
+    @bot.tree.command(
+        name="transcribe-cleanup",
+        description="Delete old voice-transcript threads (admin). older_than_days=0 wipes all.",
+    )
+    async def transcribe_cleanup(interaction: "discord.Interaction", older_than_days: float = -1.0):
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if not (perms and (perms.manage_threads or perms.manage_messages)):
+            await interaction.response.send_message(
+                "You need **Manage Threads** to run cleanup.", ephemeral=True
+            )
+            return
+        # Default (unset) → use the configured retention window.
+        days = VOICE_TRANSCRIPT_RETENTION_DAYS if older_than_days < 0 else older_than_days
+        channel = _resolve_post_channel(interaction)
+        await interaction.response.defer(ephemeral=True)
+        try:
+            n = await _purge_old_threads(channel, bot.user.id, days)
+        except Exception as e:
+            log.error("voice: /transcribe-cleanup failed: %s", e)
+            await interaction.followup.send(f"Cleanup failed: {e}", ephemeral=True)
+            return
+        scope = "all" if days <= 0 else f"older than {days:g} day(s)"
+        await interaction.followup.send(
+            f"🧹 Deleted **{n}** transcript thread(s) ({scope}).", ephemeral=True
+        )
+        log.info("voice: /transcribe-cleanup removed %d thread(s) (scope=%s)", n, scope)
+
+    log.info(
+        "voice: /transcribe-join + /transcribe-leave + /transcribe-cleanup registered"
+    )
     return True

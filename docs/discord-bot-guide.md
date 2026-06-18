@@ -26,7 +26,8 @@ embeds.
 | `/recent kind:<video\|web> limit:<N>` | Last N cached summaries (newest first). |
 | `/redo video_id:<id>` | Re-run a cached YouTube job with different translate / model. Autocompletes from cache. |
 | `/transcribe-join` | Join your voice channel and live-transcribe it (per-speaker, attributed, timestamped) into a thread. Needs `VOICE_TRANSCRIBE_ENABLED=1`. |
-| `/transcribe-leave` | Stop live transcription, leave the channel, archive the thread. |
+| `/transcribe-leave` | Stop live transcription, leave the channel, archive the thread (with Export/Delete buttons). |
+| `/transcribe-cleanup older_than_days:<N>` | Delete old transcript threads (admin). `0` wipes all. |
 | `/myconfig model:<name> diarize:true` | Your personal defaults — applied in any channel. |
 | `/help topic:<overview\|triggers\|admin\|limits\|errors\|translate>` | Ephemeral help cards. |
 | `/status verbose:true` | Queue depth, service health, plus per-job phase/elapsed when verbose. |
@@ -397,9 +398,36 @@ Consent notice posted on join:
 ```
 
 Flushes any buffered audio, closes every per-speaker stream (freeing the
-whisper-live slots), disconnects from the voice channel, posts
-*“— transcription ended —”*, and archives the thread so it drops out of
-the active list.
+whisper-live slots), disconnects from the voice channel, posts a final
+message with **📄 Export** / **🗑️ Delete** buttons, and archives the thread
+so it drops out of the active list.
+
+### Per-thread buttons
+
+The closing message carries two buttons (they survive bot restarts):
+
+- **📄 Export** — anyone in the thread can download the full transcript as a
+  `.txt` (the export is sent only to the clicker, ephemerally).
+- **🗑️ Delete** — deletes the whole thread. Gated to members with **Manage
+  Threads** (or Manage Messages).
+
+### Cleaning up old transcripts
+
+Three layers, all scoped to bot-created per-call threads (a thread must be
+owned by the bot **and** carry the 🎙️ name prefix — human-made threads are
+never touched):
+
+1. **Automatic retention purge.** A background loop deletes per-call threads
+   older than `VOICE_TRANSCRIPT_RETENTION_DAYS` (default 7), running every
+   `VOICE_CLEANUP_INTERVAL_H` hours. Requires a dedicated
+   `VOICE_TRANSCRIPT_CHANNEL_ID` (without a fixed channel the bot can't know
+   which threads are its own). Set retention to `0` to disable.
+2. **Manual command** — `/transcribe-cleanup older_than_days:<N>` deletes
+   threads older than N days on demand (Manage Threads required). Omit the
+   argument to use the configured retention window.
+3. **One-off bulk wipe** — `/transcribe-cleanup older_than_days:0` deletes
+   **every** bot-created transcript thread in the channel regardless of age.
+   Use this to clear out the backlog the first time.
 
 **Tuning latency.** Snappiness is governed by the bot-side flush cadence
 (`VOICE_SEND_INTERVAL`, `VOICE_MAX_SILENCE_S`) and the whisper-live
@@ -621,6 +649,7 @@ object:
 | New to the bot, need a tour | `/help topic:overview` |
 | Diarized output with renaming | `/transcribe diarize:true` then 🏷️ Rename speakers |
 | Live-transcribe an ongoing voice call | `/transcribe-join` (then `/transcribe-leave` to stop) |
+| Tidy up old voice transcripts | Auto-purge (retention) or `/transcribe-cleanup` (admin); per-thread 🗑️ Delete / 📄 Export buttons |
 
 The auto-paste, reply-trigger, and slash paths all share the same job
 queue, rate limits, and cache. None of them replace each other — pick

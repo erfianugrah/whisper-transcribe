@@ -67,7 +67,7 @@ hosted APIs), override `LLM_API_URL` / `LLM_MODEL` / `LLM_VISION_API_URL`
 - **`litmus` reply trigger** → AI-litmus forensic report (LLM-tic phrases, em-dash density, Wayback domain age, AdSense, author byline; LLM qualitative read on ambiguous middle range)
 - **Silent-video fallback** — VLM frame descriptions when speech density is low
 - **Voice-channel live transcription**: `/transcribe-join` streams the live voice call to whisper-live and posts a running transcript — **one stream per speaker**, attributed by display name and timestamped — into a dedicated per-call thread; `/transcribe-leave` stops. Transparently handles Discord's mandatory DAVE end-to-end voice encryption (discord.py 2.7.1+). See [docs/discord-bot-guide.md](docs/discord-bot-guide.md#voice-channel-live-transcription).
-- **Slash commands**: `/summarize`, `/transcribe`, `/status`, `/find`, `/config`, `/serverconfig`, `/transcribe-join`, `/transcribe-leave`
+- **Slash commands**: `/summarize`, `/transcribe`, `/status`, `/find`, `/config`, `/serverconfig`, `/transcribe-join`, `/transcribe-leave`, `/transcribe-cleanup`
 - **Per-channel + per-guild config**: model override, VLM toggle, YT-comments toggle, diarize default, summary archive channel
 - **Speaker rename**: button on diarized summaries lets users label SPEAKER_xx → real names
 - **Rate limiting**: per-user sliding window + global queue cap
@@ -276,6 +276,8 @@ Used by the SPA mic Live tab and the Discord voice bot (both stream raw 16 kHz m
 | `VOICE_SPEAKER_IDLE_S` | `45` | Close a speaker's stream after this many seconds of silence, freeing a slot (re-opens on next speech). |
 | `VOICE_SEND_INTERVAL` | `0.15` | How often buffered PCM is flushed to whisper-live (lower = snappier, more requests). |
 | `VOICE_MAX_SILENCE_S` | `2.0` | Cap on reconstructed silence injected for a pause (gives whisper-live its end-of-utterance boundary). |
+| `VOICE_TRANSCRIPT_RETENTION_DAYS` | `7` | Auto-purge deletes per-call transcript threads older than this. `0` disables the background purge (also off unless `VOICE_TRANSCRIPT_CHANNEL_ID` is set). |
+| `VOICE_CLEANUP_INTERVAL_H` | `6` | How often the auto-purge loop runs (hours; floored at 5 min). |
 
 Latency is also governed by the whisper-live streaming knobs (`LIVE_PROCESS_INTERVAL`, `LIVE_MIN_CHUNK_S`, `LIVE_TAIL_SILENCE_S` — see the Whisper service table); these are tuned low in `compose.yaml` for snappy live output.
 
