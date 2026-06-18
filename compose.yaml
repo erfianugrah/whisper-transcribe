@@ -150,6 +150,12 @@ services:
       - LIVE_MAX_STREAMS=${LIVE_MAX_STREAMS:-4}
       - LIVE_PORT=7861
       - LIVE_CHUNK_SECONDS=${LIVE_CHUNK_SECONDS:-10}
+      # Lower-latency streaming knobs (snappier live transcription for both the
+      # SPA mic tab and the Discord voice bot). Trade a little more GPU churn
+      # for faster on-screen text. Override via env if GPU contention bites.
+      - LIVE_PROCESS_INTERVAL=${LIVE_PROCESS_INTERVAL:-0.4}
+      - LIVE_MIN_CHUNK_S=${LIVE_MIN_CHUNK_S:-0.5}
+      - LIVE_TAIL_SILENCE_S=${LIVE_TAIL_SILENCE_S:-0.4}
     ports:
       - "7861:7861"
     networks:
