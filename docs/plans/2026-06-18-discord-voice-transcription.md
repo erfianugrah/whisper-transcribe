@@ -8,7 +8,7 @@ Author: erfi
 
 | Phase | State | Notes |
 |---|---|---|
-| 0 — deps + decode proof | ✅ code + tests done | voice.py (guarded import, numpy resample/mix/SilenceInjector, feature-flagged connect+BasicSink), deps+libopus, 16 unit/structural tests green. Live in-call verify + py3.13 image-build gate pending. |
+| 0 — deps + decode proof | ✅ build-verified | voice.py (guarded import, numpy resample/mix/SilenceInjector, feature-flagged connect+BasicSink), deps+libopus, 16 unit/structural tests green (395 total). py3.13 image build OK: discord.py 2.7.1 + voice_recv 0.5.2a179 + PyNaCl 1.5.0 import in-image, libopus.so.0 loads (`discord.opus.is_loaded()==True`). Only live in-call verify (real voice channel) pending. Anti-hallucination silence threshold added to streaming engine (commit 6c1d19b). |
 | 1 — single mixed-stream MVP | ⬜ not started | |
 | 2 — per-user attribution | ⬜ not started | |
 | 3 — summary on leave | ⬜ not started | |
