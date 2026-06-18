@@ -66,7 +66,8 @@ hosted APIs), override `LLM_API_URL` / `LLM_MODEL` / `LLM_VISION_API_URL`
 - **`tldr` reply trigger** on image attachments → EasyOCR + VLM describe + LLM summary. Up to 4 images per message; per-image cap 32MB. Screenshots, documents, memes, photos all supported.
 - **`litmus` reply trigger** → AI-litmus forensic report (LLM-tic phrases, em-dash density, Wayback domain age, AdSense, author byline; LLM qualitative read on ambiguous middle range)
 - **Silent-video fallback** — VLM frame descriptions when speech density is low
-- **Slash commands**: `/summarize`, `/transcribe`, `/status`, `/find`, `/config`, `/serverconfig`
+- **Voice-channel live transcription**: `/transcribe-join` streams the live voice call to whisper-live and posts a running transcript — **one stream per speaker**, attributed by display name and timestamped — into a dedicated per-call thread; `/transcribe-leave` stops. Transparently handles Discord's mandatory DAVE end-to-end voice encryption (discord.py 2.7.1+). See [docs/discord-bot-guide.md](docs/discord-bot-guide.md#voice-channel-live-transcription).
+- **Slash commands**: `/summarize`, `/transcribe`, `/status`, `/find`, `/config`, `/serverconfig`, `/transcribe-join`, `/transcribe-leave`
 - **Per-channel + per-guild config**: model override, VLM toggle, YT-comments toggle, diarize default, summary archive channel
 - **Speaker rename**: button on diarized summaries lets users label SPEAKER_xx → real names
 - **Rate limiting**: per-user sliding window + global queue cap
@@ -212,6 +213,19 @@ directly — same surface area.
 | `VLM_OCR_ENABLED` | `1` | Whether EasyOCR runs (set `0` to skip OCR on `/api/image` and `/api/describe`) |
 | `VLM_OCR_LANGUAGES` | `en` | CSV of EasyOCR language codes (e.g. `en,fr,de`) |
 
+### whisper-live (streaming) service
+Used by the SPA mic Live tab and the Discord voice bot (both stream raw 16 kHz mono PCM to `/ws-stream`).
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LIVE_MODEL` | `large-v3` | faster-whisper model for the streaming path |
+| `LIVE_COMPUTE_TYPE` | `float16` | Compute type (`float16` on GPU) |
+| `LIVE_MAX_STREAMS` | `4` | Concurrent streaming sessions (shared by SPA + every voice speaker) |
+| `LIVE_PROCESS_INTERVAL` | `0.4` | Seconds between inference passes on the growing buffer (lower = snappier) |
+| `LIVE_MIN_CHUNK_S` | `0.5` | Minimum audio buffered before the first inference |
+| `LIVE_TAIL_SILENCE_S` | `0.4` | Trailing silence that marks end-of-utterance (commit boundary) |
+| `LIVE_BEAM_SIZE` | `1` | Greedy decode (beam=1) ~halves per-pass latency vs beam=5 |
+| `LIVE_HALLUCINATION_SILENCE_S` | `2.0` | Skip silent gaps longer than this where whisper hallucinates continuation text (`0` disables) |
+
 ### Discord bot
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -252,6 +266,18 @@ directly — same surface area.
 | `IMAGE_MAX_BYTES_PER_ATTACHMENT` | `33554432` | Per-attachment byte cap the bot will forward (32MB) |
 | `IMAGE_API_TIMEOUT` | `180` | Per-image timeout on the `/api/image` call (OCR is fast; VLM is the long pole) |
 | `IMAGE_OCR_VERBATIM_MIN_CHARS` | `80` | Minimum total OCR chars across attachments before the verbatim "Text in image" embed + key-points pass fire |
+
+#### Voice-channel live transcription (Discord bot)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VOICE_TRANSCRIBE_ENABLED` | — | Set to `1` to enable `/transcribe-join` + `/transcribe-leave`. Unset = feature off (commands not registered). |
+| `VOICE_TRANSCRIPT_CHANNEL_ID` | `0` | Channel ID where per-call transcript threads are created. `0`/unset = the channel the command was invoked in. |
+| `VOICE_MAX_SPEAKERS` | `4` | Max simultaneous per-speaker streams (each uses one whisper-live slot; capped by `LIVE_MAX_STREAMS`). |
+| `VOICE_SPEAKER_IDLE_S` | `45` | Close a speaker's stream after this many seconds of silence, freeing a slot (re-opens on next speech). |
+| `VOICE_SEND_INTERVAL` | `0.15` | How often buffered PCM is flushed to whisper-live (lower = snappier, more requests). |
+| `VOICE_MAX_SILENCE_S` | `2.0` | Cap on reconstructed silence injected for a pause (gives whisper-live its end-of-utterance boundary). |
+
+Latency is also governed by the whisper-live streaming knobs (`LIVE_PROCESS_INTERVAL`, `LIVE_MIN_CHUNK_S`, `LIVE_TAIL_SILENCE_S` — see the Whisper service table); these are tuned low in `compose.yaml` for snappy live output.
 
 See `.env.example` and `bot/.env.example` for the full list.
 
@@ -304,7 +330,19 @@ alignment ~360MB). Crawl4AI and FlareSolverr each run their own Chromium
 | Service | Image | Purpose |
 |---------|-------|---------|
 | `whisper` | built locally | Transcription + VLM frame description |
+| `whisper-live` | built locally | Low-latency streaming ASR (SPA mic Live tab + Discord voice bot) |
 | `bot` | built locally | Discord interface |
 | `valkey` | `valkey/valkey:9-alpine` | Job queue + transcript cache (AOF-persisted) |
 | `crawl4ai` | `unclecode/crawl4ai:0.7.4` | Article scraper (readability → Markdown) |
 | `flaresolverr` | `ghcr.io/flaresolverr/flaresolverr:v3.4.6` | Cloudflare-challenge fallback |
+
+## Documentation
+
+| Doc | Contents |
+|-----|----------|
+| [docs/discord-bot-guide.md](docs/discord-bot-guide.md) | Full Discord bot guide — setup, every interaction path, slash commands, voice-channel live transcription, per-user/channel/server config, rate limits, diagnostics |
+| [docs/design/multilingual.md](docs/design/multilingual.md) | Multilingual design — language ID pre-pass + translate-to-English flow |
+| [docs/design/global-queue.md](docs/design/global-queue.md) | Global job-queue design notes |
+| [docs/plans/](docs/plans/) | Implementation plans (live transcription, Discord voice transcription) |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution + local-dev notes |
+| [AGENTS.md](AGENTS.md) | Build/deploy/test cheat-sheet (Makefile targets, conventions, footguns) |

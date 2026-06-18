@@ -25,6 +25,8 @@ embeds.
 | `/find query:<keywords> kind:<video\|web> since_days:<N>` | Search past transcripts with optional filters. |
 | `/recent kind:<video\|web> limit:<N>` | Last N cached summaries (newest first). |
 | `/redo video_id:<id>` | Re-run a cached YouTube job with different translate / model. Autocompletes from cache. |
+| `/transcribe-join` | Join your voice channel and live-transcribe it (per-speaker, attributed, timestamped) into a thread. Needs `VOICE_TRANSCRIBE_ENABLED=1`. |
+| `/transcribe-leave` | Stop live transcription, leave the channel, archive the thread. |
 | `/myconfig model:<name> diarize:true` | Your personal defaults — applied in any channel. |
 | `/help topic:<overview\|triggers\|admin\|limits\|errors\|translate>` | Ephemeral help cards. |
 | `/status verbose:true` | Queue depth, service health, plus per-job phase/elapsed when verbose. |
@@ -356,6 +358,61 @@ contents (titles, kinds, phases, elapsed).
 
 ---
 
+## Voice-channel live transcription
+
+Live-transcribe an active voice call into a text thread. Off by default —
+set `VOICE_TRANSCRIBE_ENABLED=1` (and the `discord-ext-voice-recv`
+extension + libopus must be present in the bot image) for the two slash
+commands below to register. Discord's mandatory DAVE end-to-end voice
+encryption is handled transparently by discord.py 2.7.1+.
+
+```
+/transcribe-join
+```
+
+Run it **while you are in a voice channel**. The bot joins that channel,
+creates a dedicated public thread (🎙️ `<channel> — <date> <time>`), posts
+a consent notice, and streams the call to whisper-live live:
+
+- **One stream per speaker.** Each talker gets their own whisper-live
+  slot, so lines are attributed by display name and timestamped as they
+  land in the thread.
+- Audio is resampled (48 kHz stereo → 16 kHz mono) on the receive thread
+  and converted to text live — **nothing is stored**.
+- Capacity is bounded: `VOICE_MAX_SPEAKERS` simultaneous streams (each
+  consumes one `LIVE_MAX_STREAMS` slot on whisper-live). A speaker's
+  stream is closed after `VOICE_SPEAKER_IDLE_S` seconds of silence and
+  re-opens on their next utterance.
+- Where the thread is created is governed by `VOICE_TRANSCRIPT_CHANNEL_ID`
+  (`0`/unset = the channel the command was invoked in). If the bot lacks
+  thread permissions it posts in the channel directly.
+
+Consent notice posted on join:
+
+> 🔴 **This voice channel is now being transcribed.** Audio is converted
+> to text live and not stored. Leave the channel if you do not consent.
+
+```
+/transcribe-leave
+```
+
+Flushes any buffered audio, closes every per-speaker stream (freeing the
+whisper-live slots), disconnects from the voice channel, posts
+*“— transcription ended —”*, and archives the thread so it drops out of
+the active list.
+
+**Tuning latency.** Snappiness is governed by the bot-side flush cadence
+(`VOICE_SEND_INTERVAL`, `VOICE_MAX_SILENCE_S`) and the whisper-live
+streaming knobs (`LIVE_PROCESS_INTERVAL`, `LIVE_MIN_CHUNK_S`,
+`LIVE_TAIL_SILENCE_S`, `LIVE_BEAM_SIZE`). See the Environment Variables
+tables in the [README](../README.md#environment-variables). These are
+tuned low in `compose.yaml` for live output.
+
+**Verify it freed capacity** after `/transcribe-leave`: whisper-live
+`GET /health` should report `active_streams` back to `0`.
+
+---
+
 ## Per-user defaults (`/myconfig`)
 
 Want the bot to default to a particular model or always diarize for you
@@ -563,6 +620,7 @@ object:
 | Channel has different needs from defaults | `/config` (one-time, admin) |
 | New to the bot, need a tour | `/help topic:overview` |
 | Diarized output with renaming | `/transcribe diarize:true` then 🏷️ Rename speakers |
+| Live-transcribe an ongoing voice call | `/transcribe-join` (then `/transcribe-leave` to stop) |
 
 The auto-paste, reply-trigger, and slash paths all share the same job
 queue, rate limits, and cache. None of them replace each other — pick

@@ -3319,7 +3319,7 @@ async def process(job: Job):
             "return_file": False,  # bot uses transcript text directly
             "diarize": job.diarize,
             # Server resolves "auto" via a 30s LID pre-pass and translates
-            # to English for non-English sources. See DESIGN_MULTILINGUAL.md.
+            # to English for non-English sources. See docs/design/multilingual.md.
             "translate": job.translate,
             "consumer": "discord-bot",
         }
