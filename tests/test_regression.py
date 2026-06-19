@@ -4373,9 +4373,14 @@ def test_app_decide_task_resolution():
     assert _decide_task("auto", "Auto-detect", "yue", 0.85) == "translate"
     assert _decide_task("auto", "Auto-detect", "zh", 0.9) == "translate"
 
-    # auto + low-confidence LID → translate (CS audio often has low conf)
-    assert _decide_task("auto", "Auto-detect", "en", 0.3) == "translate"
+    # auto + low-confidence English → transcribe. task=translate on English
+    # audio is degenerate (38-min call collapsed to 4 segments); a low-conf
+    # "en" is still a best-guess of English, so never translate it.
+    assert _decide_task("auto", "Auto-detect", "en", 0.3) == "transcribe"
+    assert _decide_task("auto", "Auto-detect", "en", 0.41) == "transcribe"
+    # auto + low-confidence non-English / unknown LID → translate
     assert _decide_task("auto", "Auto-detect", "unknown", 0.0) == "translate"
+    assert _decide_task("auto", "Auto-detect", "id", 0.3) == "translate"
 
 
 def test_app_transcribe_inner_accepts_task():

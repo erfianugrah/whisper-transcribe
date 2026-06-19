@@ -1615,15 +1615,14 @@ def _decide_task(translate: object, language: str | None,
           - If `language` was explicitly set (not "Auto-detect"/None/"") →
             respect it, use "transcribe". User who picked a specific
             language wants that language's output.
-          - Else if quick-LID confidence < 0.5 → "translate". Threshold
-            matches faster-whisper's `language_detection_threshold` default;
-            below that, LID is "not sure" — code-switched audio often
-            produces low-confidence single-language LID, and translate is
-            the safer default for the summarisation use case (CS-FLEURS:
-            BLEU barely degrades on CS audio).
-          - Else if high-confidence English → "transcribe" (no point
-            translating English to English).
-          - Else (high-confidence non-English) → "translate".
+          - Else if quick-LID says English (ANY confidence) → "transcribe".
+            Whisper's translate task on English audio is degenerate: it
+            collapses output to a handful of segments (observed: a 38-min
+            English call → 4 segments). Translating English→English is
+            pointless, so English always transcribes regardless of how
+            unsure LID was.
+          - Else (non-English, or unknown LID) → "translate". Safer default
+            for the summarisation use case; handles code-switched audio.
     """
     if translate is True:
         return "translate"
@@ -1633,12 +1632,12 @@ def _decide_task(translate: object, language: str | None,
     explicit = language and language not in ("Auto-detect", "auto", "")
     if explicit:
         return "transcribe"
-    # Confidence check FIRST so that a low-confidence "en" (often CS audio
-    # leaning English) gets translate, not transcribe.
-    if quick_lang == "unknown" or quick_conf < 0.5:
-        return "translate"
+    # English (any confidence) → transcribe. A low-confidence "en" still
+    # means the model's best guess is English; task=translate on English
+    # audio produces near-empty garbage, so never translate English.
     if quick_lang == "en":
         return "transcribe"
+    # Non-English or unknown → translate to English for summarisation.
     return "translate"
 
 
