@@ -1,0 +1,38 @@
+# ─── Standalone overlay: run WITHOUT llm-compose ──────────────────────────────
+#
+# The base compose.yaml declares the `llmc` network as `external: true`, so a
+# plain `docker compose up` REQUIRES the llm-compose stack to be running first
+# (it owns/creates `llmc`). That is the co-deployed default and is unchanged.
+#
+# This overlay lets you bring the whisper stack up on its own — e.g. when you
+# only need transcription (pi talks to the HTTP API on :7860) and don't want to
+# spin up the GPU LLM stack at all.
+#
+# It does ONE thing: redefine `llmc` as a self-managed bridge with a DISTINCT
+# name so:
+#   - compose creates it fresh (no "network llmc not found" startup failure),
+#   - it never collides with the real `llmc` that llm-compose owns (verified:
+#     a non-external compose net that finds a pre-existing same-name network
+#     created out-of-band aborts with an "incorrect label" error — using a
+#     separate name sidesteps that footgun entirely),
+#   - llm-compose stays 100% untouched, so co-deployed `make up` still reaches
+#     `model_proxy` by hostname over the real `llmc`.
+#
+# In this mode the LLM-dependent extras (bot summaries, whisper /api/describe
+# VLM frame description, scene synthesis) can't reach `model_proxy` and degrade
+# gracefully. Point LLM_API_URL / LLM_VISION_API_URL / LLM_TEXT_API_URL at any
+# OpenAI-compatible endpoint via .env if you want those to work standalone.
+#
+# Usage (via the Makefile, which threads both files in):
+#   make up-standalone     # valkey + whisper + whisper-live, no llm-compose
+#   make down-standalone
+#
+# Or directly:
+#   docker compose -f compose.yaml -f compose.standalone.yaml up -d \
+#       valkey whisper whisper-live
+
+networks:
+  llmc:
+    external: false
+    name: whisper-standalone-llmc
+    driver: bridge

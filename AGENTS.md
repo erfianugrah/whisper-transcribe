@@ -18,6 +18,13 @@ Two Python services + supporting infra, all in one compose stack:
 Plus: valkey (queue), crawl4ai + flaresolverr (web scraper for `tldr`
 on URLs). All run locally on this WSL2 host via Docker Desktop.
 
+**Two deploy modes:** the default (`make up`) is co-deployed with
+llm-compose — it owns the external `llmc` net and serves `model_proxy`.
+For transcription-only use without llm-compose, `make up-standalone`
+layers `compose.standalone.yaml` (redefines `llmc` as a self-managed
+bridge under a distinct name) and brings up just valkey + whisper +
+whisper-live. LLM extras degrade gracefully in that mode.
+
 ## Build / deploy — Makefile is canonical
 
 Always use `make <target>`. Never call `docker compose build` / `up`
@@ -39,6 +46,7 @@ correct restart-vs-recreate semantics.
 | Whisper API quick probe | `make status` |
 | Bot env change | `make recreate-bot` (NOT `restart-bot` — in-place restart does NOT re-read env) |
 | Whisper code change | `make build-whisper && make recreate-whisper` (compose.yaml does NOT bind-mount source despite the misleading `restart-whisper` help text) |
+| Bring up WITHOUT llm-compose (transcription core only) | `make up-standalone` / tear down with `make down-standalone` |
 
 ### Footguns
 
@@ -54,6 +62,13 @@ correct restart-vs-recreate semantics.
 - **`make ship` runs `lint` first** — if `make compose-check` fails
   (Docker Desktop integration dropped), the whole pipeline aborts.
   Verify Docker is up with `docker version` before invoking `make ship`.
+- **Do NOT make `llmc` non-external in compose.yaml to "fix" standalone.**
+  A non-external compose net that finds a pre-existing `llmc` (created
+  by llm-compose) aborts startup with an "incorrect label" error. The
+  standalone overlay sidesteps this by giving the bridge a *distinct*
+  name (`whisper-standalone-llmc`); llm-compose stays untouched so
+  co-deploy keeps working. Use `make up-standalone`, never hand-edit
+  the network's `external:` flag.
 
 ## Test discipline
 

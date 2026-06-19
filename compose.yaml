@@ -275,6 +275,13 @@ networks:
   # compose down` won't try to remove it (it belongs to the llm-compose
   # stack lifecycle). Bring up llm-compose first; this stack will refuse
   # to start with a clean "network llmc not found" error otherwise.
+  #
+  # To run WITHOUT llm-compose, layer compose.standalone.yaml on top (or use
+  # `make up-standalone`) — it redefines `llmc` as a self-managed bridge under
+  # a distinct name so the stack starts on its own. Do NOT make this network
+  # non-external here: a non-external compose net that finds a pre-existing
+  # `llmc` (created out-of-band) aborts startup with an "incorrect label"
+  # error, which would break llm-compose co-deploy.
   llmc:
     external: true
     name: llmc

@@ -15,9 +15,16 @@ GIT_SHA       := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 # Compose binding. The llm-compose overlay was removed in May 2026 — its
 # network (`llmc`) is now declared `external` in compose.yaml directly, so
 # `docker compose up` always lands the bot + whisper on the right network
-# and reaches `model_proxy` by hostname. Bring up llm-compose first.
+# and reaches `model_proxy` by hostname. Bring up llm-compose first for the
+# co-deployed default; for a standalone stack (no llm-compose) use the
+# `*-standalone` targets, which swap in compose.standalone.yaml.
 COMPOSE := docker compose
 COMPOSE_RUNTIME := docker compose
+# Standalone overlay: redefines `llmc` as a self-managed bridge so the stack
+# comes up WITHOUT llm-compose running (see compose.standalone.yaml). Used by
+# the `*-standalone` targets only; the default targets keep the co-deployed
+# behaviour (llmc external, reaches model_proxy by hostname).
+COMPOSE_STANDALONE := docker compose -f compose.yaml -f compose.standalone.yaml
 
 # Latest yt-dlp version from PyPI, fetched at make-invocation time. The
 # Dockerfile's volatile yt-dlp layer is keyed on this — when PyPI has a new
@@ -53,8 +60,8 @@ build-bot: ## Build bot image
 
 # ─── Lifecycle ────────────────────────────────────────────────────────────────
 
-.PHONY: up up-whisper up-bot down restart restart-whisper restart-bot
-up: ## Start whisper + bot (detached)
+.PHONY: up up-whisper up-bot up-standalone down down-standalone restart restart-whisper restart-bot
+up: ## Start whisper + bot (detached) — co-deployed, needs llm-compose's llmc net
 	$(COMPOSE_RUNTIME) up -d
 
 up-whisper: ## Start only whisper
@@ -63,8 +70,14 @@ up-whisper: ## Start only whisper
 up-bot: ## Start only bot
 	$(COMPOSE_RUNTIME) up -d bot
 
+up-standalone: ## Start transcription core WITHOUT llm-compose (valkey+whisper+whisper-live)
+	$(COMPOSE_STANDALONE) up -d valkey whisper whisper-live
+
 down: ## Stop and remove containers
 	$(COMPOSE_RUNTIME) down
+
+down-standalone: ## Stop the standalone stack (removes the self-managed llmc bridge)
+	$(COMPOSE_STANDALONE) down
 
 restart: ## Restart all services
 	$(COMPOSE_RUNTIME) restart
@@ -184,9 +197,10 @@ compile-check: ## ast.parse + py_compile (catches syntax + bytecode errors)
 	@python3 -c "import ast; [ast.parse(open(p).read()) for p in ['app.py','bot/main.py','bot/prompts.py']]"
 	@echo "  ast.parse OK"
 
-compose-check: ## Validate compose YAML (prod + dev overlays)
+compose-check: ## Validate compose YAML (prod + dev + standalone overlays)
 	@$(COMPOSE) config -q && echo "  compose.yaml OK"
 	@$(COMPOSE) -f compose.yaml -f compose.dev.yaml config -q && echo "  compose.dev.yaml overlay OK"
+	@$(COMPOSE_STANDALONE) config -q && echo "  compose.standalone.yaml overlay OK"
 
 bot-import-check: ## Import bot main module under stubbed deps + verify exports
 	@python3 -c "$$BOT_IMPORT_CHECK"
