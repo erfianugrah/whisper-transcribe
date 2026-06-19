@@ -47,6 +47,29 @@ To use a different LLM provider (host-side Ollama, llama.cpp, vLLM,
 hosted APIs), override `LLM_API_URL` / `LLM_MODEL` / `LLM_VISION_API_URL`
 / `LLM_VISION_MODEL` in `bot/.env` — see `.env.example` for examples.
 
+### Run without llm-compose (transcription only)
+
+If you only need the transcription API/UI (e.g. driving `:7860` from a
+tool or agent) and don't want to run the GPU LLM stack at all, use the
+standalone overlay instead of `make up`:
+
+```bash
+make up-standalone     # valkey + whisper + whisper-live, no llm-compose
+make down-standalone   # tear it down
+```
+
+This layers `compose.standalone.yaml`, which redefines `llmc` as a
+self-managed bridge (under a distinct name, `whisper-standalone-llmc`,
+so it never collides with llm-compose's real `llmc`). The co-deployed
+default (`make up`) is unchanged — when llm-compose is running, whisper
+still reaches `model_proxy` over the external `llmc` as before.
+
+In standalone mode the LLM-dependent extras (bot summaries, `/api/describe`
+VLM frame description, scene synthesis) can't reach `model_proxy` and
+degrade gracefully; core transcription is fully functional. Point the
+`LLM_*_API_URL` vars at any reachable OpenAI-compatible endpoint if you
+want those extras to work standalone.
+
 ## Features
 
 ### Whisper service
