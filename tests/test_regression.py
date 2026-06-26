@@ -5458,6 +5458,64 @@ def test_tap_sine_source_emits_16k_pcm():
     assert asyncio.run(_drain()) > 0
 
 
+# ─── Research tap (research_tap.py) ────────────────────────────────────────────
+
+RESEARCH_TAP_SRC = open(
+    os.path.join(os.path.dirname(__file__), "..", "live-tap", "research_tap.py")
+).read()
+
+
+def test_research_tap_no_bot_or_discord_dependency():
+    """research_tap.py must have zero discord / aiohttp / bot imports."""
+    for bad in ("discord", "aiohttp", "bot", "gradio"):
+        assert bad not in RESEARCH_TAP_SRC, f"unexpected dep: {bad}"
+
+
+def test_research_tap_has_transcript_buffer():
+    """TranscriptBuffer must keep a rolling word-capped window."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "live-tap"))
+    import research_tap as rt
+    buf = rt.TranscriptBuffer(max_words=10)
+    buf.add("one two three four five")
+    buf.add("six seven eight nine ten eleven")
+    assert buf.word_count() <= 11
+    ctx = buf.get()
+    assert "six seven" in ctx
+
+
+def test_research_tap_stream_research_sse_parsing():
+    """stream_research must parse SSE data: lines and stop at [DONE]."""
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "live-tap"))
+    import research_tap as rt
+    import io
+    sse = b"data: Hello\\n\ndata:  world\ndata: [DONE]\n\n"
+    class _FakeResp:
+        def __init__(self): self._data = io.BytesIO(sse)
+        def read(self, n): return self._data.read(n)
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    import urllib.request as _ur
+    original = _ur.urlopen
+    _ur.urlopen = lambda *a, **kw: _FakeResp()
+    try:
+        chunks = list(rt.stream_research("http://localhost:7860", "q", "ctx"))
+    finally:
+        _ur.urlopen = original
+    assert chunks == ["Hello\n", "world"]
+
+
+def test_research_route_registered():
+    """POST /api/research must be in the API_ROUTES table."""
+    assert 'Route("/api/research", api_research' in APP_SRC
+
+
+def test_research_endpoint_streams_sse():
+    """api_research must return text/event-stream and emit data: lines."""
+    assert 'text/event-stream' in APP_SRC
+    assert 'data: [DONE]' in APP_SRC
+    assert 'RESEARCH_SYSTEM_PROMPT' in APP_SRC
+
+
 # ─── Test runner ─────────────────────────────────────────────────────────────
 
 

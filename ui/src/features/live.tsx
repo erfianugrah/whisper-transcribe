@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -10,7 +10,14 @@ import {
 	SelectTrigger,
 	SelectValue,
 } from "@/components/ui/select";
-import { getLiveHealth } from "@/lib/api";
+import { getLiveHealth, streamResearch } from "@/lib/api";
+
+interface ResearchEntry {
+	id: number;
+	question: string;
+	answer: string;
+	streaming: boolean;
+}
 
 const TARGET_SR = 16000;
 const WAVE_HEIGHT = 72;
@@ -81,6 +88,77 @@ export function LiveTab() {
 	const [level, setLevel] = useState(0); // input RMS 0..1 for the meter
 	const [silent, setSilent] = useState(false);
 	const sysOk = systemAudioSupported();
+
+	// ─ Research panel ──────────────────────────────────────────────────────────────
+	const [researchOpen, setResearchOpen] = useState(false);
+	const [researchHistory, setResearchHistory] = useState<ResearchEntry[]>([]);
+	const [researchQuestion, setResearchQuestion] = useState("");
+	const [researchBusy, setResearchBusy] = useState(false);
+	// Text selection in the transcript → floating "Ask" chip
+	const [selection, setSelection] = useState("");
+	const transcriptDivRef = useRef<HTMLDivElement>(null);
+	const researchInputRef = useRef<HTMLInputElement>(null);
+	const researchEndRef = useRef<HTMLDivElement>(null);
+
+	const askResearch = useCallback(
+		async (question: string) => {
+			if (!question.trim() || researchBusy) return;
+			const ctx = committedRef.current.slice(-3000);
+			const id = Date.now();
+			setResearchHistory((h) => [...h, { id, question, answer: "", streaming: true }]);
+			setResearchBusy(true);
+			setResearchQuestion("");
+			setSelection("");
+			setResearchOpen(true);
+			try {
+				for await (const chunk of streamResearch({ question, context: ctx })) {
+					setResearchHistory((h) =>
+						h.map((e) => (e.id === id ? { ...e, answer: e.answer + chunk } : e)),
+					);
+				}
+			} catch (err) {
+				setResearchHistory((h) =>
+					h.map((e) =>
+						e.id === id
+							? { ...e, answer: e.answer + ` [error: ${err}]`, streaming: false }
+							: e,
+					),
+				);
+			} finally {
+				setResearchHistory((h) =>
+					h.map((e) => (e.id === id ? { ...e, streaming: false } : e)),
+				);
+				setResearchBusy(false);
+			}
+		},
+		[researchBusy],
+	);
+
+	// Scroll research panel to bottom when new content arrives
+	useEffect(() => {
+		researchEndRef.current?.scrollIntoView({ behavior: "smooth" });
+	}, [researchHistory]);
+
+	// Keyboard shortcut: "/" opens research + pre-fills selection (if any)
+	useEffect(() => {
+		const handler = (e: KeyboardEvent) => {
+			if (
+				e.key === "/" &&
+				!e.ctrlKey &&
+				!e.metaKey &&
+				document.activeElement?.tagName !== "INPUT" &&
+				document.activeElement?.tagName !== "TEXTAREA"
+			) {
+				e.preventDefault();
+				const sel = window.getSelection()?.toString().trim() ?? "";
+				if (sel) setResearchQuestion(`Explain: ${sel}`);
+				setResearchOpen(true);
+				setTimeout(() => researchInputRef.current?.focus(), 50);
+			}
+		};
+		window.addEventListener("keydown", handler);
+		return () => window.removeEventListener("keydown", handler);
+	}, []);
 
 	const health = useQuery({
 		queryKey: ["live-health"],
@@ -665,6 +743,16 @@ export function LiveTab() {
 				>
 					Clear
 				</Button>
+				<Button
+					variant={researchOpen ? "default" : "outline"}
+					onClick={() => {
+						setResearchOpen((v) => !v);
+						if (!researchOpen)
+							setTimeout(() => researchInputRef.current?.focus(), 50);
+					}}
+				>
+					Research
+				</Button>
 			</div>
 
 			{source === "both" && (
@@ -696,19 +784,163 @@ export function LiveTab() {
 				</div>
 			)}
 
-			<div className="min-h-80 overflow-auto rounded border bg-card p-3 font-mono text-xs leading-relaxed">
-				{hasText ? (
-					<p className="whitespace-pre-wrap">
-						<span>{committed}</span>{" "}
-						<span className="text-muted-foreground italic">{partial}</span>
-					</p>
-				) : (
-					<span className="text-muted-foreground">
-						Live transcript appears here. Words commit (solid) once stable;
-						provisional words show dimmed.
-					</span>
+			{/* Main content: transcript + (optional) research panel side-by-side */}
+			<div className={`flex gap-3 ${researchOpen ? "flex-col lg:flex-row" : ""}`}>
+				{/* Transcript */}
+				<div
+					ref={transcriptDivRef}
+					className="min-h-80 flex-1 overflow-auto rounded border bg-card p-3 font-mono text-xs leading-relaxed select-text"
+					onMouseUp={() => {
+						const sel = window.getSelection();
+						const text = sel?.toString().trim() ?? "";
+						setSelection(
+							text.length > 5 && transcriptDivRef.current?.contains(sel?.anchorNode ?? null)
+								? text
+								: "",
+						);
+					}}
+				>
+					{hasText ? (
+						<p className="whitespace-pre-wrap">
+							<span>{committed}</span>{" "}
+							<span className="text-muted-foreground italic">{partial}</span>
+						</p>
+					) : (
+						<span className="text-muted-foreground">
+							Live transcript appears here. Words commit (solid) once stable;
+							provisional words show dimmed.
+						</span>
+					)}
+				</div>
+
+				{/* Research panel */}
+				{researchOpen && (
+					<div className="flex w-full flex-col gap-2 lg:w-96">
+						<div className="flex items-center justify-between">
+							<span className="font-mono text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+								Research
+							</span>
+							<button
+								type="button"
+								className="font-mono text-[10px] text-muted-foreground hover:text-foreground"
+								onClick={() => setResearchOpen(false)}
+							>
+								✕ close
+							</button>
+						</div>
+
+						{/* Q&A history */}
+						<div className="flex min-h-64 flex-1 flex-col gap-3 overflow-auto rounded border bg-card p-3 font-mono text-xs">
+							{researchHistory.length === 0 ? (
+								<span className="text-muted-foreground">
+									Ask anything about the call. The last ~3000 chars of
+									transcript are sent as context automatically.
+									<br /><br />
+									Tip: select text in the transcript, then press{" "}
+									<kbd className="rounded bg-muted px-1">/</kbd> to ask
+									about it.
+								</span>
+							) : (
+								researchHistory.map((e) => (
+									<div key={e.id} className="flex flex-col gap-1">
+										<div className="text-[10px] font-semibold text-foreground">
+											Q: {e.question}
+										</div>
+										<div className="whitespace-pre-wrap leading-relaxed text-muted-foreground">
+											{e.answer}
+											{e.streaming && (
+												<span className="animate-pulse">▋</span>
+											)}
+										</div>
+									</div>
+								))
+							)}
+							<div ref={researchEndRef} />
+						</div>
+
+						{/* Selection chip */}
+						{selection && (
+							<div className="flex items-center gap-2 rounded border border-primary/40 bg-primary/5 px-2 py-1 font-mono text-[10px]">
+								<span className="flex-1 truncate text-muted-foreground">
+									“{selection.slice(0, 80)}{selection.length > 80 ? "…" : ""}”
+								</span>
+								<button
+									type="button"
+									className="shrink-0 font-semibold text-primary hover:underline"
+									onClick={() => {
+										setResearchQuestion(`Explain: ${selection}`);
+										setSelection("");
+										researchInputRef.current?.focus();
+									}}
+								>
+									Ask →
+								</button>
+								<button
+									type="button"
+									className="shrink-0 text-muted-foreground hover:text-foreground"
+									onClick={() => setSelection("")}
+								>
+									×
+								</button>
+							</div>
+						)}
+
+						{/* Question input */}
+						<form
+							className="flex gap-2"
+							onSubmit={(e) => {
+								e.preventDefault();
+								askResearch(researchQuestion);
+							}}
+						>
+							<input
+								ref={researchInputRef}
+								type="text"
+								value={researchQuestion}
+								onChange={(e) => setResearchQuestion(e.target.value)}
+								placeholder="Ask about the call…"
+								disabled={researchBusy}
+								className="flex-1 rounded border bg-background px-2 py-1 font-mono text-xs placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-50"
+							/>
+							<Button
+								type="submit"
+								size="sm"
+								disabled={researchBusy || !researchQuestion.trim()}
+							>
+								{researchBusy ? "⋯" : "Ask"}
+							</Button>
+						</form>
+					</div>
 				)}
 			</div>
+
+			{/* Selection quick-ask when research panel is closed */}
+			{!researchOpen && selection && (
+				<div className="flex items-center gap-2 rounded border border-primary/40 bg-primary/5 px-2 py-1 font-mono text-[10px]">
+					<span className="flex-1 truncate text-muted-foreground">
+						“{selection.slice(0, 100)}{selection.length > 100 ? "…" : ""}”
+					</span>
+					<button
+						type="button"
+						className="shrink-0 font-semibold text-primary hover:underline"
+						onClick={() => {
+							const q = `Explain: ${selection}`;
+							setSelection("");
+							setResearchOpen(true);
+							askResearch(q);
+						}}
+					>
+						Research →
+					</button>
+					<button
+						type="button"
+						className="shrink-0 text-muted-foreground hover:text-foreground"
+						onClick={() => setSelection("")}
+					>
+						×
+					</button>
+				</div>
+			)}
 
 			<p className="text-xs text-muted-foreground">
 				{source === "both"

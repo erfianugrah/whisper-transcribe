@@ -208,6 +208,40 @@ export const LiveHealthSchema = z
 	.passthrough();
 export const getLiveHealth = () => jget(LiveHealthSchema, "/api/live/health");
 
+// ── /api/research ──────────────────────────────────────────────────────────────
+// SSE streaming: yields text chunks as they arrive from the LLM.
+export async function* streamResearch(opts: {
+	question: string;
+	context: string;
+	model?: string;
+}): AsyncGenerator<string> {
+	const res = await fetch(`${API}/api/research`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify(opts),
+	});
+	if (!res.ok || !res.body) throw new Error(`research → ${res.status}`);
+	const reader = res.body.getReader();
+	const dec = new TextDecoder();
+	let buf = "";
+	while (true) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		buf += dec.decode(value, { stream: true });
+		const lines = buf.split("\n");
+		buf = lines.pop() ?? "";
+		for (const line of lines) {
+			if (!line.startsWith("data:")) continue;
+			const payload = line.slice(5).trim();
+			if (payload === "[DONE]") return;
+			if (payload.startsWith("[ERROR]"))
+				throw new Error(payload.slice(7).trim());
+			// server escapes \n inside chunks so one SSE line = one delta
+			yield payload.replace(/\\n/g, "\n");
+		}
+	}
+}
+
 export async function liveChunk(
 	pcm: ArrayBuffer,
 	context: string,

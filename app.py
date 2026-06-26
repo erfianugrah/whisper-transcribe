@@ -3734,6 +3734,113 @@ async def ws_live_stream(websocket):
             pass
 
 
+# ─── Research / inline LLM assistant ────────────────────────────────────────
+# POST /api/research  { question, context, model? }
+# Streams the LLM reply as SSE: data: <chunk>\n\n  ...  data: [DONE]\n\n
+# The context is typically the last N words of the live transcript; the UI
+# populates it automatically so the user just types the question.
+RESEARCH_SYSTEM_PROMPT = os.environ.get(
+    "RESEARCH_SYSTEM_PROMPT",
+    "You are a concise research assistant embedded in a live call transcription tool. "
+    "The user will give you recent transcript text and a question. "
+    "Answer directly and concisely — 1-3 short paragraphs maximum. "
+    "If the transcript doesn't contain enough information to answer, say so and answer "
+    "from general knowledge. Do not repeat the transcript back verbatim.",
+)
+RESEARCH_MODEL = os.environ.get(
+    "RESEARCH_MODEL",
+    os.environ.get("LLM_MODEL", LLM_SYNTHESIS_MODEL),
+)
+RESEARCH_MAX_TOKENS = int(os.environ.get("RESEARCH_MAX_TOKENS", "512"))
+
+
+async def api_research(request: Request):
+    """POST /api/research — stream an LLM answer given transcript context.
+
+    Body: {"question": str, "context": str, "model": str (optional)}
+    Response: text/event-stream  data: <chunk>\\n\\n ... data: [DONE]\\n\\n
+    Uses the same LLM backend (model_proxy / Ollama) as the VLM and synthesis
+    paths, so no extra deps.
+    """
+    import httpx
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    question = (body.get("question") or "").strip()
+    context = (body.get("context") or "").strip()
+    model = (body.get("model") or RESEARCH_MODEL or "").strip() or RESEARCH_MODEL
+
+    if not question:
+        return JSONResponse({"error": "question is required"}, status_code=400)
+
+    user_content = question
+    if context:
+        user_content = f"Recent transcript:\n{context}\n\nQuestion: {question}"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        "stream": True,
+        "max_tokens": RESEARCH_MAX_TOKENS,
+        "temperature": 0.4,
+    }
+
+    async def generate():
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                async with client.stream(
+                    "POST",
+                    f"{LLM_TEXT_API_URL}/chat/completions",
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                ) as resp:
+                    if resp.status_code >= 400:
+                        err = await resp.aread()
+                        yield f"data: [ERROR] LLM returned {resp.status_code}: "\
+                              f"{err[:200].decode('utf-8', errors='replace')}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        payload_str = line[5:].strip()
+                        if payload_str == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            return
+                        try:
+                            chunk = json.loads(payload_str)
+                            delta = (
+                                chunk.get("choices", [{}])[0]
+                                .get("delta", {})
+                                .get("content", "")
+                            )
+                            if delta:
+                                # Escape newlines so one SSE message = one chunk.
+                                safe = delta.replace("\n", "\\n")
+                                yield f"data: {safe}\n\n"
+                        except Exception:
+                            pass
+        except Exception as e:
+            yield f"data: [ERROR] {e}\n\n"
+            yield "data: [DONE]\n\n"
+
+    from starlette.responses import StreamingResponse as _StreamingResponse
+    return _StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable Nginx/Caddy buffering
+        },
+    )
+
+
 API_ROUTES = [
     Route("/api/status", api_status, methods=["GET"]),
     Route("/api/yt-download", api_yt_download, methods=["POST"]),
@@ -3753,6 +3860,7 @@ API_ROUTES = [
     Route("/api/live/health", api_live_health, methods=["GET"]),
     Route("/api/live/transcribe-chunk", api_live_chunk, methods=["POST"]),
     WebSocketRoute("/api/live/stream", ws_live_stream),
+    Route("/api/research", api_research, methods=["POST"]),
 ]
 
 # React SPA (ui/dist) is the only UI, served at "/". The API routes are matched

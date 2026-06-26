@@ -79,6 +79,9 @@ live-tap: ## Stream OBS/desktop/mic audio to whisper-live, print transcript (see
 live-tap-selftest: ## Verify the live-tap can reach whisper-live (5s sine tone, no audio hardware)
 	@python3 live-tap/desktop_tap.py --self-test
 
+research-tap: ## Interactive LLM research REPL fed by the live transcript. Pipe: desktop_tap.py --loopback | make research-tap
+	@python3 live-tap/research_tap.py $(ARGS)
+
 down: ## Stop and remove containers
 	$(COMPOSE_RUNTIME) down
 
@@ -198,9 +201,9 @@ test: lint ## Lint + full E2E regression suite (no docker required)
 	@python3 tests/test_regression.py
 
 compile-check: ## ast.parse + py_compile (catches syntax + bytecode errors)
-	@python3 -m py_compile app.py bot/main.py bot/prompts.py live-tap/desktop_tap.py
-	@echo "  py_compile: app.py, bot/main.py, bot/prompts.py, live-tap/desktop_tap.py OK"
-	@python3 -c "import ast; [ast.parse(open(p).read()) for p in ['app.py','bot/main.py','bot/prompts.py','live-tap/desktop_tap.py']]"
+	@python3 -m py_compile app.py bot/main.py bot/prompts.py live-tap/desktop_tap.py live-tap/research_tap.py
+	@echo "  py_compile: app.py, bot/main.py, bot/prompts.py, live-tap/desktop_tap.py, live-tap/research_tap.py OK"
+	@python3 -c "import ast; [ast.parse(open(p).read()) for p in ['app.py','bot/main.py','bot/prompts.py','live-tap/desktop_tap.py','live-tap/research_tap.py']]"
 	@echo "  ast.parse OK"
 
 compose-check: ## Validate compose YAML (prod + dev + standalone overlays)
