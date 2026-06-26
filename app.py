@@ -3759,6 +3759,34 @@ RESEARCH_MODEL = os.environ.get(
     os.environ.get("LLM_MODEL", LLM_SYNTHESIS_MODEL),
 )
 RESEARCH_MAX_TOKENS = int(os.environ.get("RESEARCH_MAX_TOKENS", "800"))
+# Cloud provider override: set RESEARCH_API_URL + RESEARCH_API_KEY to use a
+# fast cloud model (Anthropic, OpenAI-compatible, opencode zen, ...) for
+# real-time call research without touching the local model stack.
+# Provider format is auto-detected from the URL + model id:
+#   - api.anthropic.com                  -> Anthropic Messages API
+#   - opencode zen Claude/Qwen models    -> Anthropic Messages API (/zen/v1/messages)
+#   - everything else (DeepSeek/GLM/Kimi/
+#     Ollama/OpenAI chat models, ...)    -> OpenAI-compatible /chat/completions
+# Note: opencode zen GPT-5* models use the /responses API and are NOT supported
+# here -- pick a /chat/completions model (deepseek-v4-flash) or a Claude model.
+RESEARCH_API_URL = os.environ.get("RESEARCH_API_URL", "").strip() or LLM_TEXT_API_URL
+RESEARCH_API_KEY = os.environ.get("RESEARCH_API_KEY", "").strip()
+
+
+def _research_provider(url: str, model: str = "") -> str:
+    """Return 'anthropic' for the Anthropic Messages API, else 'openai'.
+
+    True Anthropic endpoints (api.anthropic.com) always use Messages. On the
+    opencode zen gateway the format is per-model: Claude and Qwen ids are served
+    via /zen/v1/messages (Anthropic format), while DeepSeek/GLM/Kimi/MiniMax ids
+    use /zen/v1/chat/completions (OpenAI format).
+    """
+    if "anthropic.com" in url:
+        return "anthropic"
+    m = (model or "").lower()
+    if "opencode.ai" in url and (m.startswith("claude") or m.startswith("qwen")):
+        return "anthropic"
+    return "openai"
 
 
 async def api_research(request: Request):
@@ -3766,8 +3794,14 @@ async def api_research(request: Request):
 
     Body: {"question": str, "context": str, "model": str (optional)}
     Response: text/event-stream  data: <chunk>\\n\\n ... data: [DONE]\\n\\n
-    Uses the same LLM backend (model_proxy / Ollama) as the VLM and synthesis
-    paths, so no extra deps.
+
+    Supports two provider formats:
+      Anthropic  — set RESEARCH_API_URL=https://api.anthropic.com
+                    and RESEARCH_API_KEY=sk-ant-...
+                    Model: claude-haiku-3-5 / claude-sonnet-4-5 / etc.
+      OpenAI-compatible (default) — Ollama, OpenAI, Groq, opencode.ai, etc.
+                    Set RESEARCH_API_URL + RESEARCH_API_KEY.
+                    Model: gpt-4o-mini / gemma-4-26B-A4B-it-Q4_K_M / etc.
     """
     import httpx
 
@@ -3787,52 +3821,97 @@ async def api_research(request: Request):
     if context:
         user_content = f"Recent transcript:\n{context}\n\nQuestion: {question}"
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        "stream": True,
-        "max_tokens": RESEARCH_MAX_TOKENS,
-        "temperature": 0.4,
-    }
+    provider = _research_provider(RESEARCH_API_URL, model)
+
+    if provider == "anthropic":
+        base = RESEARCH_API_URL.rstrip("/")
+        # Strip trailing /v1 so we can add it back cleanly
+        if base.endswith("/v1"):
+            base = base[:-3]
+        endpoint = f"{base}/v1/messages"
+        req_headers = {
+            "Content-Type": "application/json",
+            "x-api-key": RESEARCH_API_KEY,
+            "anthropic-version": "2023-06-01",
+        }
+        req_payload = {
+            "model": model,
+            "max_tokens": RESEARCH_MAX_TOKENS,
+            "system": RESEARCH_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_content}],
+            "stream": True,
+            "temperature": 0.4,
+        }
+    else:
+        endpoint = f"{RESEARCH_API_URL.rstrip('/')}/chat/completions"
+        req_headers = {"Content-Type": "application/json"}
+        if RESEARCH_API_KEY:
+            req_headers["Authorization"] = f"Bearer {RESEARCH_API_KEY}"
+        req_payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            "stream": True,
+            "max_tokens": RESEARCH_MAX_TOKENS,
+            "temperature": 0.4,
+        }
 
     async def generate():
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 async with client.stream(
-                    "POST",
-                    f"{LLM_TEXT_API_URL}/chat/completions",
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
+                    "POST", endpoint, json=req_payload, headers=req_headers,
                 ) as resp:
                     if resp.status_code >= 400:
                         err = await resp.aread()
-                        yield f"data: [ERROR] LLM returned {resp.status_code}: "\
-                              f"{err[:200].decode('utf-8', errors='replace')}\n\n"
+                        yield (f"data: [ERROR] {provider} API returned "
+                               f"{resp.status_code}: "
+                               f"{err[:300].decode('utf-8', errors='replace')}\n\n")
                         yield "data: [DONE]\n\n"
                         return
+
                     async for line in resp.aiter_lines():
                         if not line.startswith("data:"):
                             continue
                         payload_str = line[5:].strip()
-                        if payload_str == "[DONE]":
-                            yield "data: [DONE]\n\n"
-                            return
-                        try:
-                            chunk = json.loads(payload_str)
-                            delta = (
-                                chunk.get("choices", [{}])[0]
-                                .get("delta", {})
-                                .get("content", "")
-                            )
-                            if delta:
-                                # Escape newlines so one SSE message = one chunk.
-                                safe = delta.replace("\n", "\\n")
-                                yield f"data: {safe}\n\n"
-                        except Exception:
-                            pass
+                        if not payload_str:
+                            continue
+
+                        if provider == "anthropic":
+                            # Anthropic streams content_block_delta events.
+                            if payload_str == "[DONE]":
+                                yield "data: [DONE]\n\n"
+                                return
+                            try:
+                                chunk = json.loads(payload_str)
+                                ctype = chunk.get("type", "")
+                                if ctype == "content_block_delta":
+                                    delta = chunk.get("delta", {}).get("text", "")
+                                    if delta:
+                                        yield f"data: {delta.replace(chr(10), chr(92)+'n')}\n\n"
+                                elif ctype == "message_stop":
+                                    yield "data: [DONE]\n\n"
+                                    return
+                            except Exception:
+                                pass
+                        else:
+                            # OpenAI-compatible: data: {choices:[{delta:{content}}]}
+                            if payload_str == "[DONE]":
+                                yield "data: [DONE]\n\n"
+                                return
+                            try:
+                                chunk = json.loads(payload_str)
+                                delta = (
+                                    chunk.get("choices", [{}])[0]
+                                    .get("delta", {})
+                                    .get("content", "")
+                                )
+                                if delta:
+                                    yield f"data: {delta.replace(chr(10), chr(92)+'n')}\n\n"
+                            except Exception:
+                                pass
         except Exception as e:
             yield f"data: [ERROR] {e}\n\n"
             yield "data: [DONE]\n\n"
@@ -3843,7 +3922,7 @@ async def api_research(request: Request):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable Nginx/Caddy buffering
+            "X-Accel-Buffering": "no",
         },
     )
 

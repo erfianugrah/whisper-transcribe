@@ -5516,6 +5516,47 @@ def test_research_endpoint_streams_sse():
     assert 'RESEARCH_SYSTEM_PROMPT' in APP_SRC
 
 
+def _extract_research_provider():
+    """Exec just the pure _research_provider fn out of app.py (no torch import)."""
+    import re
+    m = re.search(
+        r"\ndef _research_provider\(.*?\n(?=\n\nasync def |\n\ndef )",
+        APP_SRC,
+        re.DOTALL,
+    )
+    assert m, "_research_provider definition not found in app.py"
+    ns = {}
+    exec(m.group(0), ns)
+    return ns["_research_provider"]
+
+
+def test_research_provider_detection():
+    """Provider is anthropic for api.anthropic.com and zen Claude/Qwen ids,
+    openai for everything else (Ollama, OpenAI chat, zen DeepSeek/GLM/Kimi)."""
+    rp = _extract_research_provider()
+    # True Anthropic endpoint -> always Messages API.
+    assert rp("https://api.anthropic.com", "claude-haiku-4-5") == "anthropic"
+    assert rp("https://api.anthropic.com", "") == "anthropic"
+    # opencode zen is per-model: Claude/Qwen -> Messages, others -> OpenAI.
+    assert rp("https://opencode.ai/zen/v1", "claude-haiku-4-5") == "anthropic"
+    assert rp("https://opencode.ai/zen/v1", "qwen3.5-plus") == "anthropic"
+    assert rp("https://opencode.ai/zen/v1", "deepseek-v4-flash") == "openai"
+    assert rp("https://opencode.ai/zen/v1", "glm-5.2") == "openai"
+    # Local / generic OpenAI-compatible backends.
+    assert rp("http://model_proxy:11434/v1", "gemma") == "openai"
+    assert rp("https://api.openai.com/v1", "gpt-4o-mini") == "openai"
+
+
+def test_research_anthropic_endpoint_construction():
+    """Anthropic branch must build a /v1/messages endpoint and set the
+    x-api-key + anthropic-version headers (works for both api.anthropic.com
+    and the opencode zen /zen/v1/messages path)."""
+    assert '/v1/messages' in APP_SRC
+    assert 'x-api-key' in APP_SRC
+    assert 'anthropic-version' in APP_SRC
+    assert 'content_block_delta' in APP_SRC
+
+
 # ─── Test runner ─────────────────────────────────────────────────────────────
 
 

@@ -74,6 +74,16 @@ services:
       # produce ~27 clusters; bumping to 180s leaves headroom for queue
       # waits without papering over actual UVM-fallback slowness).
       - LLM_SYNTHESIS_TIMEOUT=${LLM_SYNTHESIS_TIMEOUT:-180}
+      # Research assistant (Live tab inline LLM). Leave blank to use the local
+      # model stack (LLM_TEXT_API_URL). Set RESEARCH_API_URL + RESEARCH_API_KEY
+      # to use a cloud provider. See .env.example for the full guide.
+      # opencode zen: RESEARCH_API_URL=https://opencode.ai/zen/v1
+      #               RESEARCH_MODEL=deepseek-v4-flash   (cheapest good)
+      # Anthropic:    RESEARCH_API_URL=https://api.anthropic.com
+      #               RESEARCH_MODEL=claude-haiku-4-5
+      - RESEARCH_API_URL=${RESEARCH_API_URL:-}
+      - RESEARCH_API_KEY=${RESEARCH_API_KEY:-}
+      - RESEARCH_MODEL=${RESEARCH_MODEL:-}
       # whisper-live sidecar — used by the SPA Live tab (mic streaming).
       - LIVE_SERVICE_URL=${LIVE_SERVICE_URL:-http://whisper-live:7861}
     ports:
