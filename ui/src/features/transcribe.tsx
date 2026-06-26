@@ -235,7 +235,7 @@ export function TranscribeTab() {
 	const fmt = result?.format || opts.format;
 
 	return (
-		<div className="grid gap-4 lg:grid-cols-[minmax(0,340px)_1fr]">
+		<div className="grid gap-4 lg:grid-cols-[minmax(0,360px)_1fr] lg:items-start">
 			{/* ── Controls ── */}
 			<div className="flex flex-col gap-3 rounded border bg-card p-3">
 				<div className="flex gap-1">
@@ -412,14 +412,14 @@ export function TranscribeTab() {
 			</div>
 
 			{/* ── Result ── */}
-			<div className="min-w-0 rounded border bg-card p-3">
+			<div className="min-w-0 rounded border bg-card p-3 lg:min-h-[calc(100vh-12rem)]">
 				{!jobId && (
 					<div className="flex h-full min-h-80 items-center justify-center text-sm text-muted-foreground">
 						Submit a job to see the transcript here.
 					</div>
 				)}
 				{jobId && (
-					<div className="flex flex-col gap-3">
+					<div className="flex h-full flex-col gap-3">
 						<div className="flex items-center gap-3 font-mono text-xs">
 							<Badge
 								variant={
@@ -512,7 +512,7 @@ export function TranscribeTab() {
 								/>
 
 								{filteredLines ? (
-									<div className="min-h-80 overflow-auto rounded border bg-background p-3 font-mono text-xs leading-relaxed">
+									<div className="min-h-80 flex-1 overflow-auto rounded border bg-background p-3 font-mono text-xs leading-relaxed">
 										<div className="mb-2 text-[10px] text-muted-foreground">
 											{filteredLines.length} matching line
 											{filteredLines.length === 1 ? "" : "s"}
@@ -532,7 +532,7 @@ export function TranscribeTab() {
 									<Textarea
 										readOnly
 										value={displayed}
-										className="min-h-80 font-mono text-xs leading-relaxed"
+										className="min-h-80 flex-1 font-mono text-xs leading-relaxed"
 									/>
 								)}
 							</>
