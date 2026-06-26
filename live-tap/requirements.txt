@@ -1,2 +1,9 @@
-# Standalone live-capture tap (desktop_tap.py). Plus an `ffmpeg` binary on PATH.
+# Standalone live-capture tap (desktop_tap.py).
 websockets>=12
+
+# Native system-audio loopback (--loopback), no virtual cable. Install the one
+# for your OS; numpy is pulled in by both:
+#   Windows (WASAPI loopback):  pip install pyaudiowpatch
+#   Linux   (PulseAudio monitor): pip install soundcard
+# The ffmpeg device path (--device) needs an `ffmpeg` binary instead of these.
+# numpy>=1.24        # required by --loopback (transitive via the libs above)

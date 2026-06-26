@@ -5379,10 +5379,41 @@ def test_tap_no_bot_or_discord_dependency():
 
 def test_tap_has_capture_modes():
     """Device capture, listing, and the hardware-free self-test must all be
-    reachable from the CLI."""
+    reachable from the CLI — including the no-VB-Audio loopback + handshake."""
     for flag in ("--device", "--list-devices", "--self-test", "--partials",
-                 "--out", "--max-reconnects", "--input-format", "--ffmpeg"):
+                 "--out", "--max-reconnects", "--input-format", "--ffmpeg",
+                 "--loopback", "--list-loopback", "--loopback-device",
+                 "--language", "--translate"):
         assert flag in TAP_SRC, f"missing CLI flag: {flag}"
+
+
+def test_tap_loopback_is_native_no_virtual_cable():
+    """Loopback must use OS-native backends (pyaudiowpatch / soundcard),
+    auto-selected by platform — the whole point is no VB-Audio."""
+    assert "pyaudiowpatch" in TAP_SRC and "soundcard" in TAP_SRC
+    assert 'sys.platform == "win32"' in TAP_SRC
+    assert "include_loopback=True" in TAP_SRC  # soundcard loopback
+    assert "get_loopback_device_info_generator" in TAP_SRC  # WASAPI loopback
+
+
+def test_tap_pcm_and_resample_helpers():
+    """Pure conversion helpers: float[-1,1]→int16 (clamped) and linear resample."""
+    if tap is None:
+        return
+    import numpy as np
+    a = np.frombuffer(tap._to_pcm16(np.array([1.0, -1.0, 2.0, 0.0])), dtype="<i2")
+    assert a.tolist() == [32767, -32767, 32767, 0]  # clamped to int16 range
+    x = np.arange(48000, dtype=np.float32) / 48000
+    assert abs(tap._resample_linear(x, 48000, 16000).size - 16000) <= 1
+    assert tap._resample_linear(x, 16000, 16000) is x  # identity at same rate
+
+
+def test_tap_sends_handshake_config():
+    """--language/--translate must be sent as the first WS text frame (the
+    whisper-live per-session handshake), not dropped."""
+    assert 'config["language"]' in TAP_SRC
+    assert 'config["translate"]' in TAP_SRC
+    assert "if config:" in TAP_SRC and "ws.send(json.dumps(config))" in TAP_SRC
 
 
 def test_tap_auto_reconnects_like_the_rest_of_the_stack():

@@ -237,7 +237,7 @@ directly — same surface area.
 | `VLM_OCR_LANGUAGES` | `en` | CSV of EasyOCR language codes (e.g. `en,fr,de`) |
 
 ### whisper-live (streaming) service
-Used by the SPA Live tab (microphone **or** system/OBS audio via screen-share), the standalone `live-tap/` CLI, and the Discord voice bot (all stream raw 16 kHz mono PCM to `/ws-stream`).
+Used by the SPA Live tab (**mic**, **system/OBS** via screen-share, or **mic + system mixed** for meetings, with a live level meter, per-session language + translate, and auto-reconnect), the standalone `live-tap/` CLI, and the Discord voice bot (all stream raw 16 kHz mono PCM to `/ws-stream`). The `/ws-stream` protocol accepts an optional JSON first frame `{"language":"en","translate":true}` to pin language / translate per session (backward-compatible — binary-first clients use server defaults).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LIVE_MODEL` | `large-v3` | faster-whisper model for the streaming path |
@@ -366,10 +366,12 @@ alignment ~360MB). Crawl4AI and FlareSolverr each run their own Chromium
 | `flaresolverr` | `ghcr.io/flaresolverr/flaresolverr:v3.4.6` | Cloudflare-challenge fallback |
 
 Plus a standalone CLI (not a service): [`live-tap/`](live-tap/README.md) —
-`desktop_tap.py` captures OBS / Windows-sink / mic audio and prints the live
+`desktop_tap.py` captures OBS / desktop / mic audio and prints the live
 transcript to stdout, so you can pipe it into any LLM / research step without
-running the Discord bot. It only depends on the `whisper-live` `/ws-stream`
-contract.
+running the Discord bot. Supports **native system-audio loopback** (`--loopback`
+— WASAPI on Windows, PulseAudio monitor on Linux, **no virtual cable**) plus
+an ffmpeg device path, and the per-session `--language` / `--translate`
+handshake. It only depends on the `whisper-live` `/ws-stream` contract.
 
 ## Documentation
 

@@ -10,11 +10,22 @@ off the end of:
 
 Audio source
 ------------
-whisper-live runs in Docker and cannot see Windows audio devices, so the
-*capture* happens here via an ffmpeg subprocess (run this on Windows, or in
-WSL pointing `--ffmpeg ffmpeg.exe` at the Windows binary). Docker Desktop
-forwards container port 7861 to localhost on both Windows and WSL, so the
-default `--url ws://localhost:7861/ws-stream` works from either side.
+whisper-live runs in Docker and cannot see the host's audio devices, so the
+*capture* happens here. Three ways:
+
+  • `--loopback` — OS-native system-audio capture, NO virtual cable: WASAPI
+    loopback on Windows (pyaudiowpatch), PulseAudio/PipeWire monitor on Linux
+    (soundcard). Captures whatever is playing. `pip install pyaudiowpatch`
+    (Windows) or `pip install soundcard` (Linux). List devices:
+    `--list-loopback`.
+  • ffmpeg device (default) — `--device 'audio=...'` via dshow/pulse. Needs a
+    capturable device (a real mic, or a virtual cable for system audio).
+  • `--self-test` — synthetic tone, no hardware (connectivity check).
+
+Docker Desktop forwards container port 7861 to localhost on both Windows and
+WSL, so the default `--url ws://localhost:7861/ws-stream` works from either
+side. For Windows system audio, run on Windows (loopback needs the host APIs).
+Optional session handshake: `--language en` / `--translate`.
 
 Getting OBS / desktop audio into a capturable device
 ----------------------------------------------------
@@ -117,6 +128,134 @@ async def sine_source(seconds: float = 5.0):
         await asyncio.sleep(n / SAMPLE_RATE)  # pace at real-time
 
 
+# ── native loopback (no virtual cable) ──────────────────────────────────
+# Captures whatever the system is *playing* via OS-native loopback — WASAPI on
+# Windows (pyaudiowpatch), PulseAudio/PipeWire monitor on Linux (soundcard).
+# No VB-Audio / virtual cable, no driver install. Backend auto-selected per OS.
+def _to_pcm16(mono_float) -> bytes:
+    """float32 mono in [-1, 1] → little-endian int16 PCM bytes."""
+    import numpy as np
+    return (np.clip(mono_float, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+
+
+def _resample_linear(mono_float, in_rate: int, out_rate: int = SAMPLE_RATE):
+    """Nearest-sample linear resample of a mono float array to out_rate. Good
+    enough for speech (whisper is robust to mild aliasing); avoids a scipy dep."""
+    import numpy as np
+    if in_rate == out_rate or mono_float.size == 0:
+        return mono_float
+    n_out = int(round(mono_float.size * out_rate / in_rate))
+    idx = np.clip(
+        (np.arange(n_out) * in_rate / out_rate).astype(np.int64), 0, mono_float.size - 1
+    )
+    return mono_float[idx]
+
+
+async def _soundcard_source(device_name: str | None):
+    """Linux (and cross-platform fallback) loopback via the `soundcard` pkg,
+    which resamples to SAMPLE_RATE for us."""
+    import numpy as np
+    import soundcard as sc
+
+    if device_name:
+        mic = sc.get_microphone(device_name, include_loopback=True)
+    else:
+        try:
+            mic = sc.get_microphone(sc.default_speaker().name, include_loopback=True)
+        except Exception:
+            mic = sc.default_microphone()  # Linux monitor source fallback
+    log(f"[tap] loopback (soundcard): {mic.name}")
+    loop = asyncio.get_event_loop()
+    block = SAMPLE_RATE // 10  # ~100 ms
+    with mic.recorder(samplerate=SAMPLE_RATE, channels=None) as rec:
+        while True:
+            data = await loop.run_in_executor(None, rec.record, block)
+            mono = data.mean(axis=1) if getattr(data, "ndim", 1) > 1 else data
+            yield _to_pcm16(mono)
+
+
+def _pwp_default_loopback(p):
+    """Resolve the WASAPI loopback device for the default render endpoint."""
+    import pyaudiowpatch as pyaudio
+    wasapi = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+    dev = p.get_device_info_by_index(wasapi["defaultOutputDevice"])
+    if not dev.get("isLoopbackDevice"):
+        for lb in p.get_loopback_device_info_generator():
+            if dev["name"] in lb["name"]:
+                return lb
+    return dev
+
+
+async def _pyaudiowpatch_source(device_name: str | None):
+    """Windows WASAPI loopback via pyaudiowpatch (int16 native rate → 16 kHz mono)."""
+    import numpy as np
+    import pyaudiowpatch as pyaudio
+
+    p = pyaudio.PyAudio()
+    try:
+        if device_name:
+            dev = next(
+                d for d in p.get_loopback_device_info_generator()
+                if device_name.lower() in d["name"].lower()
+            )
+        else:
+            dev = _pwp_default_loopback(p)
+        in_rate = int(dev["defaultSampleRate"])
+        in_ch = int(dev["maxInputChannels"]) or 2
+        block = int(in_rate * 0.1)
+        log(f"[tap] loopback (pyaudiowpatch): {dev['name']} {in_rate}Hz {in_ch}ch")
+        stream = p.open(
+            format=pyaudio.paInt16, channels=in_ch, rate=in_rate,
+            frames_per_buffer=block, input=True, input_device_index=dev["index"],
+        )
+        loop = asyncio.get_event_loop()
+        try:
+            while True:
+                raw = await loop.run_in_executor(None, stream.read, block, False)
+                a = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                if in_ch > 1:
+                    a = a.reshape(-1, in_ch).mean(axis=1)
+                yield _to_pcm16(_resample_linear(a, in_rate))
+        finally:
+            stream.stop_stream()
+            stream.close()
+    finally:
+        p.terminate()
+
+
+async def loopback_source(device_name: str | None = None):
+    """OS-native system-audio loopback. Windows → pyaudiowpatch (fall back to
+    soundcard); everything else → soundcard."""
+    if sys.platform == "win32":
+        try:
+            import pyaudiowpatch  # noqa: F401
+        except ImportError:
+            log("[tap] pyaudiowpatch not installed; falling back to soundcard")
+        else:
+            async for b in _pyaudiowpatch_source(device_name):
+                yield b
+            return
+    async for b in _soundcard_source(device_name):
+        yield b
+
+
+async def list_loopback() -> int:
+    """Enumerate available loopback devices for the current OS."""
+    if sys.platform == "win32":
+        import pyaudiowpatch as pyaudio
+        p = pyaudio.PyAudio()
+        try:
+            for d in p.get_loopback_device_info_generator():
+                log(f"  [{d['index']}] {d['name']} ({int(d['defaultSampleRate'])} Hz)")
+        finally:
+            p.terminate()
+    else:
+        import soundcard as sc
+        for m in sc.all_microphones(include_loopback=True):
+            log(f"  {m.name}")
+    return 0
+
+
 # ── transcript sink ────────────────────────────────────────────────────────────
 class TranscriptPrinter:
     """Renders commit/partial frames to stdout (commits) + stderr (partials).
@@ -173,14 +312,19 @@ async def _producer(source, queue: asyncio.Queue) -> None:
     await queue.put(None)  # sentinel: source ended
 
 
-async def _session(url: str, queue: asyncio.Queue, printer: TranscriptPrinter):
+async def _session(url: str, queue: asyncio.Queue, printer: TranscriptPrinter,
+                   config: dict | None = None):
     """One WS connection. Returns ('ended'|'dropped', connected_seconds).
 
     'ended'   — audio source finished; transcript flushed cleanly.
     'dropped' — whisper-live closed the socket (restart / capacity / network).
+    `config` (e.g. {"language": "en", "translate": true}) is sent as the first
+    text frame before any audio — the whisper-live per-session handshake.
     """
     t0 = asyncio.get_event_loop().time()
     async with websockets.connect(url, max_size=None, ping_interval=20) as ws:
+        if config:
+            await ws.send(json.dumps(config))
         log("[tap] connected — streaming audio (Ctrl-C to stop)")
         done = asyncio.Event()
 
@@ -210,7 +354,8 @@ async def _session(url: str, queue: asyncio.Queue, printer: TranscriptPrinter):
             return "dropped", asyncio.get_event_loop().time() - t0
 
 
-async def run(url: str, source, show_partials: bool, max_reconnects: int, out=None) -> int:
+async def run(url: str, source, show_partials: bool, max_reconnects: int,
+              out=None, config: dict | None = None) -> int:
     """Stream `source` to whisper-live, auto-reconnecting on drops.
 
     Mirrors the SPA / voice-bot resilience: a whisper-live restart or network
@@ -228,7 +373,7 @@ async def run(url: str, source, show_partials: bool, max_reconnects: int, out=No
     try:
         while True:
             try:
-                status, elapsed = await _session(url, queue, printer)
+                status, elapsed = await _session(url, queue, printer, config)
             except (OSError, websockets.WebSocketException) as e:
                 status, elapsed = "dropped", 0.0
                 log(f"[tap] connection failed: {e}")
@@ -269,21 +414,47 @@ def main() -> int:
     p.add_argument("--max-reconnects", type=int, default=5,
                    help="consecutive reconnect attempts before giving up "
                         "(reset after a >30 s healthy session) (default: %(default)s)")
+    p.add_argument("--loopback", action="store_true",
+                   help="capture system audio via OS-native loopback (no virtual "
+                        "cable): WASAPI on Windows, PulseAudio monitor on Linux")
+    p.add_argument("--loopback-device", metavar="NAME",
+                   help="loopback device name substring (default: system default "
+                        "output). List with --list-loopback")
+    p.add_argument("--language", metavar="LANG",
+                   help="pin spoken language (e.g. en) via the session handshake; "
+                        "default = server auto-detect")
+    p.add_argument("--translate", action="store_true",
+                   help="translate to English (session handshake)")
     p.add_argument("--list-devices", action="store_true",
                    help="list ffmpeg dshow devices and exit")
+    p.add_argument("--list-loopback", action="store_true",
+                   help="list OS-native loopback devices and exit")
     p.add_argument("--self-test", action="store_true",
                    help="send a 5 s synthetic tone instead of capturing audio")
     args = p.parse_args()
+
+    config: dict = {}
+    if args.language:
+        config["language"] = args.language
+    if args.translate:
+        config["translate"] = True
+    config = config or None
 
     out = open(args.out, "a", encoding="utf-8") if args.out else None
     try:
         if args.list_devices:
             return asyncio.run(list_devices(args.ffmpeg))
+        if args.list_loopback:
+            return asyncio.run(list_loopback())
         if args.self_test:
             return asyncio.run(run(args.url, sine_source(), args.partials,
-                                   args.max_reconnects, out))
-        src = ffmpeg_source(args.ffmpeg, args.device, args.input_format)
-        return asyncio.run(run(args.url, src, args.partials, args.max_reconnects, out))
+                                   args.max_reconnects, out, config))
+        if args.loopback:
+            src = loopback_source(args.loopback_device)
+        else:
+            src = ffmpeg_source(args.ffmpeg, args.device, args.input_format)
+        return asyncio.run(run(args.url, src, args.partials, args.max_reconnects,
+                               out, config))
     except KeyboardInterrupt:
         log("\n[tap] stopped")
         return 0
