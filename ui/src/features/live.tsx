@@ -12,6 +12,14 @@ import {
 } from "@/components/ui/select";
 import { getLiveHealth, streamResearch } from "@/lib/api";
 
+// Sent automatically when the Research button is clicked with transcript content.
+// The LLM system prompt is tuned to respond to this with entity extraction.
+const AUTO_RESEARCH_QUERY =
+	"Analyze the call: extract and explain every notable entity, product, company, " +
+	"technical term, and acronym mentioned. For each one, give a 1-2 sentence explanation " +
+	"from your general knowledge. Then note any comparisons, decisions, or open questions " +
+	"being discussed.";
+
 interface ResearchEntry {
 	id: number;
 	question: string;
@@ -746,9 +754,18 @@ export function LiveTab() {
 				<Button
 					variant={researchOpen ? "default" : "outline"}
 					onClick={() => {
-						setResearchOpen((v) => !v);
-						if (!researchOpen)
-							setTimeout(() => researchInputRef.current?.focus(), 50);
+						if (researchOpen) {
+							setResearchOpen(false);
+						} else {
+							setResearchOpen(true);
+							// Auto-fire entity extraction if there's transcript content.
+							// The question input is still available for follow-ups.
+							if (committedRef.current.trim()) {
+								askResearch(AUTO_RESEARCH_QUERY);
+							} else {
+								setTimeout(() => researchInputRef.current?.focus(), 50);
+							}
+						}
 					}}
 				>
 					Research
@@ -833,12 +850,14 @@ export function LiveTab() {
 						<div className="flex min-h-64 flex-1 flex-col gap-3 overflow-auto rounded border bg-card p-3 font-mono text-xs">
 							{researchHistory.length === 0 ? (
 								<span className="text-muted-foreground">
-									Ask anything about the call. The last ~3000 chars of
-									transcript are sent as context automatically.
+									Start the call, then press{" "}
+									<span className="text-foreground font-semibold">Research</span>{" "}
+									— it auto-extracts entities, products, and
+									terms from the transcript and looks them up.
 									<br /><br />
-									Tip: select text in the transcript, then press{" "}
-									<kbd className="rounded bg-muted px-1">/</kbd> to ask
-									about it.
+									Use the input below for follow-up questions, or
+									select text and press{" "}
+									<kbd className="rounded bg-muted px-1">/</kbd>.
 								</span>
 							) : (
 								researchHistory.map((e) => (

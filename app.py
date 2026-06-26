@@ -3741,17 +3741,24 @@ async def ws_live_stream(websocket):
 # populates it automatically so the user just types the question.
 RESEARCH_SYSTEM_PROMPT = os.environ.get(
     "RESEARCH_SYSTEM_PROMPT",
-    "You are a concise research assistant embedded in a live call transcription tool. "
-    "The user will give you recent transcript text and a question. "
-    "Answer directly and concisely — 1-3 short paragraphs maximum. "
-    "If the transcript doesn't contain enough information to answer, say so and answer "
-    "from general knowledge. Do not repeat the transcript back verbatim.",
+    "You are a research assistant embedded in a live call transcription tool. "
+    "You help the caller look things up mid-call without switching tabs.\n\n"
+    "When asked to analyse, summarise, or find key topics (the auto-research trigger):\n"
+    "- List every notable entity: products, companies, people, technical terms, "
+    "acronyms, jargon — anything the caller might need to look up.\n"
+    "- For each entity, give a 1-2 sentence explanation from your general knowledge "
+    "(not just what the transcript says).\n"
+    "- Highlight any comparisons, decisions, or open questions being discussed.\n"
+    "- Use **bold** for entity names. Keep each entry to 1-2 lines.\n\n"
+    "For specific follow-up questions: answer directly in 1-3 short paragraphs. "
+    "Use the transcript for context, your general knowledge for definitions. "
+    "Do not repeat the transcript verbatim.",
 )
 RESEARCH_MODEL = os.environ.get(
     "RESEARCH_MODEL",
     os.environ.get("LLM_MODEL", LLM_SYNTHESIS_MODEL),
 )
-RESEARCH_MAX_TOKENS = int(os.environ.get("RESEARCH_MAX_TOKENS", "512"))
+RESEARCH_MAX_TOKENS = int(os.environ.get("RESEARCH_MAX_TOKENS", "800"))
 
 
 async def api_research(request: Request):
