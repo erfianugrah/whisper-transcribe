@@ -100,6 +100,12 @@ body,
   min-height: 100%;
 }
 
+/* Nudge the base rem up so every rem-based size (text-xs/-sm, spacing) scales
+   proportionally — the whole SPA reads a touch larger without per-element edits. */
+html {
+  font-size: 17px;
+}
+
 body {
   margin: 0;
   background: var(--background);

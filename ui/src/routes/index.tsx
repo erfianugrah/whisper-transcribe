@@ -65,7 +65,7 @@ function Home() {
 		window.history.replaceState(null, "", `#${id}`);
 	};
 	return (
-		<div className="mx-auto max-w-5xl px-4 py-5">
+		<div className="mx-auto max-w-[1600px] px-6 py-5">
 			<header className="mb-4">
 				<div className="flex items-center justify-between gap-4">
 					<h1 className="text-base font-bold tracking-tight">
