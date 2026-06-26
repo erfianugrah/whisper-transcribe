@@ -18,6 +18,16 @@ Two Python services + supporting infra, all in one compose stack:
 Plus: valkey (queue), crawl4ai + flaresolverr (web scraper for `tldr`
 on URLs). All run locally on this WSL2 host via Docker Desktop.
 
+There is also a **standalone CLI** (not a compose service): `live-tap/desktop_tap.py`
+captures OBS / Windows-sink / mic audio via an ffmpeg subprocess and streams
+16 kHz mono PCM to the `whisper-live` `/ws-stream` endpoint, printing the
+transcript to stdout (one line per utterance) for piping into an LLM. It is
+bot-free by design — its only dependency is the `/ws-stream` contract, and it
+auto-reconnects on a whisper-live drop like the SPA Live tab and voice bot.
+Run via `make live-tap` (or `make live-tap-selftest` for a hardware-free
+connectivity check). Lives in `compile-check` and the regression suite
+(`test_tap_*`).
+
 **Two deploy modes:** the default (`make up`) is co-deployed with
 llm-compose — it owns the external `llmc` net and serves `model_proxy`.
 For transcription-only use without llm-compose, `make up-standalone`
@@ -47,6 +57,7 @@ correct restart-vs-recreate semantics.
 | Bot env change | `make recreate-bot` (NOT `restart-bot` — in-place restart does NOT re-read env) |
 | Whisper code change | `make build-whisper && make recreate-whisper` (compose.yaml does NOT bind-mount source despite the misleading `restart-whisper` help text) |
 | Bring up WITHOUT llm-compose (transcription core only) | `make up-standalone` / tear down with `make down-standalone` |
+| Capture OBS/desktop/mic audio → live transcript on stdout (no bot) | `make live-tap` (verify reachability first with `make live-tap-selftest`) |
 
 ### Footguns
 

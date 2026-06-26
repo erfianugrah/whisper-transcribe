@@ -1,0 +1,2 @@
+# Standalone live-capture tap (desktop_tap.py). Plus an `ffmpeg` binary on PATH.
+websockets>=12

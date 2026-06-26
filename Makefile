@@ -73,6 +73,12 @@ up-bot: ## Start only bot
 up-standalone: ## Start transcription core WITHOUT llm-compose (valkey+whisper+whisper-live)
 	$(COMPOSE_STANDALONE) up -d valkey whisper whisper-live
 
+live-tap: ## Stream OBS/desktop/mic audio to whisper-live, print transcript (see live-tap/README.md). Override with ARGS="--device '...'"
+	@python3 live-tap/desktop_tap.py $(ARGS)
+
+live-tap-selftest: ## Verify the live-tap can reach whisper-live (5s sine tone, no audio hardware)
+	@python3 live-tap/desktop_tap.py --self-test
+
 down: ## Stop and remove containers
 	$(COMPOSE_RUNTIME) down
 
@@ -192,9 +198,9 @@ test: lint ## Lint + full E2E regression suite (no docker required)
 	@python3 tests/test_regression.py
 
 compile-check: ## ast.parse + py_compile (catches syntax + bytecode errors)
-	@python3 -m py_compile app.py bot/main.py bot/prompts.py
-	@echo "  py_compile: app.py, bot/main.py, bot/prompts.py OK"
-	@python3 -c "import ast; [ast.parse(open(p).read()) for p in ['app.py','bot/main.py','bot/prompts.py']]"
+	@python3 -m py_compile app.py bot/main.py bot/prompts.py live-tap/desktop_tap.py
+	@echo "  py_compile: app.py, bot/main.py, bot/prompts.py, live-tap/desktop_tap.py OK"
+	@python3 -c "import ast; [ast.parse(open(p).read()) for p in ['app.py','bot/main.py','bot/prompts.py','live-tap/desktop_tap.py']]"
 	@echo "  ast.parse OK"
 
 compose-check: ## Validate compose YAML (prod + dev + standalone overlays)

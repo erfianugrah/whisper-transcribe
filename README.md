@@ -237,7 +237,7 @@ directly — same surface area.
 | `VLM_OCR_LANGUAGES` | `en` | CSV of EasyOCR language codes (e.g. `en,fr,de`) |
 
 ### whisper-live (streaming) service
-Used by the SPA mic Live tab and the Discord voice bot (both stream raw 16 kHz mono PCM to `/ws-stream`).
+Used by the SPA Live tab (microphone **or** system/OBS audio via screen-share), the standalone `live-tap/` CLI, and the Discord voice bot (all stream raw 16 kHz mono PCM to `/ws-stream`).
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LIVE_MODEL` | `large-v3` | faster-whisper model for the streaming path |
@@ -356,16 +356,23 @@ alignment ~360MB). Crawl4AI and FlareSolverr each run their own Chromium
 | Service | Image | Purpose |
 |---------|-------|---------|
 | `whisper` | built locally | Transcription + VLM frame description |
-| `whisper-live` | built locally | Low-latency streaming ASR (SPA mic Live tab + Discord voice bot) |
+| `whisper-live` | built locally | Low-latency streaming ASR (SPA Live tab — mic or system/OBS — + `live-tap/` CLI + Discord voice bot) |
 | `bot` | built locally | Discord interface |
 | `valkey` | `valkey/valkey:9-alpine` | Job queue + transcript cache (AOF-persisted) |
 | `crawl4ai` | `unclecode/crawl4ai:0.7.4` | Article scraper (readability → Markdown) |
 | `flaresolverr` | `ghcr.io/flaresolverr/flaresolverr:v3.4.6` | Cloudflare-challenge fallback |
 
+Plus a standalone CLI (not a service): [`live-tap/`](live-tap/README.md) —
+`desktop_tap.py` captures OBS / Windows-sink / mic audio and prints the live
+transcript to stdout, so you can pipe it into any LLM / research step without
+running the Discord bot. It only depends on the `whisper-live` `/ws-stream`
+contract.
+
 ## Documentation
 
 | Doc | Contents |
 |-----|----------|
+| [live-tap/README.md](live-tap/README.md) | Standalone audio → transcript tap (OBS / desktop / mic → stdout), virtual-cable routing, `make live-tap` |
 | [docs/discord-bot-guide.md](docs/discord-bot-guide.md) | Full Discord bot guide — setup, every interaction path, slash commands, voice-channel live transcription, per-user/channel/server config, rate limits, diagnostics |
 | [docs/design/multilingual.md](docs/design/multilingual.md) | Multilingual design — language ID pre-pass + translate-to-English flow |
 | [docs/design/global-queue.md](docs/design/global-queue.md) | Global job-queue design notes |

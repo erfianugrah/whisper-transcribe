@@ -39,6 +39,10 @@ export function LiveTab() {
 	const [trackInfo, setTrackInfo] = useState("");
 	const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
 	const [deviceId, setDeviceId] = useState<string>("");
+	// "mic" → getUserMedia (a selected input device); "system" → getDisplayMedia
+	// (desktop / tab / OBS audio — the user picks a surface and ticks "share
+	// audio"). Both feed the identical downsample → /ws-stream graph below.
+	const [source, setSource] = useState<"mic" | "system">("mic");
 	const health = useQuery({
 		queryKey: ["live-health"],
 		queryFn: getLiveHealth,
@@ -108,24 +112,62 @@ export function LiveTab() {
 	}, []);
 
 	const start = async () => {
-		if (!navigator.mediaDevices?.getUserMedia) {
-			toast.error("Microphone needs a secure context (https or localhost).");
+		const md = navigator.mediaDevices;
+		if (!md?.getUserMedia) {
+			toast.error("Capture needs a secure context (https or localhost).");
 			return;
 		}
 		try {
-			// Known-working capture config. autoGainControl is load-bearing for
-			// quiet USB mics.
-			const stream = await navigator.mediaDevices.getUserMedia({
-				audio: {
-					channelCount: 1,
-					echoCancellation: true,
-					noiseSuppression: true,
-					autoGainControl: true,
-					...(deviceId ? { deviceId: { exact: deviceId } } : {}),
-				},
-			});
+			let stream: MediaStream;
+			if (source === "system") {
+				if (!md.getDisplayMedia) {
+					toast.error(
+						"System-audio capture needs getDisplayMedia (Chrome/Edge).",
+					);
+					return;
+				}
+				// Chrome only exposes the "share audio" checkbox when video is also
+				// requested. Pick a tab/window/screen, ENABLE "Share tab/system
+				// audio", then we drop the video track and keep only audio. Raw
+				// capture: no echo-cancel / noise-suppress / AGC on system audio.
+				const disp = await md.getDisplayMedia({
+					video: true,
+					audio: {
+						channelCount: 1,
+						echoCancellation: false,
+						noiseSuppression: false,
+						autoGainControl: false,
+					},
+				});
+				for (const v of disp.getVideoTracks()) v.stop();
+				if (disp.getAudioTracks().length === 0) {
+					for (const t of disp.getTracks()) t.stop();
+					toast.error(
+						'No audio shared — re-pick and tick "Share tab/system audio".',
+					);
+					return;
+				}
+				stream = disp;
+			} else {
+				// Known-working mic config. autoGainControl is load-bearing for
+				// quiet USB mics.
+				stream = await md.getUserMedia({
+					audio: {
+						channelCount: 1,
+						echoCancellation: true,
+						noiseSuppression: true,
+						autoGainControl: true,
+						...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+					},
+				});
+			}
 			streamRef.current = stream;
 			if (devices.every((d) => !d.label)) loadDevices();
+			// A user closing the browser's "sharing" bar ends the track — stop
+			// cleanly so the UI returns to idle.
+			for (const t of stream.getAudioTracks()) {
+				t.addEventListener("ended", () => stop());
+			}
 			const track = stream.getAudioTracks()[0];
 			const s = track?.getSettings?.() ?? {};
 			setTrackInfo(
@@ -306,10 +348,29 @@ export function LiveTab() {
 			)}
 
 			<div className="flex flex-wrap items-center gap-2">
+				<div className="flex items-center gap-1">
+					<Button
+						variant={source === "mic" ? "default" : "outline"}
+						size="sm"
+						disabled={recording}
+						onClick={() => setSource("mic")}
+					>
+						Mic
+					</Button>
+					<Button
+						variant={source === "system" ? "default" : "outline"}
+						size="sm"
+						disabled={recording}
+						onClick={() => setSource("system")}
+						title="Capture desktop / tab / OBS audio (tick 'share audio' in the picker)"
+					>
+						System / OBS
+					</Button>
+				</div>
 				<Select
 					value={deviceId}
 					onValueChange={setDeviceId}
-					disabled={recording}
+					disabled={recording || source === "system"}
 				>
 					<SelectTrigger className="w-72">
 						<SelectValue placeholder="Default microphone" />
@@ -338,7 +399,7 @@ export function LiveTab() {
 				</Button>
 				{!recording ? (
 					<Button onClick={start} disabled={unavailable}>
-						● Start mic
+						{source === "system" ? "● Capture system audio" : "● Start mic"}
 					</Button>
 				) : (
 					<Button variant="destructive" onClick={stop}>
@@ -405,10 +466,13 @@ export function LiveTab() {
 			</div>
 
 			<p className="text-xs text-muted-foreground">
-				Mic audio streams continuously to the whisper-live sidecar, which runs
-				LocalAgreement streaming: it transcribes a growing buffer and commits
-				only words confirmed across consecutive passes — low latency without the
-				short-window hallucinations.
+				{source === "system"
+					? "System / OBS audio (desktop, tab, or window — tick 'share audio' in the picker) streams continuously to the whisper-live sidecar."
+					: "Mic audio streams continuously to the whisper-live sidecar."}{" "}
+				It runs LocalAgreement streaming: transcribes a growing buffer and
+				commits only words confirmed across consecutive passes — low latency
+				without the short-window hallucinations. For a headless / no-browser
+				capture, use the standalone CLI in <code>live-tap/</code>.
 			</p>
 		</div>
 	);

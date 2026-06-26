@@ -125,6 +125,16 @@ import prompts as p  # noqa: E402
 APP_SRC = open(os.path.join(os.path.dirname(__file__), "..", "app.py")).read()
 BOT_SRC = open(os.path.join(os.path.dirname(__file__), "..", "bot", "main.py")).read()
 
+# Standalone live-capture tap (live-tap/desktop_tap.py). Source-string assertions
+# always run; the module is imported for unit tests only when `websockets` is
+# available (its sole third-party dep) so the suite stays green without it.
+TAP_SRC = open(os.path.join(os.path.dirname(__file__), "..", "live-tap", "desktop_tap.py")).read()
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "live-tap"))
+try:
+    import desktop_tap as tap  # noqa: E402
+except Exception:
+    tap = None
+
 
 # ─── 1. Permanent error classification ────────────────────────────────────────
 
@@ -5345,6 +5355,76 @@ def test_voice_optout_drop_user_removes_session():
     assert 42 not in mgr._pending
     assert 42 not in mgr._creating
     assert len(scheduled) == 1  # close was scheduled on the loop
+
+
+# ─── live-tap standalone capturer (live-tap/desktop_tap.py) ─────────────────
+
+
+def test_tap_targets_ws_stream_pcm_contract():
+    """The tap must stream to whisper-live's /ws-stream at 16 kHz mono (the
+    binary-PCM streaming contract), not /ws-url or /transcribe-chunk."""
+    assert "/ws-stream" in TAP_SRC
+    assert "SAMPLE_RATE = 16000" in TAP_SRC
+    assert '"-ac", "1"' in TAP_SRC
+    assert '"-ar", str(SAMPLE_RATE)' in TAP_SRC
+    assert '"s16le"' in TAP_SRC
+
+
+def test_tap_no_bot_or_discord_dependency():
+    """The whole point: standalone, no Discord/bot import. Keep it that way."""
+    assert "discord" not in TAP_SRC
+    assert "import main" not in TAP_SRC
+    assert "import websockets" in TAP_SRC
+
+
+def test_tap_has_capture_modes():
+    """Device capture, listing, and the hardware-free self-test must all be
+    reachable from the CLI."""
+    for flag in ("--device", "--list-devices", "--self-test", "--partials",
+                 "--out", "--max-reconnects", "--input-format", "--ffmpeg"):
+        assert flag in TAP_SRC, f"missing CLI flag: {flag}"
+
+
+def test_tap_auto_reconnects_like_the_rest_of_the_stack():
+    """A whisper-live drop must re-dial with backoff (parity with the SPA Live
+    tab and the voice bot), bounded by max_reconnects, with audio decoupled
+    via a queue so it keeps flowing across reconnects."""
+    assert "async def _session(" in TAP_SRC
+    assert '"dropped"' in TAP_SRC and '"ended"' in TAP_SRC
+    assert "max_reconnects" in TAP_SRC
+    assert "backoff" in TAP_SRC
+    assert "async def _producer(" in TAP_SRC
+    assert "asyncio.Queue" in TAP_SRC
+
+
+def test_tap_transcript_printer_commit_and_eou():
+    """commit frames append (space-joined); eou emits a newline so a pipe gets
+    one line per utterance. partial/error stay off the stdout sink."""
+    if tap is None:
+        return  # websockets unavailable; source assertions cover the contract
+    import io
+    buf = io.StringIO()
+    pr = tap.TranscriptPrinter(show_partials=False, out=buf)
+    assert pr.handle({"type": "commit", "text": "hello"}) is False
+    assert pr.handle({"type": "commit", "text": "world", "eou": True}) is False
+    assert pr.handle({"type": "partial", "text": "prov"}) is False
+    assert pr.handle({"type": "error", "message": "x"}) is False
+    assert pr.handle({"type": "done"}) is True
+    assert buf.getvalue() == "hello world\n"
+
+
+def test_tap_sine_source_emits_16k_pcm():
+    """The self-test tone must yield non-empty int16 PCM blocks."""
+    if tap is None:
+        return
+    async def _drain():
+        total = 0
+        async for block in tap.sine_source(0.3):
+            assert isinstance(block, (bytes, bytearray))
+            assert len(block) % 2 == 0  # int16 frames
+            total += len(block)
+        return total
+    assert asyncio.run(_drain()) > 0
 
 
 # ─── Test runner ─────────────────────────────────────────────────────────────
