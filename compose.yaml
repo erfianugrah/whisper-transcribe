@@ -155,7 +155,8 @@ services:
       # for faster on-screen text. Override via env if GPU contention bites.
       - LIVE_PROCESS_INTERVAL=${LIVE_PROCESS_INTERVAL:-0.4}
       - LIVE_MIN_CHUNK_S=${LIVE_MIN_CHUNK_S:-2.0}
-      - LIVE_TAIL_SILENCE_S=${LIVE_TAIL_SILENCE_S:-0.4}
+      - LIVE_TAIL_SILENCE_S=${LIVE_TAIL_SILENCE_S:-0.8}
+      - LIVE_BEAM_SIZE=${LIVE_BEAM_SIZE:-5}
       # Pin spoken language (e.g. "en") to skip per-pass auto-detect; unset = auto.
       - LIVE_LANGUAGE=${LIVE_LANGUAGE:-}
       # Diagnostics: throttled per-stream level/throughput log cadence (s).
