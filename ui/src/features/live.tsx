@@ -1,5 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+	type ReactNode,
+	useCallback,
+	useEffect,
+	useRef,
+	useState,
+} from "react";
 import { toast } from "sonner";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,6 +34,81 @@ interface ResearchEntry {
 }
 
 const TARGET_SR = 16000;
+
+// ── Minimal markdown renderer for research answers ──────────────────────────
+// Handles the subset the research model emits: **bold**, `code`, bullet lists
+// (- / *), and blank-line paragraph breaks. Deliberately tiny — avoids pulling
+// react-markdown + its dependency tree into the bundle. Streams gracefully:
+// an unterminated **bold** simply renders as literal text until it closes.
+function renderInline(text: string): ReactNode[] {
+	const nodes: ReactNode[] = [];
+	const re = /(\*\*[^*]+\*\*|`[^`]+`)/g;
+	let last = 0;
+	let key = 0;
+	for (const m of text.matchAll(re)) {
+		const idx = m.index ?? 0;
+		if (idx > last) nodes.push(text.slice(last, idx));
+		const tok = m[0];
+		if (tok.startsWith("**")) {
+			nodes.push(
+				<strong key={key++} className="text-foreground">
+					{tok.slice(2, -2)}
+				</strong>,
+			);
+		} else {
+			nodes.push(
+				<code key={key++} className="rounded bg-muted px-1 text-foreground">
+					{tok.slice(1, -1)}
+				</code>,
+			);
+		}
+		last = idx + tok.length;
+	}
+	if (last < text.length) nodes.push(text.slice(last));
+	return nodes;
+}
+
+function Markdown({ text }: { text: string }) {
+	const blocks: ReactNode[] = [];
+	let bullets: string[] = [];
+	let k = 0;
+	const flush = () => {
+		if (bullets.length) {
+			const items = bullets;
+			blocks.push(
+				<ul key={`ul-${k++}`} className="ml-4 list-disc space-y-1">
+					{items.map((b, i) => (
+						// biome-ignore lint/suspicious/noArrayIndexKey: stream-stable order
+						<li key={i} className="break-words">
+							{renderInline(b)}
+						</li>
+					))}
+				</ul>,
+			);
+			bullets = [];
+		}
+	};
+	for (const raw of text.split("\n")) {
+		const line = raw.replace(/\s+$/, "");
+		const bullet = line.match(/^\s*[-*]\s+(.*)$/);
+		if (bullet) {
+			bullets.push(bullet[1]);
+			continue;
+		}
+		flush();
+		if (line.trim() === "") {
+			blocks.push(<div key={`sp-${k++}`} className="h-1.5" />);
+		} else {
+			blocks.push(
+				<p key={`p-${k++}`} className="break-words">
+					{renderInline(line)}
+				</p>,
+			);
+		}
+	}
+	flush();
+	return <>{blocks}</>;
+}
 const WAVE_HEIGHT = 72;
 const SILENCE_RMS = 0.004; // below this = effectively no audio
 const SILENCE_AFTER_MS = 3000; // warn after this long with no audible input
@@ -113,7 +194,10 @@ export function LiveTab() {
 			if (!question.trim() || researchBusy) return;
 			const ctx = committedRef.current.slice(-3000);
 			const id = Date.now();
-			setResearchHistory((h) => [...h, { id, question, answer: "", streaming: true }]);
+			setResearchHistory((h) => [
+				...h,
+				{ id, question, answer: "", streaming: true },
+			]);
 			setResearchBusy(true);
 			setResearchQuestion("");
 			setSelection("");
@@ -121,14 +205,20 @@ export function LiveTab() {
 			try {
 				for await (const chunk of streamResearch({ question, context: ctx })) {
 					setResearchHistory((h) =>
-						h.map((e) => (e.id === id ? { ...e, answer: e.answer + chunk } : e)),
+						h.map((e) =>
+							e.id === id ? { ...e, answer: e.answer + chunk } : e,
+						),
 					);
 				}
 			} catch (err) {
 				setResearchHistory((h) =>
 					h.map((e) =>
 						e.id === id
-							? { ...e, answer: e.answer + ` [error: ${err}]`, streaming: false }
+							? {
+									...e,
+									answer: e.answer + ` [error: ${err}]`,
+									streaming: false,
+								}
 							: e,
 					),
 				);
@@ -802,7 +892,9 @@ export function LiveTab() {
 			)}
 
 			{/* Main content: transcript + (optional) research panel side-by-side */}
-			<div className={`flex gap-3 ${researchOpen ? "flex-col lg:flex-row" : ""}`}>
+			<div
+				className={`flex gap-3 ${researchOpen ? "flex-col lg:flex-row" : ""}`}
+			>
 				{/* Transcript */}
 				<div
 					ref={transcriptDivRef}
@@ -811,7 +903,8 @@ export function LiveTab() {
 						const sel = window.getSelection();
 						const text = sel?.toString().trim() ?? "";
 						setSelection(
-							text.length > 5 && transcriptDivRef.current?.contains(sel?.anchorNode ?? null)
+							text.length > 5 &&
+								transcriptDivRef.current?.contains(sel?.anchorNode ?? null)
 								? text
 								: "",
 						);
@@ -851,13 +944,15 @@ export function LiveTab() {
 							{researchHistory.length === 0 ? (
 								<span className="text-muted-foreground">
 									Start the call, then press{" "}
-									<span className="text-foreground font-semibold">Research</span>{" "}
-									— it auto-extracts entities, products, and
-									terms from the transcript and looks them up.
-									<br /><br />
-									Use the input below for follow-up questions, or
-									select text and press{" "}
-									<kbd className="rounded bg-muted px-1">/</kbd>.
+									<span className="text-foreground font-semibold">
+										Research
+									</span>{" "}
+									— it auto-extracts entities, products, and terms from the
+									transcript and looks them up.
+									<br />
+									<br />
+									Use the input below for follow-up questions, or select text
+									and press <kbd className="rounded bg-muted px-1">/</kbd>.
 								</span>
 							) : (
 								researchHistory.map((e) => (
@@ -865,11 +960,9 @@ export function LiveTab() {
 										<div className="text-[10px] font-semibold text-foreground">
 											Q: {e.question}
 										</div>
-										<div className="whitespace-pre-wrap leading-relaxed text-muted-foreground">
-											{e.answer}
-											{e.streaming && (
-												<span className="animate-pulse">▋</span>
-											)}
+										<div className="break-words leading-relaxed text-muted-foreground">
+											<Markdown text={e.answer} />
+											{e.streaming && <span className="animate-pulse">▋</span>}
 										</div>
 									</div>
 								))
@@ -881,7 +974,8 @@ export function LiveTab() {
 						{selection && (
 							<div className="flex items-center gap-2 rounded border border-primary/40 bg-primary/5 px-2 py-1 font-mono text-[10px]">
 								<span className="flex-1 truncate text-muted-foreground">
-									“{selection.slice(0, 80)}{selection.length > 80 ? "…" : ""}”
+									“{selection.slice(0, 80)}
+									{selection.length > 80 ? "…" : ""}”
 								</span>
 								<button
 									type="button"
@@ -937,7 +1031,8 @@ export function LiveTab() {
 			{!researchOpen && selection && (
 				<div className="flex items-center gap-2 rounded border border-primary/40 bg-primary/5 px-2 py-1 font-mono text-[10px]">
 					<span className="flex-1 truncate text-muted-foreground">
-						“{selection.slice(0, 100)}{selection.length > 100 ? "…" : ""}”
+						“{selection.slice(0, 100)}
+						{selection.length > 100 ? "…" : ""}”
 					</span>
 					<button
 						type="button"

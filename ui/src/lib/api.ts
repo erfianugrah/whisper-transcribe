@@ -232,7 +232,11 @@ export async function* streamResearch(opts: {
 		buf = lines.pop() ?? "";
 		for (const line of lines) {
 			if (!line.startsWith("data:")) continue;
-			const payload = line.slice(5).trim();
+			// Strip the "data:" prefix + exactly ONE optional SSE framing space.
+			// Do NOT trim: streamed tokens carry leading/trailing spaces that are
+			// part of the content (e.g. " management") — trimming concatenates words.
+			let payload = line.slice(5);
+			if (payload.startsWith(" ")) payload = payload.slice(1);
 			if (payload === "[DONE]") return;
 			if (payload.startsWith("[ERROR]"))
 				throw new Error(payload.slice(7).trim());
