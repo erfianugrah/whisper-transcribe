@@ -156,6 +156,12 @@ services:
       - LIVE_PROCESS_INTERVAL=${LIVE_PROCESS_INTERVAL:-0.4}
       - LIVE_MIN_CHUNK_S=${LIVE_MIN_CHUNK_S:-0.5}
       - LIVE_TAIL_SILENCE_S=${LIVE_TAIL_SILENCE_S:-0.4}
+      # Pin spoken language (e.g. "en") to skip per-pass auto-detect; unset = auto.
+      - LIVE_LANGUAGE=${LIVE_LANGUAGE:-}
+      # Diagnostics: throttled per-stream level/throughput log cadence (s).
+      # LIVE_DEBUG=1 keeps faster-whisper's per-pass INFO spam.
+      - LIVE_LOG_INTERVAL=${LIVE_LOG_INTERVAL:-5.0}
+      - LIVE_DEBUG=${LIVE_DEBUG:-}
     ports:
       - "7861:7861"
     networks:

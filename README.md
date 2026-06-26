@@ -248,6 +248,9 @@ Used by the SPA Live tab (microphone **or** system/OBS audio via screen-share), 
 | `LIVE_TAIL_SILENCE_S` | `0.4` | Trailing silence that marks end-of-utterance (commit boundary) |
 | `LIVE_BEAM_SIZE` | `1` | Greedy decode (beam=1) ~halves per-pass latency vs beam=5 |
 | `LIVE_HALLUCINATION_SILENCE_S` | `2.0` | Skip silent gaps longer than this where whisper hallucinates continuation text (`0` disables) |
+| `LIVE_LANGUAGE` | _(unset)_ | Pin the spoken language (e.g. `en`) to skip per-pass auto-detection. Unset = auto-detect. Auto-detect on short streaming chunks is wasteful and flaps to random low-confidence languages on silence (e.g. `nn`). |
+| `LIVE_LOG_INTERVAL` | `5.0` | Seconds between per-stream health log lines (`[ws-stream] recv=Ns level=… committed=…w`). The `level` is input RMS — `~0.0 SILENT` means no audible audio is reaching the service. |
+| `LIVE_DEBUG` | _(unset)_ | `1` keeps faster-whisper's per-pass INFO spam (Processing / VAD removed / Detected language); default quiets it to WARNING. |
 
 ### Discord bot
 | Variable | Default | Description |

@@ -28,24 +28,29 @@ class StreamingTranscriber:
         self._model = WhisperModel(model_name, device=device, compute_type=compute_type)
         self._lock = asyncio.Lock()
 
-    async def transcribe_chunk(self, pcm_bytes: bytes, context: str = "") -> list[dict]:
+    async def transcribe_chunk(
+        self, pcm_bytes: bytes, context: str = "", language: str | None = None
+    ) -> list[dict]:
         """Transcribe a raw PCM chunk (16 kHz mono int16).
 
         Returns [{"text", "start", "end"}] with empty segments filtered.
         Serialises on self._lock so concurrent callers queue rather than
-        racing on the GPU.
+        racing on the GPU. `language` pins the spoken language (None = auto).
         """
         loop = asyncio.get_event_loop()
         async with self._lock:
             return await loop.run_in_executor(
-                None, self._transcribe_sync, pcm_bytes, context
+                None, self._transcribe_sync, pcm_bytes, context, language
             )
 
-    def _transcribe_sync(self, pcm_bytes: bytes, context: str) -> list[dict]:
+    def _transcribe_sync(
+        self, pcm_bytes: bytes, context: str, language: str | None = None
+    ) -> list[dict]:
         audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         kwargs: dict = dict(
             vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 500},
+            language=language or None,
         )
         if context:
             kwargs["initial_prompt"] = context
@@ -162,11 +167,20 @@ class OnlineSession:
         min_silence_ms: int = 300,
         beam_size: int = 1,
         hallucination_silence_s: float = 2.0,
+        language: str | None = None,
     ) -> None:
         self._model = model
         self._min_samples = int(SAMPLE_RATE * min_chunk_s)
         self._trim_s = trim_s
         self._beam_size = beam_size
+        # Pin the spoken language (e.g. "en") instead of per-pass auto-detect.
+        # None = auto. Auto-detect on short streaming chunks is wasteful and
+        # flaps to random low-confidence languages on silence.
+        self._language = language or None
+        # Diagnostics: total audio ingested + last measured input level (RMS).
+        # Read by the server's throttled health log (GIL-atomic scalar reads).
+        self._received_samples = 0
+        self._last_level = 0.0
         # faster-whisper anti-hallucination: with word_timestamps it skips
         # silent gaps longer than this where whisper invents continuation text
         # (the classic "...and this is looks like you" garble on low-signal
@@ -196,14 +210,26 @@ class OnlineSession:
             parts.append(self._inbox.popleft())
         a = np.frombuffer(b"".join(parts), dtype=np.int16).astype(np.float32) / 32768.0
         self.audio = np.append(self.audio, a)
+        self._received_samples += len(a)
 
     def _prompt(self) -> str | None:
         text = "".join(w[2] for w in self.committed)[-200:].strip()
         return text or None
 
+    def level(self) -> float:
+        """RMS (0..1) of the most recent ~0.5 s of buffered audio. Silence vs
+        signal diagnostics for the server log: ~0.0 means nothing audible is
+        reaching us (e.g. a muted tab); a healthy speech level is >~0.01."""
+        if self.audio.size == 0:
+            return 0.0
+        n = min(self.audio.size, SAMPLE_RATE // 2)
+        tail = self.audio[-n:]
+        return float(np.sqrt(np.mean(tail * tail)))
+
     def _transcribe(self) -> list[Word]:
         segments, _info = self._model.transcribe(
             self.audio,
+            language=self._language,
             beam_size=self._beam_size,
             word_timestamps=True,
             condition_on_previous_text=False,
@@ -226,6 +252,7 @@ class OnlineSession:
         `end_of_utterance` is True when a trailing-silence pause closed an
         utterance — the caller uses it to insert a line break."""
         self._drain()
+        self._last_level = self.level()
         if len(self.audio) < self._min_samples:
             return "", self._partial(), False
         self.hyp.insert(self._transcribe(), self.offset)

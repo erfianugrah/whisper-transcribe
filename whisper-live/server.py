@@ -48,6 +48,20 @@ PORT = int(os.environ.get("LIVE_PORT", "7861"))
 # Inference cadence: accumulate this many seconds of audio before a pass.
 CHUNK_SECONDS = int(os.environ.get("LIVE_CHUNK_SECONDS", "10"))
 CHUNK_THRESHOLD = CHUNK_SECONDS * 16000 * 2  # bytes of 16 kHz int16
+# Optional: pin the spoken language (e.g. "en") instead of per-pass
+# auto-detection. Auto-detect on short streaming chunks flaps between
+# languages (a silent stream "detects" random low-confidence langs like 'nn')
+# and burns a detection pass each cycle. Empty = auto-detect (default).
+LIVE_LANGUAGE = os.environ.get("LIVE_LANGUAGE", "").strip() or None
+# Seconds between throttled per-stream level/throughput log lines.
+LIVE_LOG_INTERVAL = float(os.environ.get("LIVE_LOG_INTERVAL", "5.0"))
+# LIVE_DEBUG keeps faster-whisper's per-pass INFO spam (Processing / VAD
+# removed / Detected language) instead of quieting it to WARNING.
+LIVE_DEBUG = os.environ.get("LIVE_DEBUG", "").lower() in ("1", "true", "yes")
+if not LIVE_DEBUG:
+    # faster-whisper logs several INFO lines per inference pass — multiple a
+    # second per stream. Our throttled [ws-stream] level line covers health.
+    logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 
 _transcriber: StreamingTranscriber | None = None
 _active_streams: int = 0
@@ -117,8 +131,9 @@ async def transcribe_chunk(request: Request) -> JSONResponse:
     if not body:
         return JSONResponse({"error": "empty body"}, status_code=400)
     context = request.query_params.get("context", "")
+    language = request.query_params.get("language") or LIVE_LANGUAGE
     try:
-        segments = await _transcriber.transcribe_chunk(body, context=context)
+        segments = await _transcriber.transcribe_chunk(body, context=context, language=language)
     except Exception as e:
         log.error(f"transcribe_chunk error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -220,6 +235,7 @@ _SESSION_KW = dict(
     # continuation text. 0 disables. word_timestamps (always on in streaming)
     # is required for it to take effect.
     hallucination_silence_s=float(os.environ.get("LIVE_HALLUCINATION_SILENCE_S", "2.0")),
+    language=LIVE_LANGUAGE,
 )
 
 
@@ -233,9 +249,14 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
     _active_streams += 1
     session = _transcriber.new_session(**_SESSION_KW)
     stop = asyncio.Event()
-    log.info(f"[ws-stream] opened ({_active_streams}/{LIVE_MAX_STREAMS})")
+    log.info(
+        f"[ws-stream] opened ({_active_streams}/{LIVE_MAX_STREAMS}) "
+        f"lang={LIVE_LANGUAGE or 'auto'}"
+    )
 
     async def processor() -> None:
+        import time
+        last_log = 0.0
         while not stop.is_set():
             await asyncio.sleep(PROCESS_INTERVAL)
             try:
@@ -243,10 +264,24 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
             except Exception as e:
                 log.error(f"[ws-stream] inference error: {e}")
                 continue
+            # Throttled health line: input level (RMS) makes silence obvious
+            # (level~0.0 SILENT) vs a real no-output bug (level high, no words).
+            now = time.monotonic()
+            if now - last_log >= LIVE_LOG_INTERVAL:
+                last_log = now
+                lvl = getattr(session, "_last_level", 0.0)
+                secs = getattr(session, "_received_samples", 0) / 16000
+                tag = " SILENT" if lvl < 0.005 else ""
+                log.info(
+                    f"[ws-stream] recv={secs:.0f}s level={lvl:.4f}{tag} "
+                    f"committed={len(session.committed)}w"
+                )
             if committed or eou:
                 await websocket.send_text(
                     json.dumps({"type": "commit", "text": committed, "eou": eou})
                 )
+                if committed:
+                    log.info(f"[ws-stream] commit: {committed!r}")
             if partial:
                 await websocket.send_text(json.dumps({"type": "partial", "text": partial}))
 
@@ -280,7 +315,11 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
         except Exception:
             pass
         _active_streams -= 1
-        log.info(f"[ws-stream] closed ({_active_streams}/{LIVE_MAX_STREAMS})")
+        secs = getattr(session, "_received_samples", 0) / 16000
+        log.info(
+            f"[ws-stream] closed ({_active_streams}/{LIVE_MAX_STREAMS}) "
+            f"recv={secs:.0f}s committed={len(session.committed)}w"
+        )
 
 
 app = Starlette(

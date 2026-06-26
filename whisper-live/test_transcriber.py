@@ -231,6 +231,73 @@ def test_ws_url_route_registered():
     assert "/ws-stream" in paths
 
 
+# ── language pinning + diagnostics (added after the live test session) ─────────
+class _RecordingModel:
+    """Captures the kwargs of the last transcribe() call."""
+    def __init__(self):
+        self.last_kwargs = None
+    def transcribe(self, audio, **k):
+        self.last_kwargs = k
+        return [_seg], _info
+
+
+def test_session_pins_language_into_transcribe():
+    """OnlineSession(language='en') must pass language='en' to model.transcribe
+    instead of leaving it None (per-pass auto-detect)."""
+    tr = StreamingTranscriber.__new__(StreamingTranscriber)
+    tr._model = _RecordingModel()
+    sess = tr.new_session(language="en", min_chunk_s=0.1)
+    sess.insert_audio(_sine_pcm(0.5))
+    sess.process()
+    assert tr._model.last_kwargs is not None
+    assert tr._model.last_kwargs.get("language") == "en"
+
+
+def test_session_language_defaults_to_auto():
+    """No language given → None (auto-detect), not an empty string."""
+    tr = StreamingTranscriber.__new__(StreamingTranscriber)
+    tr._model = _RecordingModel()
+    sess = tr.new_session(min_chunk_s=0.1)
+    sess.insert_audio(_sine_pcm(0.5))
+    sess.process()
+    assert tr._model.last_kwargs.get("language") is None
+
+
+def test_chunk_threads_language():
+    """transcribe_chunk(language=...) must reach the model."""
+    tr = StreamingTranscriber.__new__(StreamingTranscriber)
+    tr._model = _RecordingModel()
+    tr._lock = asyncio.Lock()
+    asyncio.run(tr.transcribe_chunk(_sine_pcm(0.3), language="de"))
+    assert tr._model.last_kwargs.get("language") == "de"
+
+
+def test_session_level_distinguishes_silence_from_signal():
+    """level() ~0 on silence, clearly higher on a tone — the signal the server
+    logs as 'SILENT' vs a real level."""
+    tr = StreamingTranscriber.__new__(StreamingTranscriber)
+    tr._model = _RecordingModel()
+    sess = tr.new_session(min_chunk_s=0.1)
+    sess.insert_audio((np.zeros(16000, dtype=np.int16)).tobytes())
+    sess._drain()
+    assert sess.level() < 0.005  # silence
+    sess2 = tr.new_session(min_chunk_s=0.1)
+    sess2.insert_audio(_sine_pcm(0.5))
+    sess2._drain()
+    assert sess2.level() > 0.05  # audible tone
+
+
+def test_session_tracks_received_samples():
+    """_received_samples accumulates ingested audio (drives the recv=Ns log)."""
+    tr = StreamingTranscriber.__new__(StreamingTranscriber)
+    tr._model = _RecordingModel()
+    sess = tr.new_session(min_chunk_s=0.1)
+    assert sess._received_samples == 0
+    sess.insert_audio(_sine_pcm(1.0))
+    sess._drain()
+    assert sess._received_samples == 16000
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
