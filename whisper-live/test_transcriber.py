@@ -298,6 +298,50 @@ def test_session_tracks_received_samples():
     assert sess._received_samples == 16000
 
 
+def test_session_translate_sets_task():
+    """translate=True → model.transcribe(task='translate'); default transcribe."""
+    tr = StreamingTranscriber.__new__(StreamingTranscriber)
+    tr._model = _RecordingModel()
+    sess = tr.new_session(translate=True, min_chunk_s=0.1)
+    sess.insert_audio(_sine_pcm(0.5)); sess.process()
+    assert tr._model.last_kwargs.get("task") == "translate"
+    tr2 = StreamingTranscriber.__new__(StreamingTranscriber)
+    tr2._model = _RecordingModel()
+    s2 = tr2.new_session(min_chunk_s=0.1)
+    s2.insert_audio(_sine_pcm(0.5)); s2.process()
+    assert tr2._model.last_kwargs.get("task") == "transcribe"
+
+
+def test_ws_stream_handshake_applies_language_and_translate():
+    """A JSON config frame sent first must pin language + translate on the
+    session; binary-first clients keep working (covered by other tests)."""
+    import json
+    import time
+    import server as srv
+    rec = _RecordingModel()
+    stub_tr = StreamingTranscriber.__new__(StreamingTranscriber)
+    stub_tr._lock = asyncio.Lock()
+    stub_tr._model = rec
+    srv._transcriber = stub_tr
+    srv.PROCESS_INTERVAL = 0.01  # force fast inference passes for the test
+    from starlette.testclient import TestClient
+    client = TestClient(srv.app)
+    with client.websocket_connect("/ws-stream") as ws:
+        ws.send_text(json.dumps({"language": "de", "translate": True}))
+        ws.send_bytes(_sine_pcm(2.0))
+        time.sleep(0.15)  # let the processor run ≥ 1 pass
+        ws.send_text("done")
+        try:
+            for _ in range(50):
+                if json.loads(ws.receive_text()).get("type") == "done":
+                    break
+        except Exception:
+            pass
+    assert rec.last_kwargs is not None, "model.transcribe never ran"
+    assert rec.last_kwargs.get("language") == "de"
+    assert rec.last_kwargs.get("task") == "translate"
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))

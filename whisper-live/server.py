@@ -235,8 +235,9 @@ _SESSION_KW = dict(
     # continuation text. 0 disables. word_timestamps (always on in streaming)
     # is required for it to take effect.
     hallucination_silence_s=float(os.environ.get("LIVE_HALLUCINATION_SILENCE_S", "2.0")),
-    language=LIVE_LANGUAGE,
 )
+# language / translate are per-session (handshake-overridable), not in the
+# shared tuning dict above — they're passed explicitly in new_session().
 
 
 async def ws_stream_endpoint(websocket: WebSocket) -> None:
@@ -247,11 +248,45 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
         await websocket.close(1013)
         return
     _active_streams += 1
-    session = _transcriber.new_session(**_SESSION_KW)
     stop = asyncio.Event()
+
+    # Optional config handshake. The SPA sends ONE JSON text frame first
+    # ({"language": "en", "translate": true}) before any audio; the live-tap
+    # CLI and older clients send binary PCM straight away. We read the first
+    # frame, branch on it, and build the session with the right language/task.
+    session_lang = LIVE_LANGUAGE
+    session_translate = False
+    first_audio: bytes | None = None
+    done_early = False
+    try:
+        first = await websocket.receive()
+    except Exception:
+        first = {"type": "websocket.disconnect"}
+    if first.get("type") == "websocket.disconnect":
+        _active_streams -= 1
+        return
+    _ftext = first.get("text")
+    if first.get("bytes"):
+        first_audio = first["bytes"]
+    elif _ftext == "done" or (_ftext and '"done"' in _ftext):
+        done_early = True
+    elif _ftext:
+        try:
+            cfg = json.loads(_ftext)
+            if isinstance(cfg, dict):
+                session_lang = (cfg.get("language") or LIVE_LANGUAGE) or None
+                session_translate = bool(cfg.get("translate"))
+        except Exception:
+            pass  # not JSON config — ignore, fall through to defaults
+
+    session = _transcriber.new_session(
+        language=session_lang, translate=session_translate, **_SESSION_KW
+    )
+    if first_audio:
+        session.insert_audio(first_audio)
     log.info(
         f"[ws-stream] opened ({_active_streams}/{LIVE_MAX_STREAMS}) "
-        f"lang={LIVE_LANGUAGE or 'auto'}"
+        f"lang={session_lang or 'auto'} translate={session_translate}"
     )
 
     async def processor() -> None:
@@ -287,7 +322,7 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
 
     proc_task = asyncio.create_task(processor())
     try:
-        while True:
+        while not done_early:
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
                 break

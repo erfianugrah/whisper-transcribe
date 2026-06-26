@@ -168,6 +168,7 @@ class OnlineSession:
         beam_size: int = 1,
         hallucination_silence_s: float = 2.0,
         language: str | None = None,
+        translate: bool = False,
     ) -> None:
         self._model = model
         self._min_samples = int(SAMPLE_RATE * min_chunk_s)
@@ -177,6 +178,9 @@ class OnlineSession:
         # None = auto. Auto-detect on short streaming chunks is wasteful and
         # flaps to random low-confidence languages on silence.
         self._language = language or None
+        # task="translate" makes whisper emit English regardless of the source
+        # language (faster-whisper only translates *to* English).
+        self._translate = bool(translate)
         # Diagnostics: total audio ingested + last measured input level (RMS).
         # Read by the server's throttled health log (GIL-atomic scalar reads).
         self._received_samples = 0
@@ -230,6 +234,7 @@ class OnlineSession:
         segments, _info = self._model.transcribe(
             self.audio,
             language=self._language,
+            task="translate" if self._translate else "transcribe",
             beam_size=self._beam_size,
             word_timestamps=True,
             condition_on_previous_text=False,
