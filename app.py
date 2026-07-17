@@ -151,7 +151,12 @@ def _unload_models():
         whisper_model = None
         current_model_key = None
         diarize_model = None
-        align_model_cache = {}
+        # Must stay an OrderedDict - load_align_model() calls .move_to_end()
+        # for LRU behaviour. Resetting to a plain {} here made the NEXT
+        # alignment after an idle-unload crash with "'dict' object has no
+        # attribute 'move_to_end'", silently dropping word-level timestamps
+        # (and therefore per-word speakers / overlap analysis).
+        align_model_cache = collections.OrderedDict()
         if DEVICE == "cuda":
             torch.cuda.empty_cache()
         log.info("Models unloaded, VRAM freed")
