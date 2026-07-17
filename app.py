@@ -268,6 +268,114 @@ def load_diarization():
     return diarize_model
 
 
+# -- Voice-print speaker identification ----------------------------------------
+# A voice print is a 256-d WeSpeaker embedding (from the diarization pipeline)
+# labeled with a person's name. Enrolled prints are matched against each
+# diarized speaker's embedding by cosine similarity so transcripts show real
+# names instead of SPEAKER_00. Server-side (not client-side) so the SPA, bot,
+# and plain-curl transcription all benefit - not just the pi extension.
+# Stored on the persistent /data volume so they survive container recreation.
+
+VOICEPRINT_FILE = os.environ.get("VOICEPRINT_FILE", "/data/voiceprints.json")
+VOICEPRINT_THRESHOLD = float(os.environ.get("VOICEPRINT_THRESHOLD", "0.5"))
+IDENTIFY_SPEAKERS = os.environ.get("IDENTIFY_SPEAKERS", "1") not in ("0", "false", "no")
+
+
+def _load_voiceprints() -> list:
+    try:
+        with open(VOICEPRINT_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_voiceprints(prints: list) -> None:
+    parent = os.path.dirname(VOICEPRINT_FILE)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+    with open(VOICEPRINT_FILE, "w") as f:
+        json.dump(prints, f, ensure_ascii=False, indent=2)
+
+
+def _cosine(a, b) -> float:
+    import numpy as np
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.shape != b.shape or a.size == 0:
+        return 0.0
+    na = np.linalg.norm(a)
+    nb = np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def _identify_speakers(embeddings: dict, prints: list, threshold: float) -> dict:
+    """Greedy one-to-one match of diarized speaker labels to enrolled names.
+
+    Highest-scoring (label, name) pairs are assigned first; each label and each
+    name is used at most once, so two speakers can't both become the same
+    person. A name with multiple reference prints wins on its best vector
+    (sorted-desc + used-name set gives max automatically). Returns
+    {label: name} for assigned labels only.
+    """
+    cands = []
+    for label, vec in embeddings.items():
+        for p in prints:
+            cands.append((_cosine(vec, p.get("vec", [])), label, p.get("name", "")))
+    cands.sort(key=lambda x: x[0], reverse=True)
+    out: dict = {}
+    used_label: set = set()
+    used_name: set = set()
+    for score, label, name in cands:
+        if score < threshold:
+            break
+        if not name or label in used_label or name in used_name:
+            continue
+        out[label] = name
+        used_label.add(label)
+        used_name.add(name)
+    return out
+
+
+def _embed_clip(file_path: str, start=None, end=None):
+    """Compute a single voice embedding for a (mostly single-speaker) clip.
+
+    Runs the diarization pipeline with return_embeddings and returns the
+    dominant speaker's 256-d vector as a plain float list.
+    """
+    import whisperx
+    audio = whisperx.load_audio(file_path)
+    if start is not None or end is not None:
+        sr = 16000
+        s = int(float(start or 0) * sr)
+        e = int(float(end) * sr) if end is not None else len(audio)
+        audio = audio[s:e]
+    dpipe = load_diarization()
+    if dpipe is None:
+        raise RuntimeError("diarization pipeline unavailable (HF_TOKEN not set?)")
+    out = dpipe(audio, return_embeddings=True)
+    if not isinstance(out, tuple):
+        raise RuntimeError("diarization did not return embeddings")
+    df, embs = out
+    if not embs:
+        raise RuntimeError("no speaker embedding produced for the clip")
+    # Pick the dominant speaker by total spoken duration in the clip.
+    durations: dict = {}
+    try:
+        for _, row in df.iterrows():
+            seg = row.get("segment")
+            spk = row.get("speaker")
+            dur = getattr(seg, "duration", 0.0) if seg is not None else 0.0
+            durations[spk] = durations.get(spk, 0.0) + float(dur)
+    except Exception:
+        pass
+    dom = max(durations, key=durations.get) if durations else next(iter(embs))
+    vec = embs[dom]
+    return [float(x) for x in vec]
+
+
 # -- Temp file cleanup ---------------------------------------------------------
 _previous_subtitle = None
 
@@ -946,8 +1054,20 @@ def _transcribe_inner(file, local_path, model_name, language, output_format,
             dpipe = load_diarization()
             if dpipe is not None:
                 yield "Running speaker diarization...", _plain_html("\n".join(formatted_lines)), "\n".join(formatted_lines), None
-                diarize_segments = dpipe(audio, min_speakers=min_spk, max_speakers=max_spk)
+                # return_embeddings=True also yields a {speaker_label: 256-d
+                # vector} dict (WeSpeaker embeddings from the community-1
+                # pipeline). We surface these in the JSON output so callers can
+                # do voice-print enrollment / speaker identification client-side
+                # (cosine match against a reference library). Guard the unpack:
+                # older whisperX returns just the dataframe.
+                diarize_out = dpipe(audio, min_speakers=min_spk, max_speakers=max_spk, return_embeddings=True)
+                if isinstance(diarize_out, tuple):
+                    diarize_segments, speaker_embeddings = diarize_out
+                else:
+                    diarize_segments, speaker_embeddings = diarize_out, None
                 result = whisperx.assign_word_speakers(diarize_segments, result)
+                if speaker_embeddings:
+                    result["speaker_embeddings"] = speaker_embeddings
 
                 # Split segments at speaker boundaries (requires word-level timestamps)
                 if alignment_ok:
@@ -966,8 +1086,37 @@ def _transcribe_inner(file, local_path, model_name, language, output_format,
                         result["segments"] = apply_gender_labels(result.get("segments", []), genders)
                         gender_summary = ", ".join(f"{k}={v}" for k, v in sorted(genders.items()))
                         log.info(f"[{request_id}]   Gender estimates: {gender_summary}")
+                        # Keep embedding keys in sync with the gender-prefixed
+                        # segment labels so callers can align them 1:1.
+                        if result.get("speaker_embeddings"):
+                            result["speaker_embeddings"] = {
+                                (f"{genders[k]}-{k}" if genders.get(k) not in (None, "?") else k): v
+                                for k, v in result["speaker_embeddings"].items()
+                            }
                 except Exception as e:
                     log.warning(f"[{request_id}]   Gender estimation failed (non-critical): {e}")
+
+                # -- Voice-print identification (server-side; names all outputs) --
+                try:
+                    prints = _load_voiceprints() if IDENTIFY_SPEAKERS else []
+                    if prints and result.get("speaker_embeddings"):
+                        name_map = _identify_speakers(
+                            result["speaker_embeddings"], prints, VOICEPRINT_THRESHOLD
+                        )
+                        if name_map:
+                            for seg in result.get("segments", []):
+                                if seg.get("speaker") in name_map:
+                                    seg["speaker"] = name_map[seg["speaker"]]
+                                for w in seg.get("words", []):
+                                    if w.get("speaker") in name_map:
+                                        w["speaker"] = name_map[w["speaker"]]
+                            result["speaker_embeddings"] = {
+                                name_map.get(k, k): v for k, v in result["speaker_embeddings"].items()
+                            }
+                            result["speaker_names"] = name_map
+                            log.info(f"[{request_id}]   Identified speakers: {name_map}")
+                except Exception as e:
+                    log.warning(f"[{request_id}]   Voice-print identification failed (non-critical): {e}")
 
                 # Rebuild formatted lines with speaker labels
                 formatted_lines = []
@@ -1042,6 +1191,16 @@ def _transcribe_inner(file, local_path, model_name, language, output_format,
                         word_out["speaker"] = w["speaker"]
                     seg_out["words"].append(word_out)
             json_data["segments"].append(seg_out)
+        # Per-speaker voice embeddings (when diarization produced them) - keyed
+        # by the same (gender-prefixed) speaker label used on the segments.
+        # Enables client-side speaker identification / voice-print enrollment.
+        if has_speakers and result.get("speaker_embeddings"):
+            json_data["speaker_embeddings"] = {
+                spk: [round(float(x), 6) for x in vec]
+                for spk, vec in result["speaker_embeddings"].items()
+            }
+        if has_speakers and result.get("speaker_names"):
+            json_data["speaker_names"] = result["speaker_names"]
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode="w")
         json.dump(json_data, tmp, ensure_ascii=False, indent=2)
         tmp.close()
@@ -3664,6 +3823,57 @@ async def api_artifact(request: Request):
     return Response(content=data, media_type=media_type)
 
 
+async def api_voiceprints_list(request: Request):
+    """GET /api/voiceprints - list enrolled voice-print names + counts."""
+    prints = _load_voiceprints()
+    by: dict = {}
+    for p in prints:
+        n = p.get("name", "")
+        by[n] = by.get(n, 0) + 1
+    return JSONResponse({"voiceprints": [{"name": n, "count": c} for n, c in sorted(by.items())]})
+
+
+async def api_voiceprints_add(request: Request):
+    """POST /api/voiceprints - enroll a voice print.
+
+    Body: {name, embedding:[...]} to store a vector directly, OR
+          {name, file_path, start?, end?} for the server to embed a clip.
+    Enrolling an existing name appends a second reference vector.
+    """
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"error": "missing 'name'"}, status_code=400)
+    vec = body.get("embedding")
+    if vec is None:
+        fp = (body.get("file_path") or "").strip()
+        if not fp or not os.path.isfile(fp):
+            return JSONResponse({"error": f"file not found: {fp}"}, status_code=400)
+        try:
+            vec = await asyncio.to_thread(_embed_clip, fp, body.get("start"), body.get("end"))
+        except Exception as e:
+            log.error(f"[API] voiceprint embed failed: {e}")
+            return JSONResponse({"error": str(e)}, status_code=500)
+    vec = [float(x) for x in vec]
+    if len(vec) == 0:
+        return JSONResponse({"error": "empty embedding"}, status_code=400)
+    prints = _load_voiceprints()
+    prints.append({"name": name, "vec": vec, "source": body.get("source", ""), "at": _now_iso()})
+    _save_voiceprints(prints)
+    count = sum(1 for p in prints if p.get("name") == name)
+    log.info(f"[API] enrolled voice print: {name} (now {count}, dim={len(vec)})")
+    return JSONResponse({"name": name, "count": count, "dim": len(vec)})
+
+
+async def api_voiceprints_delete(request: Request):
+    """DELETE /api/voiceprints/{name} - remove all prints for a name."""
+    name = request.path_params["name"]
+    prints = _load_voiceprints()
+    remaining = [p for p in prints if p.get("name") != name]
+    _save_voiceprints(remaining)
+    return JSONResponse({"removed": name, "remaining": len(remaining)})
+
+
 async def api_upload(request: Request):
     """POST /api/upload — multipart file upload.
 
@@ -3990,6 +4200,9 @@ API_ROUTES = [
     Route("/api/history", api_history, methods=["GET"]),
     Route("/api/media", api_media, methods=["GET"]),
     Route("/api/artifact", api_artifact, methods=["GET"]),
+    Route("/api/voiceprints", api_voiceprints_list, methods=["GET"]),
+    Route("/api/voiceprints", api_voiceprints_add, methods=["POST"]),
+    Route("/api/voiceprints/{name}", api_voiceprints_delete, methods=["DELETE"]),
     Route("/api/upload", api_upload, methods=["POST"]),
     Route("/api/live/health", api_live_health, methods=["GET"]),
     Route("/api/live/transcribe-chunk", api_live_chunk, methods=["POST"]),
