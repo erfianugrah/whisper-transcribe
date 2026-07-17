@@ -3617,6 +3617,53 @@ async def api_media(request: Request):
     return JSONResponse({"files": [{"name": n, "path": p} for n, p in files]})
 
 
+async def api_artifact(request: Request):
+    """GET /api/artifact?path=... - serve a transcription artifact file.
+
+    The word-level JSON (and srt/vtt/txt) subtitle files produced by a
+    `format:"json"` job are written to the server's temp dir and their path
+    returned as `.result.subtitle_file`. There was previously no way to fetch
+    that file over HTTP (it lives in the container FS), so callers that need
+    the word-level start/end/speaker arrays (e.g. overlap analysis) couldn't
+    reach them. This endpoint closes that gap.
+
+    Hard-guarded: the resolved realpath MUST live under the system temp dir
+    (where NamedTemporaryFile / upload dirs land). No traversal, no arbitrary
+    file read. 64 MB ceiling.
+    """
+    from starlette.responses import Response
+
+    raw = (request.query_params.get("path") or "").strip()
+    if not raw:
+        return JSONResponse({"error": "missing 'path' query param"}, status_code=400)
+
+    # Resolve symlinks + normalise, then confine to the temp dir.
+    tmp_root = os.path.realpath(tempfile.gettempdir())
+    real = os.path.realpath(raw)
+    if not (real == tmp_root or real.startswith(tmp_root + os.sep)):
+        log.warning(f"[API] artifact path outside temp root rejected: {raw}")
+        return JSONResponse({"error": "path must be under the server temp dir"}, status_code=403)
+    if not os.path.isfile(real):
+        return JSONResponse({"error": f"file not found: {raw}"}, status_code=404)
+
+    size = os.path.getsize(real)
+    if size > 64 * 1024 * 1024:
+        return JSONResponse({"error": f"artifact too large ({size} bytes)"}, status_code=413)
+
+    ext = os.path.splitext(real)[1].lower()
+    media_type = {
+        ".json": "application/json",
+        ".srt": "text/plain; charset=utf-8",
+        ".vtt": "text/vtt; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+    }.get(ext, "application/octet-stream")
+
+    with open(real, "rb") as f:
+        data = f.read()
+    log.info(f"[API] artifact served: {real} ({size} bytes, {media_type})")
+    return Response(content=data, media_type=media_type)
+
+
 async def api_upload(request: Request):
     """POST /api/upload — multipart file upload.
 
@@ -3942,6 +3989,7 @@ API_ROUTES = [
     # SPA support (history / media / upload / live proxy).
     Route("/api/history", api_history, methods=["GET"]),
     Route("/api/media", api_media, methods=["GET"]),
+    Route("/api/artifact", api_artifact, methods=["GET"]),
     Route("/api/upload", api_upload, methods=["POST"]),
     Route("/api/live/health", api_live_health, methods=["GET"]),
     Route("/api/live/transcribe-chunk", api_live_chunk, methods=["POST"]),
