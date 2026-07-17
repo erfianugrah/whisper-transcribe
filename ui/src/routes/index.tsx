@@ -6,6 +6,7 @@ import { HistoryTab } from "@/features/history";
 import { LiveTab } from "@/features/live";
 import { QueueTab } from "@/features/queue";
 import { TranscribeTab } from "@/features/transcribe";
+import { VoicesTab } from "@/features/voices";
 import { getStatus } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -48,6 +49,7 @@ const TABS = [
 	{ id: "transcribe", label: "Transcribe" },
 	{ id: "queue", label: "Queue" },
 	{ id: "history", label: "History" },
+	{ id: "voices", label: "Speakers" },
 	{ id: "live", label: "Live" },
 ] as const;
 type TabId = (typeof TABS)[number]["id"];
@@ -108,6 +110,7 @@ function Home() {
 				{tab === "transcribe" && <TranscribeTab />}
 				{tab === "queue" && <QueueTab />}
 				{tab === "history" && <HistoryTab />}
+				{tab === "voices" && <VoicesTab />}
 				{tab === "live" && <LiveTab />}
 			</main>
 		</div>

@@ -197,6 +197,37 @@ export async function uploadFile(
 	return UploadSchema.parse(json);
 }
 
+// ── /api/voiceprints ─────────────────────────────────────────────────────────
+// Enrolled voice prints power server-side speaker naming: matched speakers
+// are relabeled to real names in every transcript (this SPA included).
+export const VoiceprintsSchema = z.object({
+	voiceprints: z.array(z.object({ name: z.string(), count: z.number() })),
+});
+export type Voiceprints = z.infer<typeof VoiceprintsSchema>;
+export const getVoiceprints = () => jget(VoiceprintsSchema, "/api/voiceprints");
+
+export const AddVoiceprintSchema = z.object({
+	name: z.string(),
+	count: z.number(),
+	dim: z.number().nullish(),
+});
+export const addVoiceprint = (body: {
+	name: string;
+	file_path: string;
+	start?: number;
+	end?: number;
+}) => jpost(AddVoiceprintSchema, "/api/voiceprints", body);
+
+export async function deleteVoiceprint(name: string): Promise<void> {
+	const res = await fetch(
+		`${API}/api/voiceprints/${encodeURIComponent(name)}`,
+		{
+			method: "DELETE",
+		},
+	);
+	if (!res.ok) throw new Error(`delete voiceprint → ${res.status}`);
+}
+
 // ── /api/live ────────────────────────────────────────────────────────────────
 export const LiveHealthSchema = z
 	.object({
