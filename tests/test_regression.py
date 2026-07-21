@@ -5560,6 +5560,207 @@ def test_research_anthropic_endpoint_construction():
 # ─── Test runner ─────────────────────────────────────────────────────────────
 
 
+# ─── Auto-hotwords + media duplicate detection (app.py) ─────────────────────
+
+
+def _exec_app_fns(names, extra_ns=None):
+    """Exec pure helper functions out of app.py source (module-level torch
+    imports make a real import impractical). Returns the namespace."""
+    import ast
+    tree = ast.parse(APP_SRC)
+    ns: dict = {"os": os, "re": re, "json": __import__("json")}
+    if extra_ns:
+        ns.update(extra_ns)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in names:
+            exec(ast.get_source_segment(APP_SRC, node), ns)
+    return ns
+
+
+def test_app_build_hotwords_merges_sources_with_dedupe():
+    """_build_hotwords: user terms first, then voice-print names, then vocab;
+    case-insensitive dedupe; AUTO_HOTWORDS=0 disables the auto sources."""
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("Supabase\nPostgREST\n# a comment\n\nerfi\n")
+        vocab_path = f.name
+    ns = _exec_app_fns(
+        ["_load_vocabulary", "_build_hotwords"],
+        {
+            "VOCABULARY_FILE": vocab_path,
+            "AUTO_HOTWORDS": True,
+            "HOTWORDS_MAX_TERMS": 60,
+            "_load_voiceprints": lambda: [{"name": "Erfi"}, {"name": "Gerardo"}, "garbage"],
+        },
+    )
+    _build = ns["_build_hotwords"]
+    # user term wins position; prints + vocab merged; 'Erfi' deduped vs 'erfi'
+    out = _build("CustomTerm")
+    assert out == "CustomTerm, Erfi, Gerardo, Supabase, PostgREST", out
+    # no user hotwords still injects auto sources
+    assert _build("") == "Erfi, Gerardo, Supabase, PostgREST"
+    assert _build(None) == "Erfi, Gerardo, Supabase, PostgREST"
+    # AUTO_HOTWORDS off: only user terms
+    ns["AUTO_HOTWORDS"] = False
+    assert _build("CustomTerm") == "CustomTerm"
+    assert _build("") == ""
+    # cap respected
+    ns["AUTO_HOTWORDS"] = True
+    ns["HOTWORDS_MAX_TERMS"] = 2
+    assert _build("A, B") == "A, B"
+
+
+def test_app_load_vocabulary_missing_file():
+    ns = _exec_app_fns(["_load_vocabulary"], {"VOCABULARY_FILE": "/nonexistent/vocab.txt"})
+    assert ns["_load_vocabulary"]() == []
+
+
+def test_app_media_name_timestamp():
+    ns = _exec_app_fns(
+        ["_media_name_timestamp"],
+        {"_MEDIA_NAME_TS": re.compile(r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})-(\d{2})-(\d{2})")},
+    )
+    ts = ns["_media_name_timestamp"]
+    a = ts("2026-07-21 11-12-07.mkv")
+    b = ts("2026-07-21 11-12-12.mkv")
+    assert a is not None and b is not None
+    assert b - a == 5
+    assert ts("random-file.mkv") is None
+
+
+def test_app_mark_possible_duplicates():
+    ns = _exec_app_fns(
+        ["_media_name_timestamp", "mark_possible_duplicates"],
+        {
+            "MEDIA_DUPE_WINDOW_SEC": 120,
+            "_MEDIA_NAME_TS": re.compile(r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})-(\d{2})-(\d{2})"),
+        },
+    )
+    mark = ns["mark_possible_duplicates"]
+    files = [
+        ("2026-07-21 12-32-00.mkv", "/media/2026-07-21 12-32-00.mkv"),
+        ("2026-07-21 11-12-12.mkv", "/media/2026-07-21 11-12-12.mkv"),
+        ("2026-07-21 11-12-07.mkv", "/media/2026-07-21 11-12-07.mkv"),  # false start
+        ("2026-07-21 10-29-45.mkv", "/media/2026-07-21 10-29-45.mkv"),
+    ]
+    out = mark(files)
+    assert "possible_duplicate_of" not in out[0]
+    assert "possible_duplicate_of" not in out[1]
+    assert out[2]["possible_duplicate_of"] == "2026-07-21 11-12-12.mkv"
+    assert "possible_duplicate_of" not in out[3]
+    # unparseable names: no crash, no flag without mtime fallback files
+    out2 = mark([("b.mkv", "/nonexistent/b.mkv"), ("a.mkv", "/nonexistent/a.mkv")])
+    assert all("possible_duplicate_of" not in f for f in out2)
+
+
+def test_app_vocabulary_endpoints_registered():
+    """/api/vocabulary GET+PUT routes exist and the state helper reports the
+    terms, the file, the auto-injection toggle, and voice-print names."""
+    assert 'Route("/api/vocabulary", api_vocabulary_get, methods=["GET"])' in APP_SRC
+    assert 'Route("/api/vocabulary", api_vocabulary_put, methods=["PUT"])' in APP_SRC
+    ns = _exec_app_fns(
+        ["_load_vocabulary", "_vocabulary_state"],
+        {
+            "VOCABULARY_FILE": "/nonexistent/vocab.txt",
+            "AUTO_HOTWORDS": True,
+            "HOTWORDS_MAX_TERMS": 60,
+            "_load_voiceprints": lambda: [{"name": "Erfi"}, {"name": "Gerardo"}],
+        },
+    )
+    state = ns["_vocabulary_state"]()
+    assert state["terms"] == []
+    assert state["auto_hotwords"] is True
+    assert state["max_terms"] == 60
+    assert state["voiceprint_names"] == ["Erfi", "Gerardo"]
+
+
+def test_app_transcribe_inner_uses_build_hotwords():
+    """_transcribe_inner must derive its hotwords via _build_hotwords (the
+    merge point for user terms + voice-print names + vocabulary), not by
+    stripping the user payload directly."""
+    src = APP_SRC[APP_SRC.index("def _transcribe_inner"):
+                   APP_SRC.index("def format_timestamp_display")]
+    assert "hotwords_str = _build_hotwords(hotwords)" in src
+
+
+def test_app_media_endpoint_marks_duplicates():
+    """The /api/media handler must return mark_possible_duplicates output so
+    every consumer (SPA picker, extension) sees the annotation."""
+    src = APP_SRC[APP_SRC.index("async def api_media"):
+                   APP_SRC.index("async def api_artifact")]
+    assert "mark_possible_duplicates(files)" in src
+
+
+def test_app_microturn_cleanup_wired():
+    """Diarization micro-turn cleanup must be applied to diarize_segments
+    before assign_word_speakers, and be env-disableable."""
+    assert 'MICRO_TURN_CLEANUP = os.environ.get("MICRO_TURN_CLEANUP", "1")' in APP_SRC
+    assert "diarize_segments = _merge_sandwiched_microturns(diarize_segments)" in APP_SRC
+
+
+def test_app_merge_sandwiched_microturns_behaviour():
+    pd = __import__("pandas")
+    ns = _exec_app_fns(
+        ["_merge_sandwiched_microturns"],
+        {"MICRO_TURN_CLEANUP": True, "MICRO_TURN_MAX_SEC": 1.0,
+         "log": type("L", (), {"info": staticmethod(lambda *a, **k: None),
+                               "warning": staticmethod(lambda *a, **k: None)})()},
+    )
+    merge = ns["_merge_sandwiched_microturns"]
+    df = pd.DataFrame({
+        "start": [0.0, 5.0, 5.4, 10.0],
+        "end":   [5.0, 5.4, 10.0, 15.0],
+        "speaker": ["A", "B", "A", "A"],
+    })
+    out = merge(df)
+    # 0.4s B-turn sandwiched between A turns -> reassigned to A
+    assert out["speaker"].tolist() == ["A", "A", "A", "A"]
+    # long middle turn is a real interjection - untouched
+    df2 = pd.DataFrame({
+        "start": [0.0, 5.0, 8.0],
+        "end":   [5.0, 8.0, 12.0],
+        "speaker": ["A", "B", "A"],
+    })
+    assert merge(df2)["speaker"].tolist() == ["A", "B", "A"]
+    # disabled -> passthrough
+    ns["MICRO_TURN_CLEANUP"] = False
+    out3 = ns["_merge_sandwiched_microturns"](df)
+    assert out3["speaker"].tolist() == ["A", "B", "A", "A"]
+
+
+def test_app_relabel_unknown_microsegments():
+    """Short '?' segments inherit the nearest known speaker; long unknowns are
+    left alone; disableable via env constant."""
+    ns = _exec_app_fns(
+        ["_relabel_unknown_microsegments"],
+        {"UNKNOWN_SPEAKER_RELABEL": True, "UNKNOWN_SPEAKER_MAX_SEC": 2.0,
+         "log": type("L", (), {"info": staticmethod(lambda *a, **k: None)})()},
+    )
+    relabel = ns["_relabel_unknown_microsegments"]
+    segs = [
+        {"start": 0, "end": 5, "speaker": "SPEAKER_00", "words": [{"speaker": "SPEAKER_00"}]},
+        {"start": 5, "end": 5.8, "speaker": "?", "words": [{"speaker": "?"}]},
+        {"start": 6, "end": 10, "speaker": "SPEAKER_01", "words": [{"speaker": "SPEAKER_01"}]},
+        {"start": 10, "end": 20, "speaker": "?", "words": [{"speaker": "?"}]},  # too long: untouched
+    ]
+    out = relabel(segs)
+    assert out[1]["speaker"] == "SPEAKER_00"           # previous neighbour wins
+    assert out[1]["words"][0]["speaker"] == "SPEAKER_00"
+    assert out[3]["speaker"] == "?"                     # long unknown preserved
+    # first-segment unknown falls back to the NEXT known speaker
+    segs2 = [
+        {"start": 0, "end": 1, "speaker": "?", "words": []},
+        {"start": 1, "end": 4, "speaker": "SPEAKER_01", "words": []},
+    ]
+    assert relabel(segs2)[0]["speaker"] == "SPEAKER_01"
+    # disabled -> passthrough (fresh data: the function mutates in place)
+    ns["UNKNOWN_SPEAKER_RELABEL"] = False
+    segs3 = [{"start": 5, "end": 5.8, "speaker": "?", "words": []},
+             {"start": 6, "end": 10, "speaker": "SPEAKER_01", "words": []}]
+    assert ns["_relabel_unknown_microsegments"](segs3)[0]["speaker"] == "?"
+    # wired into the pipeline after segment splitting
+    assert 'result["segments"] = _relabel_unknown_microsegments(result.get("segments", []))' in APP_SRC
+
+
 def main():
     import traceback
     tests = sorted(name for name in globals() if name.startswith("test_"))

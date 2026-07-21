@@ -284,6 +284,9 @@ def load_diarization():
 VOICEPRINT_FILE = os.environ.get("VOICEPRINT_FILE", "/data/voiceprints.json")
 VOICEPRINT_THRESHOLD = float(os.environ.get("VOICEPRINT_THRESHOLD", "0.5"))
 IDENTIFY_SPEAKERS = os.environ.get("IDENTIFY_SPEAKERS", "1") not in ("0", "false", "no")
+VOCABULARY_FILE = os.environ.get("VOCABULARY_FILE", "/data/vocabulary.txt")
+AUTO_HOTWORDS = os.environ.get("AUTO_HOTWORDS", "1") not in ("0", "false", "no")
+HOTWORDS_MAX_TERMS = int(os.environ.get("HOTWORDS_MAX_TERMS", "60"))
 
 
 def _load_voiceprints() -> list:
@@ -301,6 +304,128 @@ def _save_voiceprints(prints: list) -> None:
         os.makedirs(parent, exist_ok=True)
     with open(VOICEPRINT_FILE, "w") as f:
         json.dump(prints, f, ensure_ascii=False, indent=2)
+
+
+MICRO_TURN_CLEANUP = os.environ.get("MICRO_TURN_CLEANUP", "1") not in ("0", "false", "no")
+MICRO_TURN_MAX_SEC = float(os.environ.get("MICRO_TURN_MAX_SEC", "1.0"))
+UNKNOWN_SPEAKER_RELABEL = os.environ.get("UNKNOWN_SPEAKER_RELABEL", "1") not in ("0", "false", "no")
+UNKNOWN_SPEAKER_MAX_SEC = float(os.environ.get("UNKNOWN_SPEAKER_MAX_SEC", "2.0"))
+
+
+def _relabel_unknown_microsegments(segments: list, max_sec: float = UNKNOWN_SPEAKER_MAX_SEC) -> list:
+    """Fix short segments whose words got NO diarization assignment (speaker
+    "?" / missing) - typically a brief utterance like "Thank you." that the
+    diarizer never clustered. Left alone these surface as a literal "?"
+    speaker in transcripts and pollute downstream speaker stats. Segments at
+    or under max_sec take the nearest known neighbour's speaker (previous
+    wins, next as fallback); longer unknowns are left for a human to notice.
+    Disable with UNKNOWN_SPEAKER_RELABEL=0."""
+    if not UNKNOWN_SPEAKER_RELABEL or not segments:
+        return segments
+
+    def _unknown(sp) -> bool:
+        return sp in (None, "", "?")
+
+    fixed = 0
+    for i, seg in enumerate(segments):
+        if not _unknown(seg.get("speaker")):
+            continue
+        try:
+            dur = float(seg.get("end", 0)) - float(seg.get("start", 0))
+        except (TypeError, ValueError):
+            continue
+        if dur > max_sec:
+            continue
+        donor = None
+        for j in range(i - 1, -1, -1):
+            if not _unknown(segments[j].get("speaker")):
+                donor = segments[j]["speaker"]
+                break
+        if donor is None:
+            for j in range(i + 1, len(segments)):
+                if not _unknown(segments[j].get("speaker")):
+                    donor = segments[j]["speaker"]
+                    break
+        if donor is None:
+            continue
+        seg["speaker"] = donor
+        for w in seg.get("words", []):
+            if _unknown(w.get("speaker")):
+                w["speaker"] = donor
+        fixed += 1
+    if fixed:
+        log.info(f"unknown-speaker relabel: fixed {fixed} micro segment(s)")
+    return segments
+
+
+def _merge_sandwiched_microturns(diarize_segments, max_duration: float = MICRO_TURN_MAX_SEC):
+    """Fix diarization flicker: a micro-turn (< max_duration) sandwiched
+    between two turns of the SAME speaker (A -> B -> A within a second) is
+    almost always a misassignment, not a real interjection - it splits one
+    person's sentence across two labels and pollutes voice-print enrollment.
+    Reassign it to the flanking speaker. Operates on the whisperX diarize
+    DataFrame before word-speaker assignment; no-op on anything unexpected.
+    Disable with MICRO_TURN_CLEANUP=0."""
+    try:
+        if not MICRO_TURN_CLEANUP or diarize_segments is None or len(diarize_segments) < 3:
+            return diarize_segments
+        df = diarize_segments.reset_index(drop=True).copy()
+        speakers = df["speaker"].tolist()
+        starts = df["start"].tolist()
+        ends = df["end"].tolist()
+        fixed = 0
+        for i in range(1, len(df) - 1):
+            if ends[i] - starts[i] > max_duration:
+                continue
+            if speakers[i - 1] == speakers[i + 1] and speakers[i] != speakers[i - 1]:
+                speakers[i] = speakers[i - 1]
+                fixed += 1
+        if fixed:
+            df["speaker"] = speakers
+            log.info(f"diarization micro-turn cleanup: reassigned {fixed} sandwiched segment(s)")
+        return df
+    except Exception as e:
+        log.warning(f"micro-turn cleanup skipped (non-critical): {e}")
+        return diarize_segments
+
+
+def _load_vocabulary() -> list:
+    """Persistent custom vocabulary: one term per line, '#' comments allowed.
+
+    Company / product / account names whisper would otherwise mangle
+    ("Supabase", teammate names, active deal names). Auto-merged into every
+    job's hotwords by _build_hotwords."""
+    try:
+        with open(VOCABULARY_FILE) as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+    except Exception:
+        return []
+
+
+def _build_hotwords(user_hotwords) -> str:
+    """Merge user-supplied hotwords + enrolled voice-print names + vocabulary.
+
+    Enrolled speaker names and the persistent vocabulary are proper nouns the
+    model otherwise mis-hears ("Erfi" -> "Erfie", "Supabase" -> "superbase"),
+    so they are injected automatically on every job. User terms take priority;
+    the merged list is capped (HOTWORDS_MAX_TERMS) because hotwords share
+    whisper's 448-token prompt budget with initial_prompt. Case-insensitive
+    dedupe; set AUTO_HOTWORDS=0 to disable the automatic sources.
+    """
+    terms, seen = [], set()
+
+    def _add(items):
+        for t in items:
+            t = (t or "").strip()
+            if t and t.lower() not in seen:
+                seen.add(t.lower())
+                terms.append(t)
+
+    _add((user_hotwords or "").split(","))
+    if AUTO_HOTWORDS:
+        _add(p.get("name", "") for p in _load_voiceprints() if isinstance(p, dict))
+        _add(_load_vocabulary())
+    return ", ".join(terms[:HOTWORDS_MAX_TERMS])
 
 
 def _cosine(a, b) -> float:
@@ -853,7 +978,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format,
         log.info(f"[{request_id}] Could not determine file size")
 
     batch_size = int(batch_size)
-    hotwords_str = hotwords.strip() if hotwords else ""
+    hotwords_str = _build_hotwords(hotwords)
     prompt_str = initial_prompt.strip() if initial_prompt else ""
     log.info(f"[{request_id}] Model: {model_name}")
     log.info(f"[{request_id}] Language: {language}")
@@ -1070,6 +1195,7 @@ def _transcribe_inner(file, local_path, model_name, language, output_format,
                     diarize_segments, speaker_embeddings = diarize_out
                 else:
                     diarize_segments, speaker_embeddings = diarize_out, None
+                diarize_segments = _merge_sandwiched_microturns(diarize_segments)
                 result = whisperx.assign_word_speakers(diarize_segments, result)
                 if speaker_embeddings:
                     result["speaker_embeddings"] = speaker_embeddings
@@ -1083,6 +1209,8 @@ def _transcribe_inner(file, local_path, model_name, language, output_format,
                         log.info(f"[{request_id}]   Split {original_count} -> {new_count} segments at speaker/sentence boundaries")
                 else:
                     log.info(f"[{request_id}]   Skipping segment splitting (no word timestamps)")
+
+                result["segments"] = _relabel_unknown_microsegments(result.get("segments", []))
 
                 # Estimate gender from pitch and apply labels (after splitting so all segments get labeled)
                 try:
@@ -1448,6 +1576,46 @@ MEDIA_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".
 # the cache by passing force=True).
 _MEDIA_SCAN_TTL = int(os.environ.get("MEDIA_SCAN_TTL", "60"))
 _media_scan_cache: dict = {"at": 0.0, "result": []}
+
+
+MEDIA_DUPE_WINDOW_SEC = int(os.environ.get("MEDIA_DUPE_WINDOW_SEC", "120"))
+_MEDIA_NAME_TS = re.compile(r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})-(\d{2})-(\d{2})")
+
+
+def _media_name_timestamp(name: str):
+    """Parse a recording-start timestamp from OBS-style file names
+    ('2026-07-21 11-12-07.mkv'). Returns epoch seconds or None."""
+    m = _MEDIA_NAME_TS.search(os.path.basename(name))
+    if not m:
+        return None
+    try:
+        import datetime as _dt
+
+        y, mo, d, h, mi, s = (int(g) for g in m.groups())
+        return _dt.datetime(y, mo, d, h, mi, s).timestamp()
+    except Exception:
+        return None
+
+
+def mark_possible_duplicates(files: list[tuple[str, str]]) -> list[dict]:
+    """Annotate a newest-first media list with likely duplicate/false-start
+    recordings. Two files whose name-embedded start times are within
+    MEDIA_DUPE_WINDOW_SEC are flagged (the older points at the newer).
+    Falls back to mtime when names don't parse."""
+    out = [{"name": n, "path": p} for n, p in files]
+    for i in range(1, len(out)):
+        newer, older = out[i - 1], out[i]
+        tn = _media_name_timestamp(newer["name"])
+        to = _media_name_timestamp(older["name"])
+        if tn is None or to is None:
+            try:
+                tn = tn if tn is not None else os.path.getmtime(newer["path"])
+                to = to if to is not None else os.path.getmtime(older["path"])
+            except OSError:
+                continue
+        if 0 <= tn - to <= MEDIA_DUPE_WINDOW_SEC:
+            older["possible_duplicate_of"] = newer["name"]
+    return out
 
 
 def scan_media_files(force: bool = False) -> list[tuple[str, str]]:
@@ -3778,7 +3946,7 @@ async def api_media(request: Request):
     """
     force = request.query_params.get("refresh") in ("1", "true", "yes")
     files = scan_media_files(force=force)
-    return JSONResponse({"files": [{"name": n, "path": p} for n, p in files]})
+    return JSONResponse({"files": mark_possible_duplicates(files)})
 
 
 async def api_artifact(request: Request):
@@ -3877,6 +4045,55 @@ async def api_voiceprints_delete(request: Request):
     remaining = [p for p in prints if p.get("name") != name]
     _save_voiceprints(remaining)
     return JSONResponse({"removed": name, "remaining": len(remaining)})
+
+
+def _vocabulary_state() -> dict:
+    return {
+        "terms": _load_vocabulary(),
+        "file": VOCABULARY_FILE,
+        "auto_hotwords": AUTO_HOTWORDS,
+        "max_terms": HOTWORDS_MAX_TERMS,
+        "voiceprint_names": [p.get("name") for p in _load_voiceprints() if isinstance(p, dict) and p.get("name")],
+    }
+
+
+async def api_vocabulary_get(request: Request):
+    """GET /api/vocabulary - the persistent hotword vocabulary auto-injected
+    into every transcription job (plus the enrolled voice-print names, which
+    are also injected)."""
+    return JSONResponse(_vocabulary_state())
+
+
+async def api_vocabulary_put(request: Request):
+    """PUT /api/vocabulary {terms: [...]} - replace the vocabulary file.
+
+    Terms are one-per-line strings; '#'-prefixed lines are comments and blank
+    lines are dropped on read, but we store the clean list verbatim."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    terms = body.get("terms")
+    if not isinstance(terms, list) or not all(isinstance(t, str) for t in terms):
+        return JSONResponse({"error": "'terms' must be a list of strings"}, status_code=400)
+    clean = []
+    for t in terms:
+        t = t.strip()
+        if not t or t.startswith("#"):
+            continue
+        if len(t) > 80:
+            return JSONResponse({"error": f"term too long (80 chars max): {t[:40]}..."}, status_code=400)
+        clean.append(t)
+    if len(clean) > 200:
+        return JSONResponse({"error": "too many terms (200 max)"}, status_code=400)
+    parent = os.path.dirname(VOCABULARY_FILE)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+    with open(VOCABULARY_FILE, "w") as f:
+        f.write("# whisper auto-hotwords vocabulary - one term per line\n")
+        f.write("\n".join(clean) + ("\n" if clean else ""))
+    log.info(f"[API] vocabulary replaced: {len(clean)} terms")
+    return JSONResponse(_vocabulary_state())
 
 
 async def api_upload(request: Request):
@@ -4208,6 +4425,8 @@ API_ROUTES = [
     Route("/api/voiceprints", api_voiceprints_list, methods=["GET"]),
     Route("/api/voiceprints", api_voiceprints_add, methods=["POST"]),
     Route("/api/voiceprints/{name}", api_voiceprints_delete, methods=["DELETE"]),
+    Route("/api/vocabulary", api_vocabulary_get, methods=["GET"]),
+    Route("/api/vocabulary", api_vocabulary_put, methods=["PUT"]),
     Route("/api/upload", api_upload, methods=["POST"]),
     Route("/api/live/health", api_live_health, methods=["GET"]),
     Route("/api/live/transcribe-chunk", api_live_chunk, methods=["POST"]),

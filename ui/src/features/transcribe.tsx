@@ -272,6 +272,9 @@ export function TranscribeTab() {
 									{media.data?.files.map((f) => (
 										<SelectItem key={f.path} value={f.path}>
 											{f.name}
+											{f.possible_duplicate_of
+												? ` (possible duplicate of ${f.possible_duplicate_of})`
+												: ""}
 										</SelectItem>
 									))}
 								</SelectContent>
@@ -395,6 +398,10 @@ export function TranscribeTab() {
 						onChange={(e) => set("hotwords", e.target.value)}
 						placeholder="optional"
 					/>
+					<p className="text-xs text-muted-foreground">
+						Enrolled voice-print names and the server vocabulary are injected
+						automatically (see Voices tab).
+					</p>
 				</Field>
 
 				<Field label="Initial prompt (context / spelling hints)">

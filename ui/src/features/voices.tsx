@@ -25,7 +25,9 @@ import {
 	addVoiceprint,
 	deleteVoiceprint,
 	getMedia,
+	getVocabulary,
 	getVoiceprints,
+	putVocabulary,
 } from "@/lib/api";
 
 // Enrolled voice prints drive server-side speaker naming: a matched speaker is
@@ -91,10 +93,30 @@ export function VoicesTab() {
 		},
 		onError: (e: Error) => toast.error(e.message),
 	});
-
 	const canEnroll =
 		name.trim().length > 0 && file.length > 0 && !enroll.isPending;
 	const rows = prints.data?.voiceprints ?? [];
+
+	// ── vocabulary (auto-hotwords) ──────────────────────────────────────────
+	const vocab = useQuery({ queryKey: ["vocabulary"], queryFn: getVocabulary });
+	const [vocabText, setVocabText] = useState<string | null>(null);
+	const saveVocab = useMutation({
+		mutationFn: () =>
+			putVocabulary(
+				(vocabText ?? "")
+					.split("\n")
+					.map((t) => t.trim())
+					.filter((t) => t.length > 0 && !t.startsWith("#")),
+			),
+		onSuccess: (r) => {
+			toast.success(`Vocabulary saved (${r.terms.length} terms)`);
+			setVocabText(null);
+			qc.invalidateQueries({ queryKey: ["vocabulary"] });
+		},
+		onError: (e: Error) => toast.error(e.message),
+	});
+	const vocabDisplay =
+		vocabText ?? (vocab.data ? vocab.data.terms.join("\n") : "");
 
 	return (
 		<div className="flex flex-col gap-6 max-w-3xl">
@@ -212,6 +234,43 @@ export function VoicesTab() {
 						</TableBody>
 					</Table>
 				)}
+			</div>
+
+			{/* Vocabulary (auto-hotwords) */}
+			<div className="flex flex-col gap-3 rounded-md border p-4">
+				<h2 className="text-sm font-medium">
+					Vocabulary{" "}
+					<Badge variant="secondary" className="ml-1 font-mono">
+						{vocab.data?.terms.length ?? 0}
+					</Badge>
+				</h2>
+				<p className="text-xs text-muted-foreground">
+					One term per line. These are injected as hotwords into every
+					transcription job automatically (alongside the enrolled voice names
+					above) - use it for company, product, and account names the model
+					would otherwise mis-hear.
+					{vocab.data && !vocab.data.auto_hotwords
+						? " Auto-injection is currently DISABLED server-side (AUTO_HOTWORDS=0)."
+						: ""}
+				</p>
+				<Textarea
+					rows={8}
+					className="font-mono text-xs"
+					value={vocabDisplay}
+					onChange={(e) => setVocabText(e.target.value)}
+					placeholder={
+						vocab.isLoading ? "Loading..." : "Supabase\nPostgREST\nAcme Corp"
+					}
+				/>
+				<div>
+					<Button
+						type="button"
+						disabled={vocabText === null || saveVocab.isPending}
+						onClick={() => saveVocab.mutate()}
+					>
+						{saveVocab.isPending ? "Saving..." : "Save vocabulary"}
+					</Button>
+				</div>
 			</div>
 		</div>
 	);

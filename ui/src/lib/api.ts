@@ -92,7 +92,13 @@ export const getHistory = () => jget(HistorySchema, "/api/history");
 
 // ── /api/media ───────────────────────────────────────────────────────────────
 export const MediaSchema = z.object({
-	files: z.array(z.object({ name: z.string(), path: z.string() })),
+	files: z.array(
+		z.object({
+			name: z.string(),
+			path: z.string(),
+			possible_duplicate_of: z.string().optional(),
+		}),
+	),
 });
 export const getMedia = (refresh = false) =>
 	jget(MediaSchema, `/api/media${refresh ? "?refresh=1" : ""}`);
@@ -226,6 +232,33 @@ export async function deleteVoiceprint(name: string): Promise<void> {
 		},
 	);
 	if (!res.ok) throw new Error(`delete voiceprint → ${res.status}`);
+}
+
+// ── /api/vocabulary ──────────────────────────────────────────────────────────
+// Persistent hotword vocabulary auto-injected into every transcription job
+// (alongside enrolled voice-print names). One term per line server-side.
+export const VocabularySchema = z.object({
+	terms: z.array(z.string()),
+	file: z.string(),
+	auto_hotwords: z.boolean(),
+	max_terms: z.number(),
+	voiceprint_names: z.array(z.string()),
+});
+export type Vocabulary = z.infer<typeof VocabularySchema>;
+export const getVocabulary = () => jget(VocabularySchema, "/api/vocabulary");
+
+export async function putVocabulary(terms: string[]): Promise<Vocabulary> {
+	const res = await fetch(`${API}/api/vocabulary`, {
+		method: "PUT",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ terms }),
+	});
+	const json = await res.json().catch(() => ({}));
+	if (!res.ok)
+		throw new Error(
+			(json as { error?: string }).error || `vocabulary → ${res.status}`,
+		);
+	return VocabularySchema.parse(json);
 }
 
 // ── /api/live ────────────────────────────────────────────────────────────────
