@@ -55,7 +55,7 @@ correct restart-vs-recreate semantics.
 | Tail whisper logs (OCR, VLM, transcription) | `make logs-whisper` |
 | Whisper API quick probe | `make status` |
 | Bot env change | `make recreate-bot` (NOT `restart-bot` — in-place restart does NOT re-read env) |
-| Whisper code change | `make build-whisper && make recreate-whisper` (compose.yaml does NOT bind-mount source despite the misleading `restart-whisper` help text) |
+| Whisper code change | `make build-whisper && make recreate-whisper` (compose.yaml does NOT bind-mount source despite the misleading `restart-whisper` help text). If the stack is in STANDALONE mode, use `make build-whisper && make recreate-whisper-standalone` - the plain target fails on the missing external `llmc` net |
 | Bring up WITHOUT llm-compose (transcription core only) | `make up-standalone` / tear down with `make down-standalone` |
 | Capture OBS/desktop/mic audio → live transcript on stdout (no bot) | `make live-tap` (verify reachability first with `make live-tap-selftest`) |
 

@@ -310,6 +310,10 @@ MICRO_TURN_CLEANUP = os.environ.get("MICRO_TURN_CLEANUP", "1") not in ("0", "fal
 MICRO_TURN_MAX_SEC = float(os.environ.get("MICRO_TURN_MAX_SEC", "1.0"))
 UNKNOWN_SPEAKER_RELABEL = os.environ.get("UNKNOWN_SPEAKER_RELABEL", "1") not in ("0", "false", "no")
 UNKNOWN_SPEAKER_MAX_SEC = float(os.environ.get("UNKNOWN_SPEAKER_MAX_SEC", "2.0"))
+# Gender-prefixed speaker labels (M-/F-SPEAKER_XX) via F0 pitch estimation.
+# Default OFF - F0 over compressed/phone mics mislabels too often and the
+# prefix misleads; voice prints are the identity mechanism. Opt-in with 1.
+SPEAKER_GENDER_LABELS = os.environ.get("SPEAKER_GENDER_LABELS", "0") in ("1", "true", "yes")
 
 
 def _relabel_unknown_microsegments(segments: list, max_sec: float = UNKNOWN_SPEAKER_MAX_SEC) -> list:
@@ -1212,22 +1216,28 @@ def _transcribe_inner(file, local_path, model_name, language, output_format,
 
                 result["segments"] = _relabel_unknown_microsegments(result.get("segments", []))
 
-                # Estimate gender from pitch and apply labels (after splitting so all segments get labeled)
-                try:
-                    genders = estimate_speaker_genders(audio, result.get("segments", []))
-                    if genders:
-                        result["segments"] = apply_gender_labels(result.get("segments", []), genders)
-                        gender_summary = ", ".join(f"{k}={v}" for k, v in sorted(genders.items()))
-                        log.info(f"[{request_id}]   Gender estimates: {gender_summary}")
-                        # Keep embedding keys in sync with the gender-prefixed
-                        # segment labels so callers can align them 1:1.
-                        if result.get("speaker_embeddings"):
-                            result["speaker_embeddings"] = {
-                                (f"{genders[k]}-{k}" if genders.get(k) not in (None, "?") else k): v
-                                for k, v in result["speaker_embeddings"].items()
-                            }
-                except Exception as e:
-                    log.warning(f"[{request_id}]   Gender estimation failed (non-critical): {e}")
+                # Gender-prefixed labels (M-/F-SPEAKER_XX) from F0 pitch. OFF by
+                # default: F0 over a compressed/phone mic mislabels often enough
+                # (e.g. a male voice on a laptop mic landing >=165 Hz) that the
+                # prefix actively misleads downstream readers, and voice prints
+                # are the real identity mechanism. Opt back in with
+                # SPEAKER_GENDER_LABELS=1.
+                if SPEAKER_GENDER_LABELS:
+                    try:
+                        genders = estimate_speaker_genders(audio, result.get("segments", []))
+                        if genders:
+                            result["segments"] = apply_gender_labels(result.get("segments", []), genders)
+                            gender_summary = ", ".join(f"{k}={v}" for k, v in sorted(genders.items()))
+                            log.info(f"[{request_id}]   Gender estimates: {gender_summary}")
+                            # Keep embedding keys in sync with the gender-prefixed
+                            # segment labels so callers can align them 1:1.
+                            if result.get("speaker_embeddings"):
+                                result["speaker_embeddings"] = {
+                                    (f"{genders[k]}-{k}" if genders.get(k) not in (None, "?") else k): v
+                                    for k, v in result["speaker_embeddings"].items()
+                                }
+                    except Exception as e:
+                        log.warning(f"[{request_id}]   Gender estimation failed (non-critical): {e}")
 
                 # -- Voice-print identification (server-side; names all outputs) --
                 try:

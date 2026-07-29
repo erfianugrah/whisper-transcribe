@@ -5761,6 +5761,23 @@ def test_app_relabel_unknown_microsegments():
     assert 'result["segments"] = _relabel_unknown_microsegments(result.get("segments", []))' in APP_SRC
 
 
+def test_app_speaker_gender_labels_default_off():
+    """Gender-prefixed speaker labels (M-/F-SPEAKER_XX) must be gated behind
+    SPEAKER_GENDER_LABELS and default OFF - F0 pitch over compressed/phone
+    mics mislabels often enough that the prefix misleads; voice prints are
+    the identity mechanism."""
+    assert 'SPEAKER_GENDER_LABELS = os.environ.get("SPEAKER_GENDER_LABELS", "0")' in APP_SRC
+    # exactly one def + one call site each: no ungated second call
+    assert APP_SRC.count("estimate_speaker_genders(") == 2
+    assert APP_SRC.count("apply_gender_labels(") == 2
+    # both calls must sit INSIDE the gate, before voice-print identification
+    gate = APP_SRC.index("if SPEAKER_GENDER_LABELS:")
+    voiceprint = APP_SRC.index("# -- Voice-print identification")
+    block = APP_SRC[gate:voiceprint]
+    assert "estimate_speaker_genders(audio," in block
+    assert "apply_gender_labels(result.get" in block
+
+
 def main():
     import traceback
     tests = sorted(name for name in globals() if name.startswith("test_"))

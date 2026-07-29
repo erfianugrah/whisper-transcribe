@@ -100,12 +100,15 @@ restart-bot: ## Restart bot only (in-place; does NOT re-read bot/.env — use re
 restart-scraper: ## Restart crawl4ai + flaresolverr together (e.g. after a hung browser)
 	$(COMPOSE_RUNTIME) restart crawl4ai flaresolverr
 
-.PHONY: recreate-bot recreate-whisper recreate-scraper restart-scraper
+.PHONY: recreate-bot recreate-whisper recreate-whisper-standalone recreate-scraper restart-scraper
 recreate-bot: ## Tear down + recreate bot container (re-reads bot/.env, refreshes image)
 	$(COMPOSE_RUNTIME) up -d --force-recreate bot
 
 recreate-whisper: ## Tear down + recreate whisper container (re-reads .env)
 	$(COMPOSE_RUNTIME) up -d --force-recreate whisper
+
+recreate-whisper-standalone: ## recreate-whisper for standalone mode (no llm-compose; the plain target fails on the missing external llmc net)
+	$(COMPOSE_STANDALONE) up -d --force-recreate whisper
 
 recreate-scraper: ## Tear down + recreate scraper services (refreshes images, clears state)
 	$(COMPOSE_RUNTIME) up -d --force-recreate crawl4ai flaresolverr
