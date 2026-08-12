@@ -217,7 +217,7 @@ services:
   # The bot falls back to this when Crawl4AI returns a CF interstitial.
   # Doesn't solve hard Turnstile — those still fail, by design.
   flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:v3.4.6
+    image: ghcr.io/flaresolverr/flaresolverr:v3.5.0
     pull_policy: missing
     environment:
       - LOG_LEVEL=info
