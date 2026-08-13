@@ -80,6 +80,11 @@ correct restart-vs-recreate semantics.
   name (`whisper-standalone-llmc`); llm-compose stays untouched so
   co-deploy keeps working. Use `make up-standalone`, never hand-edit
   the network's `external:` flag.
+- **Containers are compose-managed - `docker stop`, never `docker rm`.**
+  External tooling that needs the GPU (llm-compose bench scripts) stops
+  `whisper` / `whisper-live`. `docker rm` destroys them and `docker
+  start` cannot recover - recreate with `make up` (observed 2026-08-13).
+  `whisper-live` holds large-v3 resident (~5.6 GiB VRAM) even when idle.
 
 ## Test discipline
 
