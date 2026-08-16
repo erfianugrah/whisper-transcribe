@@ -226,6 +226,8 @@ directly — same surface area.
 | `VLM_FRAME_CONCURRENCY` | `4` | Parallel frame description requests |
 | `ALIGN_MODEL_CACHE_SIZE` | `4` | LRU cap for wav2vec2 alignment models |
 | `YT_DLP_COOKIES_FILE` | — | Optional cookies.txt path for age-gated / bot-flagged videos |
+| `YT_DLP_PLAYER_CLIENTS` | `default,android,ios,tv,mweb` | YouTube player-client fallback chain. On an IP-throttle (HTTP 403 / "unable to download video data") the download is retried with each client in turn. `default` = yt-dlp's own selection; pin one entry to disable fallback |
+| `YT_DLP_EXTRA_ARGS` | (empty) | Raw yt-dlp arg passthrough appended to every attempt. Escape valve for PO tokens (`--extractor-args youtube:po_token=...`, pin the client chain to match) or an egress proxy for a hot IP (`--proxy socks5://...`) |
 | `VALKEY_URL` | `redis://valkey:6379/0` | Job queue backing store |
 | `TRANSCRIPT_CACHE_TTL` | `604800` | Shared transcript cache TTL (seconds; default 7d) |
 | `JOB_TTL` | `3600` | How long terminal job hashes stick around (seconds) |

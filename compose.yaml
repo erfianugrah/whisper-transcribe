@@ -46,6 +46,18 @@ services:
       # Optional yt-dlp cookies (age-gated / bot-challenged videos).
       # Leave unset to disable; see .env.example for the why and how.
       - YT_DLP_COOKIES_FILE=${YT_DLP_COOKIES_FILE:-}
+      # YouTube player-client fallback chain for yt-dlp. When the default
+      # client gets IP-throttled (HTTP 403 "unable to download video
+      # data"), the download is retried with each client in turn.
+      # "default" = yt-dlp's own selection. Pin one entry to disable
+      # fallback; reorder to prefer a client that works for your IP.
+      - YT_DLP_PLAYER_CLIENTS=${YT_DLP_PLAYER_CLIENTS:-default,android,ios,tv,mweb}
+      # Raw yt-dlp arg passthrough, appended to every attempt. Escape
+      # valve for features without a bespoke env var: PO tokens (pin the
+      # client chain to match, e.g. clients=mweb + extra args of
+      # '--extractor-args youtube:po_token=mweb.gvs+XXX'), an egress
+      # proxy for a hot IP ('--proxy socks5://host:1055'), rate limits.
+      - YT_DLP_EXTRA_ARGS=${YT_DLP_EXTRA_ARGS:-}
       # VLM: silent-video frame description via OpenAI-compatible endpoint.
       # Defaults target llm-compose's model_proxy on the `llmc` external
       # network (see the networks: block on this service). Override to

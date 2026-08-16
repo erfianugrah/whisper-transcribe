@@ -6,6 +6,7 @@ import logging
 import tempfile
 import traceback
 import shutil
+import shlex
 import json
 import threading
 import subprocess
@@ -1495,6 +1496,40 @@ def _is_permanent_yt_dlp_error(stderr: str) -> bool:
     return any(p in stderr for p in _PERMANENT_YT_DLP_PATTERNS)
 
 
+# YouTube IP-throttles and bot-walls show up as HTTP 403 / "unable to
+# download video data" on yt-dlp's default player client while alternate
+# clients (android, ios, ...) still serve the same video. The download
+# path walks this chain in order; "default" means no override (yt-dlp's
+# own client selection). Comma-separated env override, e.g.
+# YT_DLP_PLAYER_CLIENTS=default,android - set to a single entry to pin.
+YT_DLP_PLAYER_CLIENTS = [
+    c.strip()
+    for c in os.environ.get(
+        "YT_DLP_PLAYER_CLIENTS", "default,android,ios,tv,mweb"
+    ).split(",")
+    if c.strip()
+] or ["default"]
+
+# stderr fragments that mean "this player client is being rejected" -
+# worth retrying with the next one. Distinct from
+# _PERMANENT_YT_DLP_PATTERNS (the content itself is unavailable; no
+# client switch will help). "Sign in to confirm you're not a bot" sits
+# in BOTH lists deliberately: alternate clients often dodge the bot
+# wall, so we retry first - but if every client hits it, the final
+# classification is still permanent (422) via the permanent list.
+_RETRYABLE_YT_DLP_PATTERNS = (
+    "HTTP Error 403",
+    "HTTP Error 429",
+    "unable to download video data",
+    "Requested format is not available",
+    "Sign in to confirm you're not a bot",
+)
+
+
+def _is_retryable_yt_dlp_error(stderr: str) -> bool:
+    return any(p in stderr for p in _RETRYABLE_YT_DLP_PATTERNS)
+
+
 def _extract_comments(meta: dict, output_dir: str, video_id: str) -> list[dict]:
     """Pull comments from yt-dlp's --print-json blob; fall back to the
     .info.json file on disk when --print-json truncated them.
@@ -1571,6 +1606,17 @@ def _yt_dlp_auth_args() -> list[str]:
     if cookies_browser:
         args.extend(["--cookies-from-browser", cookies_browser])
     return args
+
+
+def _yt_dlp_extra_args() -> list[str]:
+    """Raw passthrough appended to every yt-dlp attempt. The escape valve
+    for yt-dlp features that don't need a bespoke env var - PO tokens
+    (pair with a pinned YT_DLP_PLAYER_CLIENTS entry, e.g. clients=mweb +
+    extra='--extractor-args youtube:po_token=mweb.gvs+XXX'), an egress
+    proxy for a hot IP ('--proxy socks5://host:1055'), rate limits, etc.
+    Shell-split, so quote groupings survive."""
+    raw = os.environ.get("YT_DLP_EXTRA_ARGS", "").strip()
+    return shlex.split(raw) if raw else []
 
 
 # -- /media filesystem scanning ------------------------------------------------
@@ -2361,6 +2407,7 @@ async def api_yt_download(request: Request):
         # Required for YouTube Music / signature-protected streams as of 2026.
         "--remote-components", "ejs:github",
         *_yt_dlp_auth_args(),
+        *_yt_dlp_extra_args(),
         "-f", fmt,
     ]
     if not keep_video:
@@ -2390,7 +2437,26 @@ async def api_yt_download(request: Request):
     log.info(f"[API] yt-dlp download: {url} (playlist={playlist}, "
              f"comments={include_comments and comments_max or 0})")
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        # Player-client fallback chain. A 403/throttle on one client is
+        # retried with the next; errors a client switch can't fix
+        # (private video, unsupported URL, ...) stop the chain early.
+        result = None
+        for client in YT_DLP_PLAYER_CLIENTS:
+            attempt_cmd = list(cmd)
+            if client != "default":
+                attempt_cmd.extend(
+                    ["--extractor-args", f"youtube:player_client={client}"])
+            result = subprocess.run(attempt_cmd, capture_output=True,
+                                    text=True, timeout=3600)
+            if result.returncode == 0:
+                if client != "default":
+                    log.info(f"[API] yt-dlp succeeded with fallback "
+                             f"player_client={client}")
+                break
+            if not _is_retryable_yt_dlp_error(result.stderr):
+                break
+            log.warning(f"[API] yt-dlp player_client={client} failed: "
+                        f"{result.stderr[:150].strip()} - trying next client")
         if result.returncode != 0:
             log.error(f"[API] yt-dlp failed: {result.stderr[:500]}")
             # 422 (Unprocessable Entity) for permanent errors — clients

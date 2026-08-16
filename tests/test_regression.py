@@ -255,6 +255,91 @@ def test_pattern_list_drift():
     )
 
 
+# ─── 1b. Player-client fallback chain (regression: YouTube 403 IP-throttle) ──
+
+
+def test_retryable_yt_dlp_patterns_cover_throttle_modes():
+    """The retryable list must catch the real throttle/bot-wall stderr we
+    observed in production (2026-08: default client 403s while the android
+    client still serves the same video)."""
+    import ast
+
+    tree = ast.parse(APP_SRC)
+    patterns = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "_RETRYABLE_YT_DLP_PATTERNS":
+                    if isinstance(node.value, ast.Tuple):
+                        patterns = {
+                            el.value for el in node.value.elts
+                            if isinstance(el, ast.Constant)
+                            and isinstance(el.value, str)
+                        }
+    assert patterns, "could not parse _RETRYABLE_YT_DLP_PATTERNS"
+    required = {
+        "HTTP Error 403",
+        "unable to download video data",
+        "Sign in to confirm you're not a bot",
+    }
+    missing = required - patterns
+    assert not missing, f"retryable list missing throttle modes: {missing}"
+
+
+def test_player_client_fallback_wired_into_download():
+    """The /api/yt-download path must walk YT_DLP_PLAYER_CLIENTS and pass
+    the override as a youtube extractor-arg."""
+    assert "_is_retryable_yt_dlp_error" in APP_SRC
+    assert "YT_DLP_PLAYER_CLIENTS" in APP_SRC
+    assert 'f"youtube:player_client={client}"' in APP_SRC
+    # Default chain: yt-dlp's own selection first, then the alternates.
+    assert '"default,android,ios,tv,mweb"' in APP_SRC
+    # Fallback success must be logged for observability.
+    assert "succeeded with fallback" in APP_SRC
+
+
+def test_bot_wall_string_in_both_lists_deliberately():
+    """'Sign in to confirm you're not a bot' must be in BOTH the retryable
+    and permanent lists: retry with alternate clients first, but if every
+    client hits it the final classification is still permanent (422)."""
+    import ast
+
+    def _extract(src, var):
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == var:
+                        if isinstance(node.value, ast.Tuple):
+                            return {
+                                el.value for el in node.value.elts
+                                if isinstance(el, ast.Constant)
+                                and isinstance(el.value, str)
+                            }
+        return set()
+
+    bot_wall = "Sign in to confirm you're not a bot"
+    assert bot_wall in _extract(APP_SRC, "_RETRYABLE_YT_DLP_PATTERNS")
+    assert bot_wall in _extract(APP_SRC, "_PERMANENT_YT_DLP_PATTERNS")
+
+
+def test_extra_args_passthrough_wired():
+    """YT_DLP_EXTRA_ARGS must be shlex-split and appended to every yt-dlp
+    attempt - the escape valve for PO tokens / proxies without a rebuild."""
+    assert "_yt_dlp_extra_args" in APP_SRC
+    assert "shlex.split" in APP_SRC
+    assert "*_yt_dlp_extra_args()," in APP_SRC
+    compose = open(os.path.join(os.path.dirname(__file__), "..", "compose.yaml")).read()
+    assert "YT_DLP_EXTRA_ARGS" in compose
+
+
+def test_compose_passes_player_clients_env():
+    """compose.yaml must pass YT_DLP_PLAYER_CLIENTS through so operators
+    can reorder/pin the chain without a rebuild."""
+    compose = open(os.path.join(os.path.dirname(__file__), "..", "compose.yaml")).read()
+    assert "YT_DLP_PLAYER_CLIENTS" in compose
+
+
 # ─── 2. yt-dlp filename resolution (regression: .wav fallback) ────────────────
 
 
