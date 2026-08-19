@@ -211,7 +211,7 @@ services:
   # Crawl4AI: Playwright-based scraper, returns clean Markdown via /md.
   # Handles JS-rendered pages, basic stealth. ~400 MB image (Chromium baked in).
   crawl4ai:
-    image: unclecode/crawl4ai:0.7.4
+    image: unclecode/crawl4ai:0.9.2
     pull_policy: missing
     shm_size: 1gb  # Chromium needs >64 MB shared memory; default 64 MB OOMs
     networks:
