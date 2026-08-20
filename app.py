@@ -2847,7 +2847,7 @@ async def api_queue_info(request: Request):
 
 LLM_VISION_API_URL = os.environ.get(
     "LLM_VISION_API_URL",
-    os.environ.get("LLM_API_URL", "http://model_proxy:11434/v1"),
+    os.environ.get("LLM_API_URL", "http://model_proxy_go:11434/v1"),
 )
 LLM_VISION_MODEL = os.environ.get("LLM_VISION_MODEL", "Qwen2.5-VL-7B-Instruct")
 VLM_FPS_INTERVAL = float(os.environ.get("VLM_FPS_INTERVAL", "10"))  # seconds between frames
