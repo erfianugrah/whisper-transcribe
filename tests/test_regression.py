@@ -5628,7 +5628,7 @@ def test_research_provider_detection():
     assert rp("https://opencode.ai/zen/v1", "deepseek-v4-flash") == "openai"
     assert rp("https://opencode.ai/zen/v1", "glm-5.2") == "openai"
     # Local / generic OpenAI-compatible backends.
-    assert rp("http://model_proxy:11434/v1", "gemma") == "openai"
+    assert rp("http://model_proxy_go:11434/v1", "gemma") == "openai"
     assert rp("https://api.openai.com/v1", "gpt-4o-mini") == "openai"
 
 

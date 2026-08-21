@@ -16,10 +16,10 @@
 #     created out-of-band aborts with an "incorrect label" error — using a
 #     separate name sidesteps that footgun entirely),
 #   - llm-compose stays 100% untouched, so co-deployed `make up` still reaches
-#     `model_proxy` by hostname over the real `llmc`.
+#     `model_proxy_go` by hostname over the real `llmc`.
 #
 # In this mode the LLM-dependent extras (bot summaries, whisper /api/describe
-# VLM frame description, scene synthesis) can't reach `model_proxy` and degrade
+# VLM frame description, scene synthesis) can't reach `model_proxy_go` and degrade
 # gracefully. Point LLM_API_URL / LLM_VISION_API_URL / LLM_TEXT_API_URL at any
 # OpenAI-compatible endpoint via .env if you want those to work standalone.
 #

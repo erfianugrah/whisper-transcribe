@@ -15,7 +15,7 @@ GIT_SHA       := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 # Compose binding. The llm-compose overlay was removed in May 2026 — its
 # network (`llmc`) is now declared `external` in compose.yaml directly, so
 # `docker compose up` always lands the bot + whisper on the right network
-# and reaches `model_proxy` by hostname. Bring up llm-compose first for the
+# and reaches `model_proxy_go` by hostname. Bring up llm-compose first for the
 # co-deployed default; for a standalone stack (no llm-compose) use the
 # `*-standalone` targets, which swap in compose.standalone.yaml.
 COMPOSE := docker compose
@@ -23,7 +23,7 @@ COMPOSE_RUNTIME := docker compose
 # Standalone overlay: redefines `llmc` as a self-managed bridge so the stack
 # comes up WITHOUT llm-compose running (see compose.standalone.yaml). Used by
 # the `*-standalone` targets only; the default targets keep the co-deployed
-# behaviour (llmc external, reaches model_proxy by hostname).
+# behaviour (llmc external, reaches model_proxy_go by hostname).
 COMPOSE_STANDALONE := docker compose -f compose.yaml -f compose.standalone.yaml
 
 # Latest yt-dlp version from PyPI, fetched at make-invocation time. The

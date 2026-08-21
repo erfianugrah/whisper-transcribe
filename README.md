@@ -37,7 +37,7 @@ make build && make up
 ```
 
 The defaults point `LLM_API_URL` and `LLM_VISION_API_URL` at
-`http://model_proxy:11434/v1` on the external `llmc` network owned by
+`http://model_proxy_go:11434/v1` on the external `llmc` network owned by
 [llm-compose](https://github.com/erfianugrah/llm-compose). Bring
 `llm-compose` up first (`cd ~/llm-compose && make up`) — this stack
 declares the network `external: true` and refuses to start with a clean
@@ -62,10 +62,10 @@ This layers `compose.standalone.yaml`, which redefines `llmc` as a
 self-managed bridge (under a distinct name, `whisper-standalone-llmc`,
 so it never collides with llm-compose's real `llmc`). The co-deployed
 default (`make up`) is unchanged — when llm-compose is running, whisper
-still reaches `model_proxy` over the external `llmc` as before.
+still reaches `model_proxy_go` over the external `llmc` as before.
 
 In standalone mode the LLM-dependent extras (bot summaries, `/api/describe`
-VLM frame description, scene synthesis) can't reach `model_proxy` and
+VLM frame description, scene synthesis) can't reach `model_proxy_go` and
 degrade gracefully; core transcription is fully functional. Point the
 `LLM_*_API_URL` vars at any reachable OpenAI-compatible endpoint if you
 want those extras to work standalone.
@@ -261,7 +261,7 @@ Used by the SPA Live tab (**mic**, **system/OBS** via screen-share, or **mic + s
 | `WHISPER_API_URL` | `http://whisper:7860` | Whisper service location (compose-provided) |
 | `SCRAPER_API_URL` | `http://crawl4ai:11235` | Crawl4AI location |
 | `FLARESOLVERR_API_URL` | `http://flaresolverr:8191/v1` | FlareSolverr location |
-| `LLM_API_URL` | `http://model_proxy:11434/v1` | OpenAI-compatible LLM endpoint |
+| `LLM_API_URL` | `http://model_proxy_go:11434/v1` | OpenAI-compatible LLM endpoint |
 | `LLM_MODEL` | `Qwen3.5-4B-Q8_0` | Default summary model |
 | `EXA_API_KEY` | — | Optional. Web search for terminology (proper-noun spelling) |
 | `VLM_ENABLED` | `1` | Enable VLM fallback for silent videos |
@@ -329,7 +329,7 @@ See `.env.example` and `bot/.env.example` for the full list.
                        └─ /api/describe ──┐
                                           │
                                           ▼  HTTP
-                              [model_proxy] (llm-compose, external network)
+                              [model_proxy_go] (llm-compose, external network)
                                           │
                                           ▼
                               [Discord bot] ──── outbound websocket ──→ Discord

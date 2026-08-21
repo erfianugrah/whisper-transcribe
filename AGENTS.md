@@ -12,7 +12,7 @@ Two Python services + supporting infra, all in one compose stack:
   description + OCR (EasyOCR). HTTP API at `:7860`. Gradio UI at `/`.
 - **bot** (`bot/main.py`) — Discord bot that takes URL / image messages,
   enqueues jobs to the whisper service (Valkey-backed queue), and posts
-  summary embeds. Talks OpenAI-compatible LLM via `model_proxy:11434`
+  summary embeds. Talks OpenAI-compatible LLM via `model_proxy_go:11434`
   on external network `llmc` (declare `external: true` in compose.yaml).
 
 Plus: valkey (queue), crawl4ai + flaresolverr (web scraper for `tldr`
@@ -29,7 +29,7 @@ connectivity check). Lives in `compile-check` and the regression suite
 (`test_tap_*`).
 
 **Two deploy modes:** the default (`make up`) is co-deployed with
-llm-compose — it owns the external `llmc` net and serves `model_proxy`.
+llm-compose — it owns the external `llmc` net and serves `model_proxy_go`.
 For transcription-only use without llm-compose, `make up-standalone`
 layers `compose.standalone.yaml` (redefines `llmc` as a self-managed
 bridge under a distinct name) and brings up just valkey + whisper +

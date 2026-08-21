@@ -63,7 +63,7 @@ In `bot/.env` (see `bot/.env.example` for full options):
 ```dotenv
 DISCORD_TOKEN=...                  # required
 WHISPER_API_URL=http://whisper:7860
-LLM_API_URL=http://model_proxy:11434/v1
+LLM_API_URL=http://model_proxy_go:11434/v1
 LLM_MODEL=Qwen3.5-4B-Q8_0          # any model on llm-compose proxy
 EXA_API_KEY=...                    # optional — drives terminology hints
 
