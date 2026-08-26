@@ -34,7 +34,7 @@ services:
       valkey:
         condition: service_healthy
     environment:
-      - DEBUG_MODE=1  # 0/false/no/off for clean production logs
+      - DEBUG_MODE=${DEBUG_MODE:-0}  # 1/true/on for verbose debug logs
       - HF_TOKEN=${HF_TOKEN:-}  # HuggingFace token for pyannote diarization (optional)
       # Valkey URL for the job queue + transcript cache. Override only if
       # running valkey outside the default compose network.
