@@ -1,17 +1,27 @@
-"""Resident faster-whisper model for streaming transcription.
+"""faster-whisper model for streaming transcription.
 
-Keeps the model loaded permanently (the live service is dedicated; VRAM is
-not shared with the batch service). Serialises GPU calls via asyncio.Lock so
-multiple concurrent sessions share one model safely.
+The model is loaded LAZILY on first inference and released after an idle
+period (see server.py's idle reaper) so an unused live service does not sit
+on VRAM the LLM could use - this box shares one GPU between llama-server,
+comfyui, lora-train and both whisper services. Serialises GPU calls via
+asyncio.Lock so multiple concurrent sessions share one model safely.
+
+Note: no torch in this image - faster-whisper is CTranslate2, which frees
+device memory when the model object is destroyed, so unload() drops the
+reference and forces a gc pass rather than calling empty_cache().
 """
 from __future__ import annotations
 
 import asyncio
+import gc
+import logging
 import os
 import re
 from collections import deque
 
 import numpy as np
+
+log = logging.getLogger("whisper-live.transcriber")
 
 SAMPLE_RATE = 16000  # expected input: 16 kHz mono int16 PCM
 
@@ -23,10 +33,49 @@ class StreamingTranscriber:
         device: str = "cuda",
         compute_type: str = "float16",
     ) -> None:
-        from faster_whisper import WhisperModel
-
-        self._model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        self._model_name = model_name
+        self._device = device
+        self._compute_type = compute_type
+        self._model = None  # lazy: loaded on first use, dropped when idle
         self._lock = asyncio.Lock()
+
+    # ── Model lifecycle ───────────────────────────────────────────────────────
+    @property
+    def loaded(self) -> bool:
+        return self._model is not None
+
+    def ensure_model(self):
+        """Load the model if absent. Callers MUST hold self._lock (or be in
+        single-threaded startup) - concurrent loads would allocate twice."""
+        if self._model is None:
+            from faster_whisper import WhisperModel
+
+            log.info(
+                f"Loading model {self._model_name!r} on {self._device} "
+                f"({self._compute_type})..."
+            )
+            self._model = WhisperModel(
+                self._model_name, device=self._device, compute_type=self._compute_type
+            )
+        return self._model
+
+    async def unload(self) -> bool:
+        """Drop the model to free VRAM. Returns True if something was freed.
+
+        Takes the inference lock so it cannot race the stateless
+        transcribe_chunk path (which holds no stream count). The caller must
+        still guarantee no streaming session is open - OnlineSession keeps its
+        own model handle, so unloading mid-stream would leave it pointing at a
+        destroyed CTranslate2 model (server.py only reaps at
+        active_streams == 0).
+        """
+        async with self._lock:
+            if self._model is None:
+                return False
+            self._model = None
+            gc.collect()
+            log.info("Model unloaded, VRAM freed")
+            return True
 
     async def transcribe_chunk(
         self, pcm_bytes: bytes, context: str = "", language: str | None = None
@@ -39,6 +88,7 @@ class StreamingTranscriber:
         """
         loop = asyncio.get_event_loop()
         async with self._lock:
+            self.ensure_model()
             return await loop.run_in_executor(
                 None, self._transcribe_sync, pcm_bytes, context, language
             )
@@ -63,8 +113,13 @@ class StreamingTranscriber:
 
     # ── Streaming (LocalAgreement) ────────────────────────────────────────────
     def new_session(self, **kw) -> "OnlineSession":
-        """Create a per-connection streaming session bound to this model."""
-        return OnlineSession(self._model, **kw)
+        """Create a per-connection streaming session bound to this model.
+
+        Loads the model if it was idle-unloaded. Not lock-guarded: session
+        creation happens on the connection path before any inference, and a
+        concurrent inference pass would only find the model already present.
+        """
+        return OnlineSession(self.ensure_model(), **kw)
 
     async def session_process(self, session: "OnlineSession") -> tuple[str, str]:
         """Run one inference pass over the session's growing buffer on the GPU

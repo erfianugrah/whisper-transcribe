@@ -342,6 +342,97 @@ def test_ws_stream_handshake_applies_language_and_translate():
     assert rec.last_kwargs.get("task") == "translate"
 
 
+# ── Lazy load + idle unload (VRAM sharing with llama-server) ────────────────
+# The live service used to load large-v3 at boot and never release it, holding
+# ~4 GB of a single shared GPU even when nobody streamed. That silently capped
+# llama-server's usable context. These lock in load-on-demand + release-on-idle.
+
+def test_constructor_does_not_load_model():
+    """Construction must NOT touch the GPU - the model loads on first use."""
+    tr = StreamingTranscriber("stub-model", "cuda", "float16")
+    assert tr.loaded is False
+    assert tr._model is None
+
+
+def test_ensure_model_loads_once_and_is_idempotent():
+    tr = StreamingTranscriber("stub-model", "cuda", "float16")
+    m1 = tr.ensure_model()
+    assert tr.loaded is True
+    assert m1 is tr.ensure_model(), "ensure_model must reuse the loaded model"
+
+
+def test_unload_frees_and_reports():
+    tr = StreamingTranscriber("stub-model", "cuda", "float16")
+    tr.ensure_model()
+    assert asyncio.run(tr.unload()) is True
+    assert tr.loaded is False
+    # Second unload is a no-op, not an error.
+    assert asyncio.run(tr.unload()) is False
+
+
+def test_reload_after_unload():
+    """An idle-unloaded service must serve the next request, not 500."""
+    tr = StreamingTranscriber("stub-model", "cuda", "float16")
+    tr.ensure_model()
+    asyncio.run(tr.unload())
+    segs = asyncio.run(tr.transcribe_chunk(_sine_pcm(1.0), context=""))
+    assert tr.loaded is True
+    assert segs[0]["text"] == "hello world"
+
+
+def test_new_session_reloads_after_unload():
+    """new_session must not hand OnlineSession a None model post-unload."""
+    tr = StreamingTranscriber("stub-model", "cuda", "float16")
+    asyncio.run(tr.unload())
+    sess = tr.new_session()
+    assert tr.loaded is True
+    assert sess is not None
+
+
+def test_unload_serialises_against_inference():
+    """unload() must take the inference lock, so it cannot drop the model
+    while the stateless transcribe_chunk path is mid-call."""
+    tr = StreamingTranscriber("stub-model", "cuda", "float16")
+    tr.ensure_model()
+
+    async def scenario():
+        await tr._lock.acquire()          # simulate an in-flight inference
+        task = asyncio.ensure_future(tr.unload())
+        await asyncio.sleep(0.05)
+        still_loaded = tr.loaded          # must NOT have unloaded yet
+        tr._lock.release()
+        freed = await task
+        return still_loaded, freed
+
+    still_loaded, freed = asyncio.run(scenario())
+    assert still_loaded is True, "unload raced an in-flight inference call"
+    assert freed is True
+
+
+def test_server_idle_defaults_are_share_friendly():
+    """Default config must free VRAM when unused: idle unload ON, preload OFF."""
+    import importlib
+    srv = importlib.import_module("server")
+    assert srv.LIVE_MODEL_IDLE_TIMEOUT > 0, "idle unload must be on by default"
+    assert srv.LIVE_PRELOAD is False, "must not preload the model at boot"
+
+
+def test_health_reports_model_loaded_state():
+    """/health must expose whether the model is resident, so VRAM state is
+    observable without nvidia-smi."""
+    import importlib
+    from starlette.testclient import TestClient
+    srv = importlib.import_module("server")
+    tr = StreamingTranscriber("stub-model", "cuda", "float16")
+    srv._transcriber = tr
+    client = TestClient(srv.app)
+    body = client.get("/health").json()
+    assert body["model_loaded"] is False
+    assert body["idle_timeout"] == srv.LIVE_MODEL_IDLE_TIMEOUT
+    tr.ensure_model()
+    assert client.get("/health").json()["model_loaded"] is True
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))

@@ -171,6 +171,12 @@ services:
       - COMPUTE_TYPE=${LIVE_COMPUTE_TYPE:-float16}
       - LIVE_MAX_STREAMS=${LIVE_MAX_STREAMS:-4}
       - LIVE_PORT=7861
+      # VRAM sharing: this GPU is also llama-server's / comfyui's. Load the
+      # model on the first stream and release it after this many idle seconds
+      # instead of holding ~4 GB permanently (which capped llama-server's
+      # usable context). 0 = never unload; LIVE_PRELOAD=1 = load at boot.
+      - LIVE_MODEL_IDLE_TIMEOUT=${LIVE_MODEL_IDLE_TIMEOUT:-300}
+      - LIVE_PRELOAD=${LIVE_PRELOAD:-}
       - LIVE_CHUNK_SECONDS=${LIVE_CHUNK_SECONDS:-10}
       # Lower-latency streaming knobs (snappier live transcription for both the
       # SPA mic tab and the Discord voice bot). Trade a little more GPU churn

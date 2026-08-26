@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import shlex
+import time
 from contextlib import asynccontextmanager
 
 import uvicorn
@@ -55,6 +56,15 @@ CHUNK_THRESHOLD = CHUNK_SECONDS * 16000 * 2  # bytes of 16 kHz int16
 LIVE_LANGUAGE = os.environ.get("LIVE_LANGUAGE", "").strip() or None
 # Seconds between throttled per-stream level/throughput log lines.
 LIVE_LOG_INTERVAL = float(os.environ.get("LIVE_LOG_INTERVAL", "5.0"))
+# Idle unload: release the model after this many seconds with no active stream,
+# so an unused live service stops holding VRAM the LLM could use (one GPU is
+# shared with llama-server / comfyui / lora-train). 0 = never unload (the old
+# always-resident behaviour: costs ~4 GB idle, saves the cold-load on the
+# first utterance). Mirrors app.py's MODEL_IDLE_TIMEOUT.
+LIVE_MODEL_IDLE_TIMEOUT = int(os.environ.get("LIVE_MODEL_IDLE_TIMEOUT", "300"))
+# Preload at boot instead of on first use. Off by default so a service nobody
+# is streaming to costs no VRAM.
+LIVE_PRELOAD = os.environ.get("LIVE_PRELOAD", "").lower() in ("1", "true", "yes")
 # LIVE_DEBUG keeps faster-whisper's per-pass INFO spam (Processing / VAD
 # removed / Detected language) instead of quieting it to WARNING.
 LIVE_DEBUG = os.environ.get("LIVE_DEBUG", "").lower() in ("1", "true", "yes")
@@ -65,6 +75,51 @@ if not LIVE_DEBUG:
 
 _transcriber: StreamingTranscriber | None = None
 _active_streams: int = 0
+_last_activity: float = 0.0
+
+
+def _mark_activity() -> None:
+    """Stamp the idle clock. Called when a stream opens AND when it closes, so
+    the reaper measures time since the last stream ENDED."""
+    global _last_activity
+    _last_activity = time.monotonic()
+
+
+def _warmup() -> None:
+    """JIT-compile the CTranslate2 streaming kernels on a synthetic tone.
+
+    The first word_timestamps transcribe compiles kernels (~10-18 s); paying
+    it here keeps the first real utterance fast. Runs after every (re)load,
+    not just at boot.
+    """
+    import numpy as np
+    t = np.linspace(0, 1.0, 16000, endpoint=False)
+    tone = (np.sin(2 * np.pi * 220 * t) * 8000).astype(np.int16).tobytes()
+    warm = _transcriber.new_session()
+    warm.insert_audio(tone)
+    warm.process()
+
+
+async def _idle_reaper() -> None:
+    """Unload the model once no stream has run for LIVE_MODEL_IDLE_TIMEOUT.
+
+    Only ever unloads at _active_streams == 0: OnlineSession holds its own
+    model reference, so reaping mid-stream would leave it pointing at a
+    destroyed CTranslate2 model.
+    """
+    interval = max(5.0, min(30.0, LIVE_MODEL_IDLE_TIMEOUT / 4))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if _active_streams > 0 or not _transcriber.loaded:
+                continue
+            idle = time.monotonic() - _last_activity
+            if idle < LIVE_MODEL_IDLE_TIMEOUT:
+                continue
+            log.info(f"Idle for {idle:.0f}s - unloading model to free VRAM")
+            await _transcriber.unload()
+        except Exception as e:  # a reaper crash must not kill the service
+            log.warning(f"idle reaper error: {e}")
 
 
 @asynccontextmanager
@@ -72,23 +127,30 @@ async def _lifespan(app):
     # Starlette ≥1.0 removed the on_startup= kwarg; use the lifespan
     # context-manager pattern (mirrors app.py:_lifespan).
     global _transcriber
-    log.info(f"Loading model {MODEL_NAME!r} on {DEVICE} ({COMPUTE_TYPE})…")
     _transcriber = StreamingTranscriber(MODEL_NAME, DEVICE, COMPUTE_TYPE)
-    # Warm up the streaming path: the first word_timestamps transcribe
-    # JIT-compiles CTranslate2 kernels (~10-18 s). Do it now on a synthetic
-    # 1 s tone so the first real utterance isn't slow.
+    _mark_activity()
+    if LIVE_PRELOAD:
+        log.info(f"Preloading model {MODEL_NAME!r} on {DEVICE} ({COMPUTE_TYPE})...")
+        try:
+            _transcriber.ensure_model()
+            _warmup()
+            log.info("Streaming model warmed up.")
+        except Exception as e:
+            log.warning(f"preload skipped: {e}")
+    else:
+        log.info(
+            f"Model {MODEL_NAME!r} loads on first stream (LIVE_PRELOAD=1 to preload)"
+        )
+    reaper = None
+    if LIVE_MODEL_IDLE_TIMEOUT > 0:
+        reaper = asyncio.create_task(_idle_reaper())
+        log.info(f"Idle unload after {LIVE_MODEL_IDLE_TIMEOUT}s with no active stream")
+    log.info(f"Ready - max concurrent streams: {LIVE_MAX_STREAMS}")
     try:
-        import numpy as np
-        t = np.linspace(0, 1.0, 16000, endpoint=False)
-        tone = (np.sin(2 * np.pi * 220 * t) * 8000).astype(np.int16).tobytes()
-        warm = _transcriber.new_session()
-        warm.insert_audio(tone)
-        warm.process()
-        log.info("Streaming model warmed up.")
-    except Exception as e:
-        log.warning(f"warmup skipped: {e}")
-    log.info(f"Ready — max concurrent streams: {LIVE_MAX_STREAMS}")
-    yield
+        yield
+    finally:
+        if reaper is not None:
+            reaper.cancel()
 
 
 # ── HTTP routes ───────────────────────────────────────────────────────────────
@@ -96,6 +158,8 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "ok",
         "model": MODEL_NAME,
+        "model_loaded": bool(_transcriber and _transcriber.loaded),
+        "idle_timeout": LIVE_MODEL_IDLE_TIMEOUT,
         "max_streams": LIVE_MAX_STREAMS,
         "active_streams": _active_streams,
     })
@@ -132,11 +196,16 @@ async def transcribe_chunk(request: Request) -> JSONResponse:
         return JSONResponse({"error": "empty body"}, status_code=400)
     context = request.query_params.get("context", "")
     language = request.query_params.get("language") or LIVE_LANGUAGE
+    # Stateless path: no _active_streams bump, so mark activity on both sides
+    # of the call - the reaper must not unload between our load and our use.
+    _mark_activity()
     try:
         segments = await _transcriber.transcribe_chunk(body, context=context, language=language)
     except Exception as e:
         log.error(f"transcribe_chunk error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        _mark_activity()
     return JSONResponse({"segments": segments})
 
 
@@ -163,6 +232,7 @@ async def ws_url_endpoint(websocket: WebSocket) -> None:
         return
 
     _active_streams += 1
+    _mark_activity()
     log.info(f"[ws-url] stream opened ({_active_streams}/{LIVE_MAX_STREAMS}): {url}")
 
     shell_cmd = (
@@ -212,6 +282,7 @@ async def ws_url_endpoint(websocket: WebSocket) -> None:
         except ProcessLookupError:
             pass
         _active_streams -= 1
+        _mark_activity()
         log.info(f"[ws-url] stream closed ({_active_streams}/{LIVE_MAX_STREAMS})")
 
 
@@ -248,6 +319,7 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
         await websocket.close(1013)
         return
     _active_streams += 1
+    _mark_activity()
     stop = asyncio.Event()
 
     # Optional config handshake. The SPA sends ONE JSON text frame first
@@ -264,6 +336,7 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
         first = {"type": "websocket.disconnect"}
     if first.get("type") == "websocket.disconnect":
         _active_streams -= 1
+        _mark_activity()
         return
     _ftext = first.get("text")
     if first.get("bytes"):
@@ -350,6 +423,7 @@ async def ws_stream_endpoint(websocket: WebSocket) -> None:
         except Exception:
             pass
         _active_streams -= 1
+        _mark_activity()
         secs = getattr(session, "_received_samples", 0) / 16000
         log.info(
             f"[ws-stream] closed ({_active_streams}/{LIVE_MAX_STREAMS}) "
