@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# compose - docker compose with this stack's env files decrypted only for the
+# duration of one command.
+#
+# `.env` (compose interpolation) and `bot/.env` (the bot service's env_file)
+# are sops-encrypted at rest. This decrypts both into a private, RAM-backed
+# directory, points compose at them (--env-file, BOT_ENV_FILE), runs the
+# command, and removes the directory on any exit. Plaintext never touches
+# disk; a still-plaintext file (fresh clone, .env.example copied) is passed
+# through unchanged so the wrapper works before encryption too.
+#
+# Change a value without decrypting to your terminal:
+#   secretctl set 'sops:bot/.env#DISCORD_TOKEN' --from prompt:
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+base=/dev/shm
+[ -d "$base" ] && [ -w "$base" ] || base="${TMPDIR:-/tmp}"
+tmp=$(mktemp -d "$base/whisper-env.XXXXXX")
+cleanup() { rm -rf "$tmp"; }
+trap cleanup EXIT INT TERM HUP
+
+# decrypt <src> <dst>: sops-decrypt when the file carries sops metadata,
+# otherwise copy verbatim (plaintext / example file).
+decrypt() {
+  if grep -q '^sops_version=' "$1" 2>/dev/null; then
+    sops -d --input-type dotenv --output-type dotenv --output "$2" "$1"
+  else
+    cp "$1" "$2"
+  fi
+  chmod 600 "$2"
+}
+
+decrypt .env "$tmp/env"
+decrypt bot/.env "$tmp/bot.env"
+
+BOT_ENV_FILE="$tmp/bot.env" docker compose --env-file "$tmp/env" "$@"

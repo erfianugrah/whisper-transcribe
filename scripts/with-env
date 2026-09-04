@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# with-env CMD [ARGS...] - run CMD with .env and bot/.env in its environment.
+#
+# Both files are sops-encrypted at rest; each is decrypted in-process by
+# `sops exec-env` (which parses dotenv properly and never writes plaintext),
+# nested so the command sees both. A still-plaintext file is sourced as-is so
+# a fresh checkout works before encryption. Used by the Makefile's
+# bot-import-check; for compose commands use scripts/compose instead.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+cmd=$(printf '%q ' "$@")
+for f in bot/.env .env; do
+  if grep -q '^sops_version=' "$f" 2>/dev/null; then
+    cmd="sops exec-env $(printf '%q' "$f") $(printf '%q' "$cmd")"
+  else
+    cmd="set -a; . $(printf '%q' "$f"); set +a; $cmd"
+  fi
+done
+exec sh -c "$cmd"

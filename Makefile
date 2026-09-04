@@ -18,13 +18,15 @@ GIT_SHA       := $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 # and reaches `model_proxy_go` by hostname. Bring up llm-compose first for the
 # co-deployed default; for a standalone stack (no llm-compose) use the
 # `*-standalone` targets, which swap in compose.standalone.yaml.
-COMPOSE := docker compose
-COMPOSE_RUNTIME := docker compose
+# All three go through scripts/compose, which decrypts the sops-encrypted
+# .env + bot/.env into RAM for the one command and cleans up after it.
+COMPOSE := ./scripts/compose
+COMPOSE_RUNTIME := ./scripts/compose
 # Standalone overlay: redefines `llmc` as a self-managed bridge so the stack
 # comes up WITHOUT llm-compose running (see compose.standalone.yaml). Used by
 # the `*-standalone` targets only; the default targets keep the co-deployed
 # behaviour (llmc external, reaches model_proxy_go by hostname).
-COMPOSE_STANDALONE := docker compose -f compose.yaml -f compose.standalone.yaml
+COMPOSE_STANDALONE := ./scripts/compose -f compose.yaml -f compose.standalone.yaml
 
 # Latest yt-dlp version from PyPI, fetched at make-invocation time. The
 # Dockerfile's volatile yt-dlp layer is keyed on this — when PyPI has a new
@@ -214,8 +216,8 @@ compose-check: ## Validate compose YAML (prod + dev + standalone overlays)
 	@$(COMPOSE) -f compose.yaml -f compose.dev.yaml config -q && echo "  compose.dev.yaml overlay OK"
 	@$(COMPOSE_STANDALONE) config -q && echo "  compose.standalone.yaml overlay OK"
 
-bot-import-check: ## Import bot main module under stubbed deps + verify exports
-	@python3 -c "$$BOT_IMPORT_CHECK"
+bot-import-check: ## Import bot main module under stubbed deps + verify exports (bot/.env decrypted for the check)
+	@./scripts/with-env python3 -c "$$BOT_IMPORT_CHECK"
 
 ruff: ## Optional: run ruff if installed (pip install ruff)
 	@command -v ruff >/dev/null 2>&1 && ruff check app.py bot/ || echo "  ruff not installed (pip install ruff)"
@@ -324,8 +326,8 @@ migrate-from-root: ## ONE-TIME: chown stale root-owned volumes after non-root sw
 	@echo "Importing legacy ./uploads/history.json into the uploads named volume (if present)..."
 	@if [ -f ./uploads/history.json ]; then \
 	    $(COMPOSE_RUNTIME) up -d --no-recreate whisper >/dev/null 2>&1 || true; \
-	    docker compose cp ./uploads/history.json whisper:/data/history.json && \
-	        docker compose exec -u 0 whisper chown 1000:1000 /data/history.json && \
+	    $(COMPOSE_RUNTIME) cp ./uploads/history.json whisper:/data/history.json && \
+	        $(COMPOSE_RUNTIME) exec -u 0 whisper chown 1000:1000 /data/history.json && \
 	        echo "  imported ./uploads/history.json"; \
 	  else \
 	    echo "  (no legacy ./uploads/history.json — skip)"; \

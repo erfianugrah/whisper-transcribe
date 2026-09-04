@@ -252,7 +252,9 @@ services:
       context: ./bot
     pull_policy: missing
     env_file:
-      - ./bot/.env
+      # scripts/compose sets BOT_ENV_FILE to a decrypted copy; the default keeps
+      # a plaintext checkout working.
+      - ${BOT_ENV_FILE:-./bot/.env}
     environment:
       # In-stack services reached by name.
       - WHISPER_API_URL=http://whisper:7860

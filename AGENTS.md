@@ -61,14 +61,16 @@ correct restart-vs-recreate semantics.
 
 ### Footguns
 
-- **`.env` / `bot/.env` are gitignored and were rebuilt from running containers
-  once (2026-08-16)** - if the repo is ever re-cloned fresh, recover them the
-  same way BEFORE any restart: `docker inspect <container> --format '{{json .Config.Env}}'`
-  on the still-running containers (bot for `bot/.env`, whisper for the root
-  `.env` interpolated keys). `MEDIA_LIBRARY_PATH=/mnt/d/Videos` (OBS call
-  recordings; the default `/dev/null` disables the /media library and the
-  bind-mount fails at recreate time on current Docker Desktop).
-
+- **`.env` / `bot/.env` are sops-encrypted at rest (age, fleet recipient) since
+  2026-09-04.** Every Makefile target goes through `scripts/compose`, which
+  decrypts both into a RAM-backed temp dir for that one command and removes it
+  on exit; `compose.yaml` reads the bot env from `${BOT_ENV_FILE:-./bot/.env}`.
+  Never print a value to inspect it - `secretctl fp 'sops:bot/.env#KEY'` to
+  compare, `secretctl set 'sops:bot/.env#KEY' --from prompt:` to change one,
+  `sops -d bot/.env | sed 's/=.*$/=<set>/'` to list the keys. Do NOT recover
+  env from `docker inspect --format '{{json .Config.Env}}'`: that dumps every
+  credential in the container into the transcript (the secret guard blocks it).
+  Running the bot outside docker: `sops exec-env bot/.env 'python bot/main.py'`.
 - **`make ship` pushes to Docker Hub** — historically slow / sometimes
   stalls indefinitely (home upload bandwidth + accumulated layers since
   last push). If you only need the local stack updated, use
